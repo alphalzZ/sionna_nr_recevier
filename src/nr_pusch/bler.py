@@ -60,7 +60,10 @@ def simulate_bler(
         max_delay_spread_s=channel_settings.channel.max_delay_spread_s,
         num_decoder_iterations=simulation_settings.num_decoder_iterations,
         detector=simulation_settings.detector,
-        detector_parameter=simulation_settings.detector_parameter,
+        detector_parameter=simulation_settings.detector_parameters.get(
+            simulation_settings.detector, simulation_settings.detector_parameter
+        ),
+        detector_damping=simulation_settings.detector_damping,
         device=device,
     )
     if transmitter.sample_rate_hz != rx.sample_rate_hz:
@@ -178,8 +181,9 @@ def save_bler_results(
         "bler_definition": "TB block error if CRC fails or any decoded payload bit differs",
         "detector_validity_note": (
             "DFT-s-OFDM k-best first applies frequency-domain LMMSE, then uses a per-sample zero-lag "
-            "effective spatial channel with residual frequency variation in the covariance. EP and "
-            "MMSE-PIC remain per-RE experimental detectors for DFT-s-OFDM."
+            "effective spatial channel with residual frequency variation in the covariance. DFT-s-OFDM "
+            "MMSE-PIC uses soft time-domain moments for iterative frequency-domain cancellation. EP "
+            "remains a per-RE experimental detector for DFT-s-OFDM."
         ),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

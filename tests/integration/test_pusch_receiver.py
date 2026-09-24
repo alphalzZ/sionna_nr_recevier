@@ -72,6 +72,17 @@ class PuschReceiverTest(unittest.TestCase):
         self.assertTrue(torch.all(kbest_result.crc_status).item())
         torch.testing.assert_close(kbest_result.bits, tx_result.bits, rtol=0, atol=0)
 
+        pic_rx = NrPuschRx(
+            settings,
+            channel_estimator="dmrs",
+            detector="mmse-pic",
+            max_delay_spread_s=channel_settings.channel.max_delay_spread_s,
+            device="cpu",
+        )
+        pic_result = pic_rx.receive(noisy.iq, noisy.noise_variance)
+        self.assertTrue(torch.all(pic_result.crc_status).item())
+        torch.testing.assert_close(pic_result.bits, tx_result.bits, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,10 +9,12 @@ num_decoder_iterations = 20
 # dmrs uses the configured single-slot OCC pilot arrangement; perfect provides an ideal-CSI bound.
 channel_estimator = "dmrs"
 # Compare each detector under the same seed, CDL profile, SNR grid, and payload sequence.
-detectors = ["lmmse", "lmmse-sic", "k-best"]
+detectors = ["lmmse", "lmmse-sic", "k-best", "mmse-pic"]
 # SIC decodes the strongest UE first and only cancels a CRC-passing TB.
 detector = "lmmse-sic"
-# K-best list size for the time-domain DFT-s-OFDM detector.
-detector_parameter = 16
+# Per-detector parameters: K-best list size and MMSE-PIC iteration count.
+detector_parameters = { "k-best" = 16, "mmse-pic" = 4 }
+# Damping for soft PIC LLR updates; smaller values suppress unstable iterations.
+detector_damping = 0.25
 # cpu, cuda, cuda:0, or auto. Explicit CUDA fails clearly when unavailable.
 device = "cuda"

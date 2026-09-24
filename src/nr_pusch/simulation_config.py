@@ -19,6 +19,8 @@ class BlerSettings:
     channel_estimator: str
     detector: str
     detector_parameter: int | None
+    detector_parameters: dict[str, int]
+    detector_damping: float
     detectors: tuple[str, ...]
     device: str
 
@@ -30,6 +32,8 @@ class BlerSettings:
         values["snr_db"] = tuple(float(x) for x in values["snr_db"])
         values.setdefault("detector", "lmmse")
         values.setdefault("detector_parameter", None)
+        values.setdefault("detector_parameters", {})
+        values.setdefault("detector_damping", 0.25)
         values["detectors"] = tuple(values.get("detectors", (values["detector"],)))
         values.setdefault("device", "cpu")
         settings = cls(**values)
@@ -52,6 +56,10 @@ class BlerSettings:
             raise ValueError(f"detector(s) 必须属于 {sorted(allowed)}")
         if self.detector_parameter is not None and self.detector_parameter < 1:
             raise ValueError("detector_parameter 必须大于 0")
+        if any(key not in allowed or value < 1 for key, value in self.detector_parameters.items()):
+            raise ValueError("detector_parameters 必须为已支持检测器配置正整数参数")
+        if not 0.0 < self.detector_damping <= 1.0:
+            raise ValueError("detector_damping 必须位于 (0, 1]")
         if self.device not in {"cpu", "cuda", "auto"} and not self.device.startswith("cuda:"):
             raise ValueError("device 仅支持 cpu、cuda、cuda:N 或 auto")
 

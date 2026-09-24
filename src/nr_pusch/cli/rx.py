@@ -24,6 +24,7 @@ def main() -> None:
         "--detector", choices=("lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic"), default="lmmse"
     )
     parser.add_argument("--detector-parameter", type=int, default=None)
+    parser.add_argument("--detector-damping", type=float, default=0.25)
     parser.add_argument(
         "--max-delay-spread-s",
         type=float,
@@ -53,6 +54,7 @@ def main() -> None:
         channel_estimator=args.channel_estimator,
         detector=args.detector,
         detector_parameter=args.detector_parameter,
+        detector_damping=args.detector_damping,
         max_delay_spread_s=args.max_delay_spread_s,
         device=args.device,
     )
