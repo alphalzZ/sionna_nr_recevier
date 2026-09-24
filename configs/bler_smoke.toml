@@ -1,0 +1,8 @@
+[bler]
+snr_db = [-5.0, 20.0, 40.0, 60.0]
+batch_size = 1
+max_frames_per_snr = 2
+target_block_errors = 8
+seed = 2026
+num_decoder_iterations = 20
+channel_estimator = "dmrs"

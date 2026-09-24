@@ -11,6 +11,9 @@ Use the repository virtual environment at `/home/le-lei/workspace/test/.venv`.
 - `pip install -e .` installs the package and `nr-pusch-tx` command in editable mode.
 - `PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py' -v` runs unit and integration tests.
 - `nr-pusch-tx --config configs/pusch_4ue.toml --output /tmp/pusch.npz --batch-size 1 --seed 13 --device cpu` generates IQ and a JSON manifest outside the repository.
+- `nr-pusch-channel --config configs/cdl_38_901_4x4.toml --input /tmp/pusch.npz --sample-rate-hz 18000000 --output /tmp/pusch_rx.npz` applies the configured CDL channel.
+- `nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38_901_4x4.toml --simulation-config configs/bler_4ue_cdl.toml --output /tmp/pusch_bler.csv --device cpu` runs an SNR versus BLER sweep.
+- `nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /tmp/pusch_rx.npz --noise-variance 0.001 --output /tmp/pusch_decode.npz` decodes receive IQ and reports TB CRC status.
 
 ## Coding Style & Naming Conventions
 
@@ -18,7 +21,7 @@ Use Python 3.11+ syntax, four-space indentation, type hints for public APIs, `sn
 
 ## Testing Guidelines
 
-Tests use the standard-library `unittest` runner and may use NumPy assertions. Name files `test_*.py` and test methods `test_*`. Add focused unit tests for project-owned parsing and export behavior, and integration tests for Sionna composite blocks and MATLAB reference comparisons. For waveform changes, include the compared stage, tolerance, MCS/TB size, and relevant manifest values. Run tests with the command above before submitting.
+Tests use the standard-library `unittest` runner and may use NumPy assertions. Name files `test_*.py` and test methods `test_*`. Add focused unit tests for project-owned parsing and export behavior, and integration tests for Sionna channel blocks and MATLAB reference comparisons. For waveform changes, include the compared stage, tolerance, MCS/TB size, and relevant manifest values. Run tests with the command above before submitting.
 
 ## Commit & Pull Request Guidelines
 
