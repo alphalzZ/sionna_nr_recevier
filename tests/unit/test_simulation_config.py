@@ -10,9 +10,9 @@ ROOT = Path(__file__).parents[2]
 class BlerSettingsTest(unittest.TestCase):
     def test_reads_detector_comparison_and_cpu_device(self):
         settings = BlerSettings.from_toml(ROOT / "configs" / "bler_4ue_cdl.toml")
-        self.assertEqual(settings.detectors, ("lmmse", "lmmse-sic"))
+        self.assertEqual(settings.detectors, ("lmmse", "lmmse-sic", "k-best"))
         self.assertEqual(settings.device, "cpu")
-        self.assertIsNone(settings.detector_parameter)
+        self.assertEqual(settings.detector_parameter, 16)
 
     def test_rejects_unknown_detector(self):
         settings = BlerSettings(

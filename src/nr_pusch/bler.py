@@ -177,8 +177,9 @@ def save_bler_results(
         "results": [asdict(point) for point in points],
         "bler_definition": "TB block error if CRC fails or any decoded payload bit differs",
         "detector_validity_note": (
-            "For DFT-s-OFDM, per-RE QAM assumptions in k-best, EP, and MMSE-PIC are experimental; "
-            "their BLER must not be treated as validated until cross-subcarrier detection is implemented."
+            "DFT-s-OFDM k-best first applies frequency-domain LMMSE, then uses a per-sample zero-lag "
+            "effective spatial channel with residual frequency variation in the covariance. EP and "
+            "MMSE-PIC remain per-RE experimental detectors for DFT-s-OFDM."
         ),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

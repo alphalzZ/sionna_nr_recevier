@@ -23,9 +23,9 @@ nr-pusch-channel --config configs/cdl_38_901_4x4.toml --input /tmp/pusch_tx.npz 
 
 `NrPuschRx` 使用 Sionna PUSCH TB 解码器、4×4 MIMO 检测，以及 DFT-s-OFDM 每数据符号的逆 DFT。信道估计可选 `dmrs`（当前单 DMRS、双 OCC 端口对 profile 的静态 slot LS）和 `perfect`（仿真 CDL 抽头理想 CSI 上界）。DMRS 模式假设一个 slot 内信道不变，适用于当前零速静态 CDL profile；高 Doppler 或多 DMRS 配置需扩展时频插值并用抓包参考继续验证。
 
-检测器可选 `lmmse`、`lmmse-sic`、`k-best`、`ep` 和 `mmse-pic`，参数通过 `detector` / `detector_parameter` 配置，接收 CLI 也提供 `--detector` 和 `--detector-parameter`。`lmmse-sic` 按估计信道功率从强到弱处理 UE：LMMSE 解调后进行 TB 译码，仅在该 UE CRC 通过时重编码并重构其 DFT-s-OFDM 资源网格，再从接收频域信号中消除该用户并处理下一个 UE。单次接收的 JSON sidecar 会记录检测顺序和每个 UE 消除前的 CRC 状态。BLER 配置中的 `detectors` 会按相同 seed、CDL、SNR 和 payload 顺序比较检测器。
+检测器可选 `lmmse`、`lmmse-sic`、`k-best`、`ep` 和 `mmse-pic`，参数通过 `detector` / `detector_parameter` 配置，接收 CLI 也提供 `--detector` 和 `--detector-parameter`。`k-best` 先用频域 LMMSE 等化整体 MU 信道，再将输出做 IDFT；每个时域采样点使用零时延等效空间矩阵进行四流 K-best 搜索，并把剩余频率变化作为残余 ISI 协方差。`lmmse-sic` 按估计信道功率从强到弱处理 UE：LMMSE 解调后进行 TB 译码，仅在该 UE CRC 通过时重编码并重构其 DFT-s-OFDM 资源网格，再从接收频域信号中消除该用户并处理下一个 UE。单次接收的 JSON sidecar 会记录 SIC 检测顺序和每个 UE 消除前的 CRC 状态。BLER 配置中的 `detectors` 会按相同 seed、CDL、SNR 和 payload 顺序比较检测器。
 
-Sionna 的 `k-best`、`ep` 和 `mmse-pic` 按每个 RE 上独立 QAM 符号建模，而 DFT-s-OFDM 在 DFT 之后每个 RE 并非独立 QAM。在 60 dB、perfect CSI 的单帧检查中，这三种直接按 RE 检测的方法 CRC 均失败，因此仍标为实验性基线；DFT-s-OFDM 的非线性接收目前先采用 CRC 保护的 LMMSE-SIC。
+Sionna 原生逐 RE 的 `k-best`、`ep` 和 `mmse-pic` 假设每个 RE 独立承载 QAM；本仓库的 `k-best` 已改为上述时域采样检测方法。EP 和 MMSE-PIC 仍是 DFT-s-OFDM 下的实验性逐 RE 基线。当前 K-best 零时延信道近似需通过不同 CDL、时延扩展和 SNR 曲线继续评估。
 
 配置 SNR 扫描点、批大小、帧上限和停止错误数后运行：
 

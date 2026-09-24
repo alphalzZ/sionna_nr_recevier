@@ -61,6 +61,17 @@ class PuschReceiverTest(unittest.TestCase):
         self.assertEqual(set(sic_result.metadata["sic_user_order"]), {u.name for u in settings.users})
         self.assertTrue(all(all(row) for row in sic_result.metadata["sic_crc_before_cancel"]))
 
+        kbest_rx = NrPuschRx(
+            settings,
+            channel_estimator="dmrs",
+            detector="k-best",
+            max_delay_spread_s=channel_settings.channel.max_delay_spread_s,
+            device="cpu",
+        )
+        kbest_result = kbest_rx.receive(noisy.iq, noisy.noise_variance)
+        self.assertTrue(torch.all(kbest_result.crc_status).item())
+        torch.testing.assert_close(kbest_result.bits, tx_result.bits, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

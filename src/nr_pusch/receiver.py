@@ -9,11 +9,11 @@ import numpy as np
 import torch
 from sionna.phy.mapping import Constellation, Demapper
 from sionna.phy.channel import time_lag_discrete_time_channel
-from sionna.phy.mimo import StreamManagement
+from sionna.phy.mimo import KBestDetector as FlatKBestDetector
+from sionna.phy.mimo import StreamManagement, lmmse_matrix, whiten_channel
 from sionna.phy.nr import PUSCHReceiver, PUSCHTransmitter, TBDecoder
 from sionna.phy.ofdm import (
     EPDetector,
-    KBestDetector,
     LMMSEEqualizer,
     LinearDetector,
     MMSEPICDetector,
@@ -36,13 +36,6 @@ class DftSOfdmMimoDetector(torch.nn.Module):
         if method == "lmmse":
             self._detector = LMMSEEqualizer(
                 self._resource_grid, stream_management, device=transmitter.device
-            )
-        elif method == "k-best":
-            self._detector = KBestDetector(
-                "symbol", stream_management._num_tx * stream_management._num_streams_per_tx,
-                parameter or 64,
-                self._resource_grid, stream_management, constellation_type="qam",
-                num_bits_per_symbol=bps, hard_out=True, device=transmitter.device,
             )
         elif method == "ep":
             self._detector = EPDetector(
@@ -87,6 +80,10 @@ class DftSOfdmMimoDetector(torch.nn.Module):
             raise ValueError("Sionna data RE indices are not ordered by OFDM symbol")
         self._num_spread_symbols = int(active_counts.numel())
         self._fft_size = int(fft_size)
+        self.register_buffer(
+            "_data_symbol_indices",
+            torch.unique(symbol_indices, sorted=True),
+        )
         self._num_data_symbols = int(ordered_indices.numel())
         self._num_bits_per_symbol = bps
 
@@ -128,6 +125,134 @@ class DftSOfdmMimoDetector(torch.nn.Module):
         x_hat = x_hat.reshape(batch, num_tx, num_streams, self._num_data_symbols)
         no_eff = no_eff.reshape_as(x_hat.real)
         return self._demapper(x_hat, no_eff)
+
+
+class DftSOfdmKBestDetector(DftSOfdmMimoDetector):
+    """LMMSE pre-equalize, despread, then K-best detect each time sample."""
+
+    def __init__(
+        self,
+        transmitter: PUSCHTransmitter,
+        stream_management: StreamManagement,
+        k: int | None = None,
+    ) -> None:
+        super().__init__(transmitter, stream_management, method="lmmse")
+        self.k = 64 if k is None else k
+        self._flat_detector = FlatKBestDetector(
+            "symbol",
+            num_streams=stream_management._num_tx * stream_management._num_streams_per_tx,
+            k=self.k,
+            constellation_type="qam",
+            num_bits_per_symbol=int(torch.as_tensor(self._num_bits_per_symbol).reshape(-1)[0]),
+            hard_out=True,
+            device=transmitter.device,
+        )
+
+    def forward(
+        self,
+        y: torch.Tensor,
+        h_hat: torch.Tensor,
+        err_var: torch.Tensor,
+        no: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return ordered PUSCH LLRs after per-sample spatial K-best search."""
+        batch, num_rx, num_rx_ant, num_symbols, fft_size = y.shape
+        if num_rx != 1 or fft_size != self._fft_size:
+            raise ValueError("K-best DFT-s-OFDM 仅支持单接收端口和当前资源网格尺寸")
+
+        # Match Sionna's LMMSEEqualizer covariance construction. All four UE
+        # streams are desired streams, so only thermal noise and CSI error enter S.
+        y_eff = self._detector._removed_nulled_scs(y)
+        y_dt = y_eff.permute(0, 1, 3, 4, 2)
+        h_dt = h_hat.permute(0, 1, 5, 6, 2, 3, 4).flatten(-2)
+        err_dt = torch.broadcast_to(err_var, h_hat.shape)
+        err_dt = err_dt.permute(0, 1, 5, 6, 2, 3, 4).flatten(-2)
+        no = torch.as_tensor(no, dtype=y.real.dtype, device=y.device)
+        if no.ndim == 1:
+            no = no.unsqueeze(1)
+        no = torch.broadcast_to(no, (batch, num_rx, num_rx_ant))
+        no_dt = no[:, :, None, None, :].expand(
+            batch, num_rx, num_symbols, fft_size, num_rx_ant
+        )
+        err_power = err_dt.sum(dim=-1)
+        covariance = torch.diag_embed(no_dt + err_power).to(y.dtype)
+
+        y_white, h_white = whiten_channel(
+            y_dt, h_dt, covariance, return_s=False
+        )
+        equalizer_matrix = lmmse_matrix(h_white, s=None)
+        gram = equalizer_matrix @ h_white
+        diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
+        normalized_filter = equalizer_matrix / diagonal.unsqueeze(-1)
+        x_hat = (equalizer_matrix @ y_white.unsqueeze(-1)).squeeze(-1)
+        x_hat = x_hat / diagonal
+        effective_channel = normalized_filter @ h_white
+        post_eq_noise_covariance = normalized_filter @ normalized_filter.mH
+
+        # [batch, data-bearing OFDM symbol, subcarrier, UE]
+        x_freq = x_hat[:, 0].index_select(1, self._data_symbol_indices)
+        effective_channel = effective_channel[:, 0].index_select(
+            1, self._data_symbol_indices
+        )
+        post_eq_noise_covariance = post_eq_noise_covariance[:, 0].index_select(
+            1, self._data_symbol_indices
+        )
+
+        # IDFT the LMMSE output and retain the zero-lag part of its effective
+        # channel as the small per-sample MIMO matrix. Remaining frequency
+        # variation becomes colored residual ISI in the K-best noise covariance.
+        z_time = torch.fft.ifft(x_freq.permute(0, 1, 3, 2), dim=-1, norm="ortho")
+        z_time = z_time.permute(0, 1, 3, 2)
+        h_zero_lag = effective_channel.mean(dim=2)
+        channel_residual = effective_channel - h_zero_lag.unsqueeze(2)
+        isi_covariance = (channel_residual @ channel_residual.mH).mean(dim=2)
+        noise_covariance = post_eq_noise_covariance.mean(dim=2)
+        covariance_time = noise_covariance + isi_covariance
+
+        regularization = covariance_time.diagonal(dim1=-2, dim2=-1).real.mean(dim=-1)
+        regularization = regularization.clamp_min(1e-4) * 1e-5 + 1e-7
+        eye = torch.eye(num_rx_ant, dtype=covariance_time.dtype, device=y.device)
+        covariance_time = (covariance_time + covariance_time.mH) * 0.5
+        covariance_time = covariance_time + regularization[..., None, None] * eye
+
+        flat_y = z_time.reshape(-1, num_rx_ant)
+        flat_h = h_zero_lag.unsqueeze(2).expand(
+            batch,
+            self._num_spread_symbols,
+            self._fft_size,
+            num_rx_ant,
+            num_rx_ant,
+        ).reshape(-1, num_rx_ant, num_rx_ant)
+        flat_covariance = covariance_time.unsqueeze(2).expand(
+            batch,
+            self._num_spread_symbols,
+            self._fft_size,
+            num_rx_ant,
+            num_rx_ant,
+        ).reshape(-1, num_rx_ant, num_rx_ant)
+        symbol_indices = self._flat_detector(flat_y, flat_h, flat_covariance)
+        symbols = self._constellation.points[symbol_indices.to(torch.long)]
+        symbols = symbols.reshape(
+            batch, self._num_spread_symbols, self._fft_size, num_rx_ant
+        )
+        bits_per_symbol = int(torch.as_tensor(self._num_bits_per_symbol).reshape(-1)[0])
+        information_matrix = h_zero_lag.mH @ torch.linalg.solve(
+            covariance_time, h_zero_lag
+        )
+        post_detection_covariance = torch.linalg.inv(information_matrix)
+        post_detection_variance = torch.diagonal(
+            post_detection_covariance, dim1=-2, dim2=-1
+        ).real.clamp_min(1e-7)
+        post_detection_variance = post_detection_variance.unsqueeze(2).expand(
+            batch, self._num_spread_symbols, self._fft_size, num_rx_ant
+        )
+        symbols = symbols.permute(0, 3, 1, 2).reshape(
+            batch, num_rx_ant, 1, self._num_data_symbols
+        )
+        post_detection_variance = post_detection_variance.permute(0, 3, 1, 2).reshape(
+            batch, num_rx_ant, 1, self._num_data_symbols
+        )
+        return self._demapper(symbols, post_detection_variance)
 
 
 class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
@@ -389,6 +514,10 @@ class NrPuschRx:
                 num_decoder_iterations=num_decoder_iterations,
                 device=device,
             )
+        elif detector == "k-best":
+            detector_block = DftSOfdmKBestDetector(
+                tx, stream_management, k=detector_parameter
+            )
         else:
             detector_block = DftSOfdmMimoDetector(
                 tx, stream_management, detector, detector_parameter
@@ -477,11 +606,13 @@ class NrPuschRx:
             "detector_note": (
                 "Strongest-first LMMSE-SIC; cancel only after the user's TB CRC passes."
                 if self.detector == "lmmse-sic"
+                else "LMMSE frequency pre-equalization, IDFT despreading, and per-sample spatial K-best."
+                if self.detector == "k-best"
+                else "Frequency-domain LMMSE equalization followed by inverse DFT spreading."
+                if self.detector == "lmmse"
                 else
                 "This per-RE Sionna detector assumes independent QAM symbols; for DFT-s-OFDM "
-                "the non-LMMSE options are experimental until cross-subcarrier detection is added."
-                if self.detector != "lmmse"
-                else "LMMSE equalizes DFT-spread subcarriers before inverse DFT spreading."
+                "EP and MMSE-PIC remain experimental until cross-subcarrier detection is added."
             ),
             "decoder": "Sionna NR TBDecoder",
             "channel_estimator": "perfect CDL CSI" if self.channel_estimator == "perfect" else "DFT-s-OFDM DMRS OCC LS",
