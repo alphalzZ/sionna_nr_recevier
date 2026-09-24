@@ -16,10 +16,11 @@ from nr_pusch.receiver import NrPuschRx
 def main() -> None:
     parser = argparse.ArgumentParser(description="Decode four-user DFT-s-OFDM PUSCH IQ")
     parser.add_argument("--tx-config", required=True, help="TOML PUSCH profile used for decoding")
-    parser.add_argument("--input", required=True, help="NPZ containing complex receive IQ array 'iq'")
+    parser.add_argument("--input", required=True, help="NPZ containing receive 'iq' or frequency 'grid'")
     parser.add_argument("--output", required=True, help="Output NPZ with decoded bits and CRC status")
     parser.add_argument("--noise-variance", required=True, type=float, help="AWGN variance per complex sample")
     parser.add_argument("--channel-estimator", choices=("dmrs", "perfect"), default="dmrs")
+    parser.add_argument("--input-domain", choices=("time", "frequency"), default="time")
     parser.add_argument(
         "--detector", choices=("lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic"), default="lmmse"
     )
@@ -39,14 +40,22 @@ def main() -> None:
     if output_path.suffix.lower() != ".npz":
         parser.error("--output 必须使用 .npz 后缀")
     with np.load(input_path) as archive:
-        if "iq" not in archive:
-            parser.error("输入 NPZ 缺少 'iq' 数组")
-        iq = torch.from_numpy(np.array(archive["iq"], copy=True))
-        channel_taps = (
-            torch.from_numpy(np.array(archive["channel_taps"], copy=True))
-            if "channel_taps" in archive
-            else None
-        )
+        if args.input_domain == "time":
+            if "iq" not in archive:
+                parser.error("时域输入 NPZ 缺少 'iq' 数组")
+            received = torch.from_numpy(np.array(archive["iq"], copy=True))
+            channel = (
+                torch.from_numpy(np.array(archive["channel_taps"], copy=True))
+                if "channel_taps" in archive else None
+            )
+        else:
+            if "grid" not in archive:
+                parser.error("频域输入 NPZ 缺少 'grid' 数组")
+            received = torch.from_numpy(np.array(archive["grid"], copy=True))
+            channel = (
+                torch.from_numpy(np.array(archive["channel_frequency_response"], copy=True))
+                if "channel_frequency_response" in archive else None
+            )
 
     settings = TxSettings.from_toml(args.tx_config)
     receiver = NrPuschRx(
@@ -55,10 +64,18 @@ def main() -> None:
         detector=args.detector,
         detector_parameter=args.detector_parameter,
         detector_damping=args.detector_damping,
+        input_domain=args.input_domain,
         max_delay_spread_s=args.max_delay_spread_s,
         device=args.device,
     )
-    result = receiver.receive(iq, args.noise_variance, channel_taps=channel_taps)
+    if args.input_domain == "time":
+        result = receiver.receive(received, args.noise_variance, channel_taps=channel)
+    else:
+        result = receiver.receive_frequency_grid(
+            received,
+            args.noise_variance,
+            channel_frequency_response=channel,
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,

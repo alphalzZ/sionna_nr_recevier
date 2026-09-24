@@ -1,4 +1,4 @@
-"""Apply a configured CDL channel to an archived transmitter IQ result."""
+"""Apply a configured CDL channel to archived time or frequency-domain TX data."""
 
 from __future__ import annotations
 
@@ -11,13 +11,17 @@ import torch
 
 from nr_pusch.channel import NrPuschCdlChannel
 from nr_pusch.channel_config import ChannelSettings
+from nr_pusch.config import TxSettings
+from nr_pusch.transmitter import NrPuschTx
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Apply a 3GPP TR 38.901 CDL channel")
     parser.add_argument("--config", required=True, help="TOML CDL channel configuration")
-    parser.add_argument("--input", required=True, help="Input NPZ containing tx IQ array 'iq'")
+    parser.add_argument("--input", required=True, help="Input NPZ containing tx 'iq' or 'frequency_grid'")
     parser.add_argument("--sample-rate-hz", required=True, type=int, help="Input IQ sample rate")
+    parser.add_argument("--domain", choices=("time", "frequency"), default="time")
+    parser.add_argument("--tx-config", help="Required in frequency mode to define the Sionna resource grid")
     parser.add_argument("--output", required=True, help="Output NPZ path")
     parser.add_argument("--device", default=None, help="Sionna device, e.g. cpu or cuda:0")
     args = parser.parse_args()
@@ -26,20 +30,50 @@ def main() -> None:
     output_path = Path(args.output)
     if output_path.suffix.lower() != ".npz":
         parser.error("--output 必须使用 .npz 后缀")
-    with np.load(input_path) as archive:
-        if "iq" not in archive:
-            parser.error("输入 NPZ 缺少 'iq' 数组")
-        iq = torch.from_numpy(np.array(archive["iq"], copy=True))
-
     settings = ChannelSettings.from_toml(args.config)
-    result = NrPuschCdlChannel(settings, device=args.device).apply(iq, args.sample_rate_hz)
+    channel = NrPuschCdlChannel(settings, device=args.device)
+    if args.domain == "time":
+        with np.load(input_path) as archive:
+            if "iq" not in archive:
+                parser.error("时域模式输入 NPZ 缺少 'iq' 数组")
+            iq = torch.from_numpy(np.array(archive["iq"], copy=True))
+        result = channel.apply(iq, args.sample_rate_hz)
+        arrays = {
+            "iq": result.iq.detach().cpu().numpy().astype(np.complex64, copy=False),
+            "per_user_iq": result.per_user_iq.detach().cpu().numpy().astype(np.complex64, copy=False),
+            "channel_taps": result.channel_taps.detach().cpu().numpy().astype(np.complex64, copy=False),
+        }
+        axis_info = {
+            "iq": ["batch", "rx_antenna", "sample"],
+            "per_user_iq": ["batch", "user", "rx_antenna", "sample"],
+            "channel_taps": ["batch", "user", "rx_antenna", "time", "tap"],
+        }
+        shape_summary = f"IQ shape [batch,rx_antenna,sample]: {tuple(result.iq.shape)}"
+    else:
+        if args.tx_config is None:
+            parser.error("frequency 模式必须提供 --tx-config")
+        with np.load(input_path) as archive:
+            if "frequency_grid" not in archive:
+                parser.error("频域模式输入 NPZ 缺少 'frequency_grid' 数组")
+            frequency_grid = torch.from_numpy(np.array(archive["frequency_grid"], copy=True))
+        tx = NrPuschTx(TxSettings.from_toml(args.tx_config), device=args.device)
+        result = channel.apply_frequency(frequency_grid, tx._tx_freq.resource_grid)
+        arrays = {
+            "grid": result.grid.detach().cpu().numpy().astype(np.complex64, copy=False),
+            "per_user_grid": result.per_user_grid.detach().cpu().numpy().astype(np.complex64, copy=False),
+            "channel_frequency_response": result.channel_frequency_response.detach().cpu().numpy().astype(
+                np.complex64, copy=False
+            ),
+        }
+        axis_info = {
+            "grid": result.metadata["grid_axes"],
+            "per_user_grid": ["batch", "user", "rx_antenna", "ofdm_symbol", "fft_bin"],
+            "channel_frequency_response": result.metadata["channel_axes"],
+        }
+        shape_summary = f"Grid shape [batch,num_rx,rx_antenna,symbol,fft]: {tuple(result.grid.shape)}"
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output_path,
-        iq=result.iq.detach().cpu().numpy().astype(np.complex64, copy=False),
-        per_user_iq=result.per_user_iq.detach().cpu().numpy().astype(np.complex64, copy=False),
-        channel_taps=result.channel_taps.detach().cpu().numpy().astype(np.complex64, copy=False),
-    )
+    np.savez_compressed(output_path, **arrays)
     output_path.with_suffix(".json").write_text(
         json.dumps(
             {
@@ -49,7 +83,8 @@ def main() -> None:
                 "result": result.metadata,
                 "artifacts": {
                     "archive": output_path.name,
-                    "arrays": ["iq", "per_user_iq", "channel_taps"],
+                    "domain": args.domain,
+                    "arrays": axis_info,
                     "complex_dtype": "complex64",
                 },
             },
@@ -59,9 +94,8 @@ def main() -> None:
         + "\n",
         encoding="utf-8",
     )
-    print(f"Channelized IQ: {output_path}")
-    print(f"IQ shape [batch,rx_antenna,sample]: {tuple(result.iq.shape)}")
-    print(f"Per-user IQ shape [batch,user,rx_antenna,sample]: {tuple(result.per_user_iq.shape)}")
+    print(f"Channelized {args.domain} output: {output_path}")
+    print(shape_summary)
 
 
 if __name__ == "__main__":

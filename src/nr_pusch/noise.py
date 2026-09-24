@@ -13,6 +13,12 @@ class NoisySignal:
     noise_variance: torch.Tensor  # [batch, 1, rx_antenna]
 
 
+@dataclass
+class NoisyResourceGrid:
+    grid: torch.Tensor  # [batch, num_rx, rx_antenna, ofdm_symbol, fft_bin]
+    noise_variance: torch.Tensor  # [batch, num_rx, rx_antenna]
+
+
 def add_awgn(iq: torch.Tensor, snr_db: float, *, seed: int = 0) -> NoisySignal:
     """Add complex AWGN at a measured per-RX-antenna signal-to-noise ratio.
 
@@ -36,3 +42,27 @@ def add_awgn(iq: torch.Tensor, snr_db: float, *, seed: int = 0) -> NoisySignal:
     imag = torch.randn(noise_shape, dtype=real_dtype, device=iq.device, generator=generator)
     noise = torch.complex(real, imag) * torch.sqrt(noise_variance.unsqueeze(-1) / 2.0)
     return NoisySignal(iq=iq + noise, noise_variance=noise_variance.unsqueeze(1))
+
+
+def add_awgn_resource_grid(
+    grid: torch.Tensor,
+    snr_db: float,
+    *,
+    seed: int = 0,
+) -> NoisyResourceGrid:
+    """Add complex AWGN to ``[batch, rx, rx_ant, symbol, fft_bin]`` grids."""
+    if grid.ndim != 5 or grid.shape[2] != 4 or not grid.is_complex():
+        raise ValueError("grid 形状必须为复数 [batch, num_rx, 4 rx_antennas, symbols, fft_bins]")
+    if not torch.isfinite(torch.tensor(snr_db)).item():
+        raise ValueError("snr_db 必须为有限数值")
+    power = grid.abs().square().mean(dim=(-1, -2))
+    if torch.any(power <= 0).item():
+        raise ValueError("每个接收天线的资源网格平均功率必须大于 0")
+    noise_variance = power * (10.0 ** (-float(snr_db) / 10.0))
+    generator = torch.Generator(device=grid.device)
+    generator.manual_seed(seed)
+    real = torch.randn(grid.shape, dtype=grid.real.dtype, device=grid.device, generator=generator)
+    imag = torch.randn(grid.shape, dtype=grid.real.dtype, device=grid.device, generator=generator)
+    scale = torch.sqrt(noise_variance[..., None, None] / 2.0)
+    noise = torch.complex(real, imag) * scale
+    return NoisyResourceGrid(grid=grid + noise, noise_variance=noise_variance)

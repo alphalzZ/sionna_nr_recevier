@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from sionna.phy.channel import ApplyTimeChannel, cir_to_time_channel, time_lag_discrete_time_channel
+from sionna.phy.channel import (
+    ApplyOFDMChannel,
+    ApplyTimeChannel,
+    cir_to_ofdm_channel,
+    cir_to_time_channel,
+    subcarrier_frequencies,
+    time_lag_discrete_time_channel,
+)
 from sionna.phy.channel.tr38901 import AntennaArray, CDL
 
 from .channel_config import ChannelSettings
@@ -20,6 +27,16 @@ class ChannelResult:
     per_user_iq: torch.Tensor  # [batch, user, rx_antenna, sample]
     channel_taps: torch.Tensor  # [batch, user, rx_antenna, sample, tap]
     sample_rate_hz: int
+    metadata: dict[str, Any]
+
+
+@dataclass
+class FrequencyChannelResult:
+    """Frequency-domain channel output and CSI with explicit tensor axes."""
+
+    grid: torch.Tensor  # [batch, num_rx=1, rx_antenna, ofdm_symbol, fft_bin]
+    per_user_grid: torch.Tensor  # [batch, user, rx_antenna, ofdm_symbol, fft_bin]
+    channel_frequency_response: torch.Tensor  # [batch, 1, rx_ant, user, 1, symbol, fft_bin]
     metadata: dict[str, Any]
 
 
@@ -59,6 +76,85 @@ class NrPuschCdlChannel:
             device=device,
         )
         self._cdl = self._make_cdl()
+        self._apply_ofdm_channel = ApplyOFDMChannel(device=device)
+
+    def apply_frequency(self, frequency_grid: torch.Tensor, resource_grid) -> FrequencyChannelResult:
+        """Apply independent per-UE CDL responses directly to an OFDM grid.
+
+        ``frequency_grid`` uses Sionna's ``[batch, user, tx_ant, symbol, fft]``
+        layout. This single-tap frequency-domain model assumes the cyclic prefix
+        is sufficient; use :meth:`apply` when sample-level ISI or captured IQ is
+        part of the experiment.
+        """
+        if frequency_grid.ndim != 5 or frequency_grid.shape[1:3] != (self.num_users, 1):
+            raise ValueError(
+                "frequency_grid 形状必须为 [batch, 4 users, 1 tx antenna, symbols, fft_size]"
+            )
+        if not frequency_grid.is_complex():
+            raise ValueError("frequency_grid 必须为复数张量")
+        if frequency_grid.shape[-2:] != (resource_grid.num_ofdm_symbols, resource_grid.fft_size):
+            raise ValueError("frequency_grid 的 symbol/fft 维度与 resource_grid 不一致")
+        if self.device is not None:
+            frequency_grid = frequency_grid.to(self.device)
+
+        batch_size = frequency_grid.shape[0]
+        num_symbols = resource_grid.num_ofdm_symbols
+        fft_size = resource_grid.fft_size
+        num_rx_antennas = self.settings.antennas.rx_num_rows * self.settings.antennas.rx_num_cols
+        frequencies = subcarrier_frequencies(
+            fft_size,
+            resource_grid.subcarrier_spacing,
+            device=str(frequency_grid.device),
+        )
+
+        # The CDL batch axis represents independent UE links. Sample only once
+        # per OFDM symbol, avoiding the many Nyquist-rate time samples needed
+        # by ApplyTimeChannel.
+        a, tau = self._cdl(
+            batch_size * self.num_users,
+            num_symbols,
+            1.0 / resource_grid.ofdm_symbol_duration,
+        )
+        h_flat = cir_to_ofdm_channel(
+            frequencies,
+            a,
+            tau,
+            normalize=self.settings.channel.normalize_channel,
+        )
+        h_freq = h_flat.reshape(
+            batch_size, self.num_users, 1, num_rx_antennas, 1,
+            num_symbols, fft_size,
+        ).permute(0, 2, 3, 1, 4, 5, 6).contiguous()
+
+        y = self._apply_ofdm_channel(frequency_grid, h_freq)
+        # Retain per-UE contributions for diagnostics, using the same channel
+        # tensor as the summed Sionna ApplyOFDMChannel result.
+        x_expanded = frequency_grid[:, None, None, :, :, :, :]
+        user_contributions = (h_freq * x_expanded).sum(dim=4).squeeze(1)
+        per_user_grid = user_contributions.permute(0, 2, 1, 3, 4).contiguous()
+        metadata = {
+            "model": self.settings.channel.model,
+            "standard": "3GPP TR 38.901 CDL",
+            "domain": "frequency",
+            "direction": self.settings.channel.direction,
+            "grid_axes": ["batch", "num_rx", "rx_antenna", "ofdm_symbol", "fft_bin"],
+            "channel_axes": ["batch", "num_rx", "rx_antenna", "user", "tx_antenna", "ofdm_symbol", "fft_bin"],
+            "num_users": self.num_users,
+            "num_rx_antennas": num_rx_antennas,
+            "num_ofdm_symbols": num_symbols,
+            "fft_size": fft_size,
+            "subcarrier_spacing_hz": float(resource_grid.subcarrier_spacing),
+            "ofdm_symbol_duration_s": float(resource_grid.ofdm_symbol_duration),
+            "cyclic_prefix_assumption": "sufficient; frequency-domain channel excludes ISI",
+            "delay_spread_s": self.settings.channel.delay_spread_s,
+            "carrier_frequency_hz": self.settings.channel.carrier_frequency_hz,
+        }
+        return FrequencyChannelResult(
+            grid=y,
+            per_user_grid=per_user_grid,
+            channel_frequency_response=h_freq,
+            metadata=metadata,
+        )
 
     def apply(
         self,

@@ -23,6 +23,7 @@ class BlerSettings:
     detector_damping: float
     detectors: tuple[str, ...]
     device: str
+    channel_domain: str = "frequency"
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "BlerSettings":
@@ -36,6 +37,7 @@ class BlerSettings:
         values.setdefault("detector_damping", 0.25)
         values["detectors"] = tuple(values.get("detectors", (values["detector"],)))
         values.setdefault("device", "cpu")
+        values.setdefault("channel_domain", "frequency")
         settings = cls(**values)
         settings.validate()
         return settings
@@ -62,6 +64,8 @@ class BlerSettings:
             raise ValueError("detector_damping 必须位于 (0, 1]")
         if self.device not in {"cpu", "cuda", "auto"} and not self.device.startswith("cuda:"):
             raise ValueError("device 仅支持 cpu、cuda、cuda:N 或 auto")
+        if self.channel_domain not in {"frequency", "time"}:
+            raise ValueError("channel_domain 仅支持 frequency 或 time")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -16,7 +16,7 @@ import torch
 from .channel import NrPuschCdlChannel
 from .channel_config import ChannelSettings
 from .config import TxSettings
-from .noise import add_awgn
+from .noise import add_awgn, add_awgn_resource_grid
 from .receiver import NrPuschRx
 from .simulation_config import BlerSettings
 from .transmitter import NrPuschTx
@@ -64,6 +64,7 @@ def simulate_bler(
             simulation_settings.detector, simulation_settings.detector_parameter
         ),
         detector_damping=simulation_settings.detector_damping,
+        input_domain=("frequency" if simulation_settings.channel_domain == "frequency" else "time"),
         device=device,
     )
     if transmitter.sample_rate_hz != rx.sample_rate_hz:
@@ -85,21 +86,41 @@ def simulate_bler(
             )
             tx_result = transmitter.generate(batch_size=batch_size, seed=frame_seed)
             frame_seed += batch_size
-            channel_result = channel.apply(tx_result.iq, tx_result.sample_rate_hz)
-            noisy = add_awgn(
-                channel_result.iq,
-                snr_db,
-                seed=simulation_settings.seed + frame_seed,
-            )
-            rx_result = rx.receive(
-                noisy.iq,
-                noisy.noise_variance,
-                channel_taps=(
-                    channel_result.channel_taps
-                    if simulation_settings.channel_estimator == "perfect"
-                    else None
-                ),
-            )
+            if simulation_settings.channel_domain == "frequency":
+                channel_result = channel.apply_frequency(
+                    tx_result.frequency_grid,
+                    transmitter._tx_freq.resource_grid,
+                )
+                noisy = add_awgn_resource_grid(
+                    channel_result.grid,
+                    snr_db,
+                    seed=simulation_settings.seed + frame_seed,
+                )
+                rx_result = rx.receive_frequency_grid(
+                    noisy.grid,
+                    noisy.noise_variance,
+                    channel_frequency_response=(
+                        channel_result.channel_frequency_response
+                        if simulation_settings.channel_estimator == "perfect"
+                        else None
+                    ),
+                )
+            else:
+                channel_result = channel.apply(tx_result.iq, tx_result.sample_rate_hz)
+                noisy = add_awgn(
+                    channel_result.iq,
+                    snr_db,
+                    seed=simulation_settings.seed + frame_seed,
+                )
+                rx_result = rx.receive(
+                    noisy.iq,
+                    noisy.noise_variance,
+                    channel_taps=(
+                        channel_result.channel_taps
+                        if simulation_settings.channel_estimator == "perfect"
+                        else None
+                    ),
+                )
             crc = rx_result.crc_status
             payload_errors = torch.any(rx_result.bits != tx_result.bits, dim=-1)
             frame_errors = torch.logical_or(~crc, payload_errors)
@@ -151,6 +172,7 @@ def _resolve_device(requested: str) -> str:
     if requested == "cuda" or requested.startswith("cuda:"):
         if not torch.cuda.is_available():
             raise RuntimeError("配置请求 CUDA，但当前 PyTorch 环境没有可用 GPU/CUDA")
+        return "cuda:0" if requested == "cuda" else requested
     return requested
 
 
@@ -179,11 +201,13 @@ def save_bler_results(
         "simulation_settings": simulation_settings.to_dict(),
         "results": [asdict(point) for point in points],
         "bler_definition": "TB block error if CRC fails or any decoded payload bit differs",
+        "channel_domain": simulation_settings.channel_domain,
         "detector_validity_note": (
             "DFT-s-OFDM k-best first applies frequency-domain LMMSE, then uses a per-sample zero-lag "
             "effective spatial channel with residual frequency variation in the covariance. DFT-s-OFDM "
-            "MMSE-PIC uses soft time-domain moments for iterative frequency-domain cancellation. EP "
-            "remains a per-RE experimental detector for DFT-s-OFDM."
+            "MMSE-PIC uses soft time-domain moments for iterative frequency-domain cancellation. The "
+            "DFT-s-OFDM EP detector applies damped Gaussian-site moment matching to the same per-sample "
+            "spatial model; residual frequency variation is approximated as Gaussian covariance."
         ),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
