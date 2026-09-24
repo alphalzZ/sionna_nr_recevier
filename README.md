@@ -21,7 +21,11 @@ nr-pusch-channel --config configs/cdl_38_901_4x4.toml --input /tmp/pusch_tx.npz 
 
 ## 多用户接收和 BLER
 
-`NrPuschRx` 使用 Sionna PUSCH TB 解码器、4×4 LMMSE 均衡，以及 DFT-s-OFDM 每数据符号的逆 DFT。`channel_estimator="dmrs"` 从当前单 DMRS、双 OCC 端口对 profile 联合估计静态 slot CSI；`channel_estimator="perfect"` 使用仿真产生的 CDL 抽头提供理想 CSI 上界。DMRS 模式假设一个 slot 内信道不变，适用于当前零速静态 CDL profile；高 Doppler 或多 DMRS 配置需扩展时频插值并用抓包参考继续验证。
+`NrPuschRx` 使用 Sionna PUSCH TB 解码器、4×4 MIMO 检测，以及 DFT-s-OFDM 每数据符号的逆 DFT。信道估计可选 `dmrs`（当前单 DMRS、双 OCC 端口对 profile 的静态 slot LS）和 `perfect`（仿真 CDL 抽头理想 CSI 上界）。DMRS 模式假设一个 slot 内信道不变，适用于当前零速静态 CDL profile；高 Doppler 或多 DMRS 配置需扩展时频插值并用抓包参考继续验证。
+
+检测器可选 `lmmse`、`lmmse-sic`、`k-best`、`ep` 和 `mmse-pic`，参数通过 `detector` / `detector_parameter` 配置，接收 CLI 也提供 `--detector` 和 `--detector-parameter`。`lmmse-sic` 按估计信道功率从强到弱处理 UE：LMMSE 解调后进行 TB 译码，仅在该 UE CRC 通过时重编码并重构其 DFT-s-OFDM 资源网格，再从接收频域信号中消除该用户并处理下一个 UE。单次接收的 JSON sidecar 会记录检测顺序和每个 UE 消除前的 CRC 状态。BLER 配置中的 `detectors` 会按相同 seed、CDL、SNR 和 payload 顺序比较检测器。
+
+Sionna 的 `k-best`、`ep` 和 `mmse-pic` 按每个 RE 上独立 QAM 符号建模，而 DFT-s-OFDM 在 DFT 之后每个 RE 并非独立 QAM。在 60 dB、perfect CSI 的单帧检查中，这三种直接按 RE 检测的方法 CRC 均失败，因此仍标为实验性基线；DFT-s-OFDM 的非线性接收目前先采用 CRC 保护的 LMMSE-SIC。
 
 配置 SNR 扫描点、批大小、帧上限和停止错误数后运行：
 
@@ -29,12 +33,14 @@ nr-pusch-channel --config configs/cdl_38_901_4x4.toml --input /tmp/pusch_tx.npz 
 nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38_901_4x4.toml --simulation-config configs/bler_smoke.toml --output /tmp/pusch_bler.csv --device cpu
 ```
 
+将 `device` 写为 `cpu`、`cuda`、`cuda:0` 或 `auto` 可从 TOML 控制运算设备；`configs/bler_4ue_cdl_gpu.toml` 提供显式 CUDA 示例。当前运行环境没有可用 CUDA 设备，显式选择 CUDA 会给出错误提示。
+
 扫描会逐 SNR 点发射随机 transport blocks、通过 CDL、按每个接收天线的测得信号功率注入复 AWGN，再用 CRC 与 payload 比对统计 BLER。CSV 包含 SNR、BLER、CRC fail rate、BER 和样本数，JSON sidecar 保存配置及完整统计；BLER 将 CRC fail 或任何 payload bit 错误都计为 block error。`bler_smoke.toml` 是短时连通性配置，正式仿真应增加 `max_frames_per_snr` 和 `target_block_errors`。
 
 接收端也可独立加载 NPZ：`iq` 使用 `[batch,rx_antenna,sample]` 轴；`perfect` 模式另需 `channel_taps`（`[batch,user,rx_antenna,time,tap]`），`dmrs` 模式从 PUSCH DMRS 估计 CSI。
 
 ```bash
-nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /path/to/capture.npz --noise-variance 0.001 --channel-estimator dmrs --max-delay-spread-s 3e-6 --output /tmp/decoded.npz
+nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /path/to/capture.npz --noise-variance 0.001 --channel-estimator dmrs --detector lmmse-sic --max-delay-spread-s 3e-6 --output /tmp/decoded.npz
 ```
 
 ## 运行

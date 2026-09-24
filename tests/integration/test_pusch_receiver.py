@@ -1,7 +1,6 @@
 from pathlib import Path
 import unittest
 
-import sionna.phy
 import torch
 
 from nr_pusch.channel import NrPuschCdlChannel
@@ -10,6 +9,7 @@ from nr_pusch.config import TxSettings
 from nr_pusch.noise import add_awgn
 from nr_pusch.receiver import NrPuschRx
 from nr_pusch.transmitter import NrPuschTx
+import sionna.phy
 
 
 ROOT = Path(__file__).parents[2]
@@ -47,6 +47,19 @@ class PuschReceiverTest(unittest.TestCase):
         dmrs_result = dmrs_rx.receive(noisy.iq, noisy.noise_variance)
         self.assertTrue(torch.all(dmrs_result.crc_status).item())
         torch.testing.assert_close(dmrs_result.bits, tx_result.bits, rtol=0, atol=0)
+
+        sic_rx = NrPuschRx(
+            settings,
+            channel_estimator="dmrs",
+            detector="lmmse-sic",
+            max_delay_spread_s=channel_settings.channel.max_delay_spread_s,
+            device="cpu",
+        )
+        sic_result = sic_rx.receive(noisy.iq, noisy.noise_variance)
+        self.assertTrue(torch.all(sic_result.crc_status).item())
+        torch.testing.assert_close(sic_result.bits, tx_result.bits, rtol=0, atol=0)
+        self.assertEqual(set(sic_result.metadata["sic_user_order"]), {u.name for u in settings.users})
+        self.assertTrue(all(all(row) for row in sic_result.metadata["sic_crc_before_cancel"]))
 
 
 if __name__ == "__main__":

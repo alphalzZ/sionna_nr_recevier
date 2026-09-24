@@ -17,6 +17,10 @@ class BlerSettings:
     seed: int
     num_decoder_iterations: int
     channel_estimator: str
+    detector: str
+    detector_parameter: int | None
+    detectors: tuple[str, ...]
+    device: str
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "BlerSettings":
@@ -24,6 +28,10 @@ class BlerSettings:
             raw = tomllib.load(f)
         values = dict(raw["bler"])
         values["snr_db"] = tuple(float(x) for x in values["snr_db"])
+        values.setdefault("detector", "lmmse")
+        values.setdefault("detector_parameter", None)
+        values["detectors"] = tuple(values.get("detectors", (values["detector"],)))
+        values.setdefault("device", "cpu")
         settings = cls(**values)
         settings.validate()
         return settings
@@ -39,6 +47,13 @@ class BlerSettings:
             raise ValueError("target_block_errors 和 num_decoder_iterations 必须大于 0")
         if self.channel_estimator not in {"perfect", "dmrs"}:
             raise ValueError("channel_estimator 仅支持 perfect 或 dmrs")
+        allowed = {"lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic"}
+        if self.detector not in allowed or not self.detectors or any(x not in allowed for x in self.detectors):
+            raise ValueError(f"detector(s) 必须属于 {sorted(allowed)}")
+        if self.detector_parameter is not None and self.detector_parameter < 1:
+            raise ValueError("detector_parameter 必须大于 0")
+        if self.device not in {"cpu", "cuda", "auto"} and not self.device.startswith("cuda:"):
+            raise ValueError("device 仅支持 cpu、cuda、cuda:N 或 auto")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

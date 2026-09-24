@@ -7,36 +7,69 @@ from typing import Any
 
 import numpy as np
 import torch
-from sionna.phy.mapping import Demapper
+from sionna.phy.mapping import Constellation, Demapper
 from sionna.phy.channel import time_lag_discrete_time_channel
 from sionna.phy.mimo import StreamManagement
 from sionna.phy.nr import PUSCHReceiver, PUSCHTransmitter, TBDecoder
-from sionna.phy.ofdm import LMMSEEqualizer, LinearDetector
+from sionna.phy.ofdm import (
+    EPDetector,
+    KBestDetector,
+    LMMSEEqualizer,
+    LinearDetector,
+    MMSEPICDetector,
+)
 
 from .config import TxSettings
 from .transmitter import NrPuschTx
 
 
 class DftSOfdmMimoDetector(torch.nn.Module):
-    """LMMSE-detect the spread symbols, then undo per-symbol DFT spreading."""
+    """Detect spread symbols, undo DFT spreading, then produce QAM LLRs."""
 
-    def __init__(self, transmitter: PUSCHTransmitter, stream_management: StreamManagement):
+    def __init__(self, transmitter: PUSCHTransmitter, stream_management: StreamManagement,
+                 method: str = "lmmse", parameter: int | None = None):
         super().__init__()
         self._resource_grid = transmitter.resource_grid
-        self._equalizer = LMMSEEqualizer(self._resource_grid, stream_management, device=transmitter.device)
+        self.method = method
+        self.parameter = parameter
+        bps = transmitter._num_bits_per_symbol
+        if method == "lmmse":
+            self._detector = LMMSEEqualizer(
+                self._resource_grid, stream_management, device=transmitter.device
+            )
+        elif method == "k-best":
+            self._detector = KBestDetector(
+                "symbol", stream_management._num_tx * stream_management._num_streams_per_tx,
+                parameter or 64,
+                self._resource_grid, stream_management, constellation_type="qam",
+                num_bits_per_symbol=bps, hard_out=True, device=transmitter.device,
+            )
+        elif method == "ep":
+            self._detector = EPDetector(
+                "symbol", self._resource_grid, stream_management, bps,
+                l=parameter or 10, hard_out=True, device=transmitter.device,
+            )
+        elif method == "mmse-pic":
+            self._detector = _MmsePicSymbolAdapter(
+                self._resource_grid, stream_management, bps, parameter or 4,
+                device=transmitter.device,
+            )
+        else:
+            raise ValueError(f"不支持的 MIMO detector: {method}")
         self._demapper = Demapper(
-            "maxlog",
+            "app",
             "qam",
-            transmitter._num_bits_per_symbol,
+            bps,
             device=transmitter.device,
+        )
+        self._constellation = Constellation(
+            "qam", bps, device=transmitter.device
         )
 
         # Reuse Sionna's resource-grid data indexing so demapper ordering stays
         # consistent with its PUSCH layer mapper and TB decoder.
-        extractor = LinearDetector(
-            "lmmse", "symbol", "maxlog", self._resource_grid, stream_management,
-            "qam", transmitter._num_bits_per_symbol, device=transmitter.device,
-        )
+        extractor = LinearDetector("lmmse", "symbol", "app", self._resource_grid,
+                                   stream_management, "qam", bps, device=transmitter.device)
         indices = extractor._data_ind
         if not torch.all(indices == indices[0:1, 0:1]).item():
             raise ValueError("DFT-s-OFDM currently requires identical data RE positions for all users")
@@ -55,7 +88,7 @@ class DftSOfdmMimoDetector(torch.nn.Module):
         self._num_spread_symbols = int(active_counts.numel())
         self._fft_size = int(fft_size)
         self._num_data_symbols = int(ordered_indices.numel())
-        self._num_bits_per_symbol = transmitter._num_bits_per_symbol
+        self._num_bits_per_symbol = bps
 
     def forward(
         self,
@@ -64,7 +97,15 @@ class DftSOfdmMimoDetector(torch.nn.Module):
         err_var: torch.Tensor,
         no: torch.Tensor,
     ) -> torch.Tensor:
-        x_hat, no_eff = self._equalizer(y, h_hat, err_var, no)
+        if self.method == "mmse-pic":
+            x_hat = self._detector(y, h_hat, err_var, no)
+        elif self.method == "lmmse":
+            x_hat, no_eff = self._detector(y, h_hat, err_var, no)
+        else:
+            x_hat = self._detector(y, h_hat, err_var, no)
+        if not x_hat.is_complex():
+            # Sionna hard_out=True returns QAM point indices for symbol output.
+            x_hat = self._constellation.points[x_hat.to(torch.long)]
         batch, num_tx, num_streams, num_data = x_hat.shape
         expected = self._num_spread_symbols * self._fft_size
         if num_data != expected:
@@ -73,15 +114,123 @@ class DftSOfdmMimoDetector(torch.nn.Module):
             )
 
         x_hat = x_hat.reshape(batch, num_tx, num_streams, self._num_spread_symbols, self._fft_size)
-        no_eff = no_eff.reshape_as(x_hat.real)
         # Tx applies a unitary forward DFT per data-bearing OFDM symbol.
         x_hat = torch.fft.ifft(x_hat, dim=-1, norm="ortho")
         # The unitary inverse DFT produces correlated noise when subcarrier
         # variances differ. Average variance per spread symbol for LLR scaling.
-        no_eff = no_eff.mean(dim=-1, keepdim=True).expand_as(x_hat.real)
+        if self.method == "lmmse":
+            no_eff = no_eff.reshape_as(x_hat.real).mean(dim=-1, keepdim=True).expand_as(x_hat.real)
+        else:
+            no_eff = torch.as_tensor(no, dtype=x_hat.real.dtype, device=x_hat.device)
+            if no_eff.ndim >= 2:
+                no_eff = no_eff.mean(dim=tuple(range(1, no_eff.ndim)))
+            no_eff = no_eff.reshape(batch, 1, 1, 1, 1).expand_as(x_hat.real)
         x_hat = x_hat.reshape(batch, num_tx, num_streams, self._num_data_symbols)
         no_eff = no_eff.reshape_as(x_hat.real)
         return self._demapper(x_hat, no_eff)
+
+
+class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
+    """Decode users strongest-first and cancel CRC-verified reconstructions."""
+
+    def __init__(
+        self,
+        transmitter: PUSCHTransmitter,
+        stream_management: StreamManagement,
+        settings: TxSettings,
+        *,
+        num_decoder_iterations: int,
+        device: str | None,
+    ) -> None:
+        super().__init__(transmitter, stream_management, method="lmmse")
+        self._sic_decoder = TBDecoder(
+            transmitter._tb_encoder,
+            num_bp_iter=num_decoder_iterations,
+            device=device,
+        )
+        self._reencoder = NrPuschTx(settings, device=device)
+        self._num_users = len(settings.users)
+        self._transport_block_size = self._reencoder.transport_block_size
+        self.last_user_order: list[int] = []
+        self.last_crc_status: torch.Tensor | None = None
+
+    def forward(
+        self,
+        y: torch.Tensor,
+        h_hat: torch.Tensor,
+        err_var: torch.Tensor,
+        no: torch.Tensor,
+    ) -> torch.Tensor:
+        residual_y = y.clone()
+        residual_h = h_hat.clone()
+        residual_err = torch.broadcast_to(err_var, h_hat.shape).clone()
+        llr_final = None
+
+        # Strongest estimated channel is decoded first. Only a TB with passing
+        # CRC is reconstructed and subtracted, avoiding SIC error propagation.
+        user_power = h_hat.abs().square().sum(dim=(1, 2, 4, 5, 6)).mean(dim=0)
+        user_order = torch.argsort(user_power, descending=True).tolist()
+        self.last_user_order = user_order
+        crc_by_user = torch.zeros(
+            (y.shape[0], self._num_users), dtype=torch.bool, device=y.device
+        )
+        for user in user_order:
+            llr = super().forward(residual_y, residual_h, residual_err, no)
+            if llr_final is None:
+                llr_final = torch.zeros_like(llr)
+            llr_final[:, user] = llr[:, user]
+
+            decoded_bits, crc_status = self._sic_decoder(llr)
+            cancel_mask = crc_status[:, user]
+            crc_by_user[:, user] = cancel_mask
+            if not torch.any(cancel_mask).item():
+                continue
+
+            tx_bits = torch.zeros(
+                (y.shape[0], self._num_users, self._transport_block_size),
+                dtype=torch.float32,
+                device=y.device,
+            )
+            tx_bits[:, user] = decoded_bits[:, user].to(dtype=tx_bits.dtype)
+            reconstructed_grid = self._reencoder.generate(
+                batch_size=y.shape[0], bits=tx_bits
+            ).frequency_grid[:, user, 0]
+
+            h_user = h_hat[:, :, :, user, 0, :, :]
+            contribution = h_user * reconstructed_grid[:, None, None, :, :]
+            mask_y = cancel_mask.reshape(-1, 1, 1, 1, 1)
+            residual_y = residual_y - mask_y * contribution
+
+            mask_h = cancel_mask.reshape(-1, 1, 1, 1, 1, 1)
+            residual_h[:, :, :, user, :, :, :] *= ~mask_h
+            residual_err[:, :, :, user, :, :, :] *= ~mask_h
+
+        if llr_final is None:
+            raise RuntimeError("SIC detector has no users to process")
+        self.last_crc_status = crc_by_user
+        return llr_final
+
+
+class _MmsePicSymbolAdapter(torch.nn.Module):
+    """Supply neutral symbol priors to Sionna's prior-aware MMSE-PIC block."""
+
+    def __init__(self, resource_grid, stream_management, bps: int, iterations: int,
+                 *, device: str | None):
+        super().__init__()
+        self._detector = MMSEPICDetector(
+            "symbol", "app", resource_grid, stream_management, num_iter=iterations,
+            constellation_type="qam", num_bits_per_symbol=bps, hard_out=True, device=device,
+        )
+        self._num_tx = stream_management._num_tx
+        self._num_streams = stream_management._num_streams_per_tx
+        self._num_data_symbols = resource_grid.pilot_pattern.num_data_symbols
+        self._num_points = 1 << bps
+
+    def forward(self, y, h_hat, err_var, no):
+        prior = torch.zeros((y.shape[0], self._num_tx, self._num_streams,
+                             self._num_data_symbols, self._num_points),
+                            dtype=y.real.dtype, device=y.device)
+        return self._detector(y, h_hat, prior, err_var, no)
 
 
 class DftSOfdmDmrsEstimator(torch.nn.Module):
@@ -206,6 +355,8 @@ class NrPuschRx:
         l_min: int = -6,
         max_delay_spread_s: float = 3e-6,
         num_decoder_iterations: int = 20,
+        detector: str = "lmmse",
+        detector_parameter: int | None = None,
         device: str | None = None,
     ) -> None:
         settings.validate()
@@ -230,7 +381,18 @@ class NrPuschRx:
         self.sample_rate_hz = int(tx.resource_grid.fft_size * tx.resource_grid.subcarrier_spacing)
         _, l_max = time_lag_discrete_time_channel(self.sample_rate_hz, max_delay_spread_s)
         stream_management = StreamManagement(np.ones((1, len(settings.users)), dtype=bool), 1)
-        detector = DftSOfdmMimoDetector(tx, stream_management)
+        if detector == "lmmse-sic":
+            detector_block = DftSOfdmLmmseSicDetector(
+                tx,
+                stream_management,
+                settings,
+                num_decoder_iterations=num_decoder_iterations,
+                device=device,
+            )
+        else:
+            detector_block = DftSOfdmMimoDetector(
+                tx, stream_management, detector, detector_parameter
+            )
         if channel_estimator == "dmrs":
             template_tx = NrPuschTx(settings, device=device)
             zero_bits = torch.zeros(
@@ -258,7 +420,7 @@ class NrPuschRx:
         self._receiver = PUSCHReceiver(
             tx,
             channel_estimator=estimator,
-            mimo_detector=detector,
+            mimo_detector=detector_block,
             tb_decoder=tb_decoder,
             return_tb_crc_status=True,
             stream_management=stream_management,
@@ -267,6 +429,8 @@ class NrPuschRx:
             device=device,
         )
         self.channel_estimator = channel_estimator
+        self.detector = detector
+        self.detector_parameter = detector_parameter
 
     def receive(
         self,
@@ -296,13 +460,34 @@ class NrPuschRx:
             if h is not None:
                 h = h.to(self.device)
         bits, crc_status = self._receiver(y, no, h)
+        sic_metadata = {}
+        if self.detector == "lmmse-sic":
+            sic_detector = self._receiver._mimo_detector
+            sic_metadata = {
+                "sic_user_order": [self.settings.users[i].name for i in sic_detector.last_user_order],
+                "sic_crc_before_cancel": (
+                    sic_detector.last_crc_status.detach().cpu().tolist()
+                    if sic_detector.last_crc_status is not None else None
+                ),
+            }
         metadata = {
             "waveform": self.settings.pusch.waveform,
-            "detector": "Sionna LMMSE + inverse DFT spreading + max-log QAM demapper",
+            "detector": self.detector,
+            "detector_parameter": self.detector_parameter,
+            "detector_note": (
+                "Strongest-first LMMSE-SIC; cancel only after the user's TB CRC passes."
+                if self.detector == "lmmse-sic"
+                else
+                "This per-RE Sionna detector assumes independent QAM symbols; for DFT-s-OFDM "
+                "the non-LMMSE options are experimental until cross-subcarrier detection is added."
+                if self.detector != "lmmse"
+                else "LMMSE equalizes DFT-spread subcarriers before inverse DFT spreading."
+            ),
             "decoder": "Sionna NR TBDecoder",
             "channel_estimator": "perfect CDL CSI" if self.channel_estimator == "perfect" else "DFT-s-OFDM DMRS OCC LS",
             "crc_status_axes": ["batch", "user"],
             "bits_axes": ["batch", "user", "transport_block_bit"],
             "sample_rate_hz": self.sample_rate_hz,
+            **sic_metadata,
         }
         return RxResult(bits=bits, crc_status=crc_status, metadata=metadata)

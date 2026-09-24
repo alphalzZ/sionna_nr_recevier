@@ -13,4 +13,4 @@ detectors = ["lmmse", "lmmse-sic"]
 # SIC decodes the strongest UE first and only cancels a CRC-passing TB.
 detector = "lmmse-sic"
 # cpu, cuda, cuda:0, or auto. Explicit CUDA fails clearly when unavailable.
-device = "cpu"
+device = "cuda"
