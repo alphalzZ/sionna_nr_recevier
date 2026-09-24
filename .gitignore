@@ -1,0 +1,22 @@
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build and editable-install artifacts
+build/
+dist/
+*.egg-info/
+
+# Local environments and generated runs
+.venv/
+venv/
+runs/
+*.npz
+
+# Local credentials/config overrides
+.env
+.env.*
+!.env.example
