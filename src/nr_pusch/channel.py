@@ -9,9 +9,7 @@ import torch
 from sionna.phy.channel import (
     ApplyOFDMChannel,
     ApplyTimeChannel,
-    cir_to_ofdm_channel,
     cir_to_time_channel,
-    subcarrier_frequencies,
     time_lag_discrete_time_channel,
 )
 from sionna.phy.channel.tr38901 import AntennaArray, CDL
@@ -79,12 +77,13 @@ class NrPuschCdlChannel:
         self._apply_ofdm_channel = ApplyOFDMChannel(device=device)
 
     def apply_frequency(self, frequency_grid: torch.Tensor, resource_grid) -> FrequencyChannelResult:
-        """Apply independent per-UE CDL responses directly to an OFDM grid.
+        """Apply CDL through the same finite-tap response as the time path.
 
         ``frequency_grid`` uses Sionna's ``[batch, user, tx_ant, symbol, fft]``
-        layout. This single-tap frequency-domain model assumes the cyclic prefix
-        is sufficient; use :meth:`apply` when sample-level ISI or captured IQ is
-        part of the experiment.
+        layout. CDL is sampled once per OFDM symbol, converted to the configured
+        discrete sinc taps, then transformed to the frequency grid. This keeps
+        batch processing efficient while matching the time path's tap support.
+        The single-tap OFDM model still assumes a sufficient cyclic prefix.
         """
         if frequency_grid.ndim != 5 or frequency_grid.shape[1:3] != (self.num_users, 1):
             raise ValueError(
@@ -101,11 +100,13 @@ class NrPuschCdlChannel:
         num_symbols = resource_grid.num_ofdm_symbols
         fft_size = resource_grid.fft_size
         num_rx_antennas = self.settings.antennas.rx_num_rows * self.settings.antennas.rx_num_cols
-        frequencies = subcarrier_frequencies(
-            fft_size,
-            resource_grid.subcarrier_spacing,
-            device=str(frequency_grid.device),
+        sample_rate_hz = float(resource_grid.bandwidth)
+        l_min, l_max = time_lag_discrete_time_channel(
+            sample_rate_hz, self.settings.channel.max_delay_spread_s
         )
+        num_taps = l_max - l_min + 1
+        if num_taps > fft_size:
+            raise ValueError("CDL 离散 taps 数量不能超过 OFDM FFT size")
 
         # The CDL batch axis represents independent UE links. Sample only once
         # per OFDM symbol, avoiding the many Nyquist-rate time samples needed
@@ -115,11 +116,21 @@ class NrPuschCdlChannel:
             num_symbols,
             1.0 / resource_grid.ofdm_symbol_duration,
         )
-        h_flat = cir_to_ofdm_channel(
-            frequencies,
+        h_time = cir_to_time_channel(
+            sample_rate_hz,
             a,
             tau,
+            l_min,
+            l_max,
             normalize=self.settings.channel.normalize_channel,
+        )
+        # Equivalent to Sionna time_to_ofdm_channel for one CIR sample per
+        # OFDM symbol: move negative lags to the end before the FFT. Avoid
+        # expanding the taps to every Nyquist-rate sample in a batch.
+        h_padded = torch.nn.functional.pad(h_time, (0, fft_size - num_taps))
+        h_flat = torch.fft.fftshift(
+            torch.fft.fft(torch.roll(h_padded, shifts=l_min, dims=-1), dim=-1),
+            dim=-1,
         )
         h_freq = h_flat.reshape(
             batch_size, self.num_users, 1, num_rx_antennas, 1,
@@ -146,6 +157,9 @@ class NrPuschCdlChannel:
             "subcarrier_spacing_hz": float(resource_grid.subcarrier_spacing),
             "ofdm_symbol_duration_s": float(resource_grid.ofdm_symbol_duration),
             "cyclic_prefix_assumption": "sufficient; frequency-domain channel excludes ISI",
+            "frequency_response_source": "Sionna discrete sinc taps with time-domain lag support",
+            "time_lag_min": l_min,
+            "time_lag_max": l_max,
             "delay_spread_s": self.settings.channel.delay_spread_s,
             "carrier_frequency_hz": self.settings.channel.carrier_frequency_hz,
         }

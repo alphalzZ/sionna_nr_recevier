@@ -10,7 +10,7 @@
 
 `NrPuschCdlChannel` 使用 Sionna TR 38.901 CDL A–E 模型处理 4 个独立的上行 UE 链路，每个 UE 使用 1 根发射天线；4 条链路在 4 天线 BS 接收端叠加。接收阵列形状、CDL 模型、载波频率、时延扩展和速度范围等参数位于 `configs/cdl_38_901_4x4.toml`。该 profile 使用单极化 2×2 接收阵列。
 
-BLER 链路默认用 `channel_domain = "frequency"`：直接对发射资源网格施加按 OFDM 符号采样的 CDL 频响，保留整个 batch 维并行，不生成过采样 CIR 和时域卷积。该单抽头频域模型假设 CP 足以覆盖时延扩展，不模拟 CP 不足导致的 ISI 或符号内快速时变造成的 ICI。设为 `channel_domain = "time"` 可使用时域卷积；独立 IQ 抓包的信道命令也继续使用时域路径。
+BLER 链路默认用 `channel_domain = "frequency"`：按 OFDM 符号采样 CDL CIR，使用与时域链路相同的有限长度 sinc taps 和时延范围生成频响，再直接施加到发射资源网格，保留 batch 并行，不生成逐采样 CIR 和时域卷积。该单抽头频域模型假设 CP 足以覆盖时延扩展，不模拟 CP 不足导致的 ISI 或符号内快速时变造成的 ICI。设为 `channel_domain = "time"` 可使用时域卷积；独立 IQ 抓包的信道命令也继续使用时域路径。
 
 先生成发送 IQ，再将其作为独立输入应用信道：
 
@@ -32,7 +32,9 @@ nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /tmp/pusch_rx_grid.npz --
 
 ## 多用户接收和 BLER
 
-`NrPuschRx` 使用 Sionna PUSCH TB 解码器、4×4 MIMO 检测，以及 DFT-s-OFDM 每数据符号的逆 DFT。接收器可直接接收频域资源网格和频域 perfect CSI，也保留时域 IQ 接口供抓包分析。信道估计可选 `dmrs`（当前单 DMRS、双 OCC 端口对，OCC 解扩后跨频率插值）和 `perfect`（仿真 CDL 理想 CSI 上界）。DMRS 模式假设一个 slot 内信道不变，适用于当前零速静态 CDL profile；高 Doppler 或多 DMRS 配置需扩展时频插值并用抓包参考继续验证。
+`NrPuschRx` 使用 Sionna PUSCH TB 解码器、4×4 MIMO 检测，以及 DFT-s-OFDM 每数据符号的逆 DFT。时域 IQ 先由 Sionna OFDM 解调为资源网格；直接加载的频域网格跳过这一步。两种输入随后共用同一个频域 DMRS 估计器：利用发送端实际映射的低 PAPR DMRS 和 OCC 端口序列，对每对共享 comb 的用户做联合 LS 拟合，输出各子载波频响和估计误差方差。其流程遵循 [Sionna OFDM MIMO 信道估计与检测教程](https://nvlabs.github.io/sionna/phy/tutorials/notebooks/OFDM_MIMO_Detection.html) 的资源网格导频估计与检测接口；Sionna 原生 PUSCH 导频序列与本仓库的 DFT-s-OFDM 序列不同，因此此处保留自定义的 OCC 处理。`perfect` 模式直接使用仿真 CDL CSI，仅用于上界对照。
+
+DMRS 的 LS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围：当前为 18 MHz 采样率下的 `-6..60`，共 67 taps。这是接收机的时延范围先验，不读取本帧的真实信道系数。单个 DMRS 符号的估计扩展到整个 slot，适用于当前零速静态 CDL profile；高 Doppler 或多 DMRS 配置需扩展时频插值并用抓包参考验证。
 
 检测器可选 `lmmse`、`lmmse-sic`、`k-best`、`mmse-pic` 和 `ep`，参数通过 `detector`、`detector_parameter` 或 BLER 配置中的 `detector_parameters` 配置，接收 CLI 也提供 `--detector` 和 `--detector-parameter`。`k-best` 和 `ep` 均先做频域 LMMSE 预均衡并 IDFT；每个时域采样点建立四流空间模型，频率变化与等化噪声合并为残余 ISI 协方差。K-best 在该模型上搜索有限星座路径。EP 则为四个 QAM 用户维护复高斯近似因子，以 cavity 分布对离散星座做矩匹配，并对因子参数阻尼迭代，最后由后验均值和方差形成软 LLR。`mmse-pic` 从时域 LLR 计算软星座期望，DFT 回频域后并行消除其他 UE，并更新 LLR。迭代次数通过 `detector_parameters` 设置；软迭代阻尼可用 `detector_damping` / `--detector-damping` 配置。`lmmse-sic` 按估计信道功率从强到弱处理 UE：仅在该 UE CRC 通过时重编码、重构其 DFT-s-OFDM 资源网格并消除干扰。单次接收 JSON sidecar 会记录 SIC 检测顺序和每个 UE 消除前的 CRC 状态。BLER 配置中的 `detectors` 会按相同 seed、CDL、SNR 和 payload 顺序比较检测器；例如 `{ "k-best" = 16, "mmse-pic" = 4, "ep" = 10 }`。
 
@@ -48,7 +50,7 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 扫描会逐 SNR 点发射随机 transport blocks、通过 CDL、按每个接收天线的测得信号功率注入复 AWGN，再用 CRC 与 payload 比对统计 BLER。CSV 包含 SNR、BLER、CRC fail rate、BER 和样本数，JSON sidecar 保存配置及完整统计；BLER 将 CRC fail 或任何 payload bit 错误都计为 block error。`bler_smoke.toml` 是短时连通性配置，正式仿真应增加 `max_frames_per_snr` 和 `target_block_errors`。
 
-### GPU batch 选择与频域/时域对照
+### 历史 GPU batch 扫描与频域/时域对照
 
 在 NVIDIA GeForce RTX 3060 Laptop GPU（6 GiB，测试时约有 1.3 GiB 被其他进程占用）上，用 CUDA、4 用户 DFT-s-OFDM、CDL-A、DMRS 信道估计、LMMSE 检测和 30 dB SNR 测量单批吞吐。表中帧吞吐为重复运行的均值；每帧含 4 个 UE transport blocks。
 
@@ -60,7 +62,7 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 | 36 | — | — | — | OOM |
 | 48 | — | — | — | OOM |
 
-在这台有其他进程占用显存的机器上，建议频域 BLER 使用 batch 28；仅在 GPU 空闲且追求吞吐时使用 32。batch 28 比 24 快约 12%，比 32 慢约 7.8%，但少占约 0.51 GiB 峰值保留显存。该结论对应上述硬件和 LMMSE/DMRS 工作负载，不代表其他检测器或 GPU 的最优值。
+旧实现中，batch 28 比 24 快约 12%，比 32 慢约 7.8%，但少占约 0.51 GiB 峰值保留显存。该扫描使用原先的频域线性插值估计器；当前统一的联合 LS tap 拟合改变了运算量，表中吞吐和推荐 batch 需要重新测量后才能用于新实现。
 
 频域与时域的大规模对照复用了既有时域全面仿真 `/tmp/pusch_mimo_detection_comparison_ep_full_18_39.csv/json` 中的 LMMSE 结果，没有重跑时域链路。频域使用 batch 28、相同的 18–39 dB SNR 点、seed、DMRS、LMMSE 和每个 SNR 点相同的帧数，共 2,857 帧/11,428 个 TB。数据如下：
 
@@ -77,7 +79,9 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 | 36 | 1,000 | 0.0065 | 1,000 | 0.0703 |
 | 39 | 1,000 | 0.00125 | 1,000 | 0.0480 |
 
-本次对照**没有通过频域/时域 BLER 接近性验证**：频域 BLER 在中高 SNR 明显偏高，39 dB 处出现约 0.048 的误块平台；8 个点的平均绝对 BLER 差约 0.088。频域路径的 LMMSE/DMRS 诊断还显示，perfect-CSI 频域链路在 33 dB、140 帧时 BLER 为 0.0089，而 DMRS 频域链路为 0.1375，偏差集中在频域 DMRS 信道估计链路。当前频域链路适合高吞吐实验，但不应把其 DMRS BLER 当作与历史时域结果等价的曲线；需要继续校准估计误差、噪声方差和频域/时域等效条件。
+这组历史对照**没有通过频域/时域 BLER 接近性验证**：频域 BLER 在中高 SNR 明显偏高，39 dB 处出现约 0.048 的误块平台；8 个点的平均绝对 BLER 差约 0.088。频域路径的 LMMSE/DMRS 诊断还显示，perfect-CSI 频域链路在 33 dB、140 帧时 BLER 为 0.0089，而 DMRS 频域链路为 0.1375。该数据产生于两域分别使用不同信道转换和 DMRS 插值算法的旧实现；表格保留为历史结果，不代表当前统一接收链路的性能，需重新进行配对验证。
+
+修复后的定点配对检查在 30 dB 使用同一发送 payload、CDL seed 和 OFDM 解调后的噪声，比较了 12 帧/48 个 TB：两域各有 6 个 CRC 失败，CRC 判定分歧为 0；无噪声接收网格的平均相对 RMS 差为 0.235%。该样本量只用于检查两条实现路径的一致性，不能替代完整 BLER 曲线。
 
 全面仿真 CSV/JSON 保存在 `/tmp/pusch_mimo_detection_comparison_ep_full_18_39.csv/json`（既有时域全检测器结果）及 `/tmp/pusch_frequency_vs_previous_time.csv/json`（本次频域结果和对照）。短时诊断、batch 扫描原始文件和临时脚本不作为结果归档。
 

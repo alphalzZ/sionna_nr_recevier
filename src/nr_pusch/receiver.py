@@ -593,7 +593,14 @@ class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
 
 
 class DftSOfdmDmrsEstimator(torch.nn.Module):
-    """Despread OCC DMRS and interpolate the channel across frequency."""
+    """Fit frequency-domain OCC DMRS to a finite-tap channel basis.
+
+    Both time-IQ and frequency-grid receivers call this block after OFDM
+    demodulation. Sionna's stock PUSCH LS estimator uses its native pilot
+    sequence, while this transmitter maps a transform-precoded low-PAPR DMRS.
+    The fitted taps are only interpolation parameters; input and output are
+    both frequency-domain resource grids and CSI.
+    """
 
     def __init__(
         self,
@@ -601,20 +608,14 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
         resource_grid,
         l_min: int,
         l_max: int,
-        mode: str = "time",
     ):
         super().__init__()
-        if mode not in {"time", "frequency"}:
-            raise ValueError("DMRS estimator mode must be time or frequency")
-        self.mode = mode
         # [user, num_subcarriers] template from the actual DFT-s-OFDM mapper.
         if pilot_grid.ndim != 2 or pilot_grid.shape[0] != 4:
             raise ValueError("DMRS 模板必须为 [4 users, num_subcarriers]")
         self.register_buffer("_pilot_grid", pilot_grid)
         self._num_subcarriers = pilot_grid.shape[-1]
         self._num_ofdm_symbols = resource_grid.num_ofdm_symbols
-        self._l_min = l_min
-        self._l_max = l_max
         self._num_taps = l_max - l_min + 1
         mask = resource_grid.pilot_pattern.mask[0, 0]
         dmrs_symbols = torch.where(mask.sum(dim=-1) > 0)[0]
@@ -632,17 +633,20 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
             raise ValueError("当前 DMRS 估计要求四个用户组成两组共享 comb 的正交端口")
 
         self._pairs: list[tuple[int, int, str, str, str]] = []
-        self._frequency_pairs: list[tuple[int, int, str, str, str]] = []
         target_bins = torch.arange(self._num_subcarriers, dtype=torch.float32, device=pilot_grid.device)
-        if mode == "time":
-            q = target_bins - self._num_subcarriers // 2
-            lags = torch.arange(l_min, l_max + 1, dtype=torch.float32, device=pilot_grid.device)
-            frequency_basis = torch.exp(
-                (-2j * torch.pi / self._num_subcarriers) * q[:, None] * lags[None, :]
-            )
-            self.register_buffer("_frequency_basis", frequency_basis)
+        centered_bins = target_bins - self._num_subcarriers // 2
+        lags = torch.arange(l_min, l_max + 1, dtype=torch.float32, device=pilot_grid.device)
+        frequency_basis = torch.exp(
+            (-2j * torch.pi / self._num_subcarriers) * centered_bins[:, None] * lags[None, :]
+        )
+        self.register_buffer("_frequency_basis", frequency_basis)
         for support_tuple, users in support_groups.items():
             support = torch.tensor(support_tuple, dtype=torch.long, device=pilot_grid.device)
+            if support.numel() < 2 * self._num_taps:
+                raise ValueError(
+                    "DMRS pilot RE 数量不足以联合拟合两个用户的候选信道 taps；"
+                    "请减小 max_delay_spread_s 或增加 DMRS 资源"
+                )
             base, partner = users
             ratio = pilot_grid[partner, support] / pilot_grid[base, support]
             ratio_pairs = ratio.reshape(-1, 2)
@@ -650,48 +654,22 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
                 raise ValueError("DMRS OCC pair must start with a +1 cover chip")
             if not torch.allclose(ratio_pairs[:, 1], -torch.ones_like(ratio_pairs[:, 1])):
                 raise ValueError("DMRS OCC pair must alternate +1/-1 for despreading")
-            pair_id = len(self._pairs) + len(self._frequency_pairs)
+            pair_id = len(self._pairs)
             support_name = f"_support_{pair_id}"
             self.register_buffer(support_name, support)
-            if mode == "time":
-                design = torch.cat(
-                    (
-                        pilot_grid[base, support, None] * frequency_basis[support],
-                        pilot_grid[partner, support, None] * frequency_basis[support],
-                    ),
-                    dim=-1,
-                )
-                covariance = torch.linalg.pinv(design.mH @ design)
-                design_name = f"_design_{pair_id}"
-                covariance_name = f"_covariance_{pair_id}"
-                self.register_buffer(design_name, design)
-                self.register_buffer(covariance_name, covariance)
-                self._pairs.append((base, partner, design_name, support_name, covariance_name))
-            else:
-                pilot_locations = (support[0::2] + support[1::2]).to(torch.float32) * 0.5
-                right = torch.searchsorted(pilot_locations, target_bins).clamp(0, pilot_locations.numel() - 1)
-                left = (right - 1).clamp(0, pilot_locations.numel() - 1)
-                same = left == right
-                denominator = (pilot_locations[right] - pilot_locations[left]).clamp_min(1.0)
-                alpha = torch.where(
-                    same,
-                    torch.zeros_like(target_bins),
-                    (target_bins - pilot_locations[left]) / denominator,
-                )
-                interpolation = torch.zeros(
-                    (self._num_subcarriers, pilot_locations.numel()),
-                    dtype=torch.float32,
-                    device=pilot_grid.device,
-                )
-                interpolation.scatter_add_(1, left[:, None], (1.0 - alpha)[:, None])
-                interpolation.scatter_add_(1, right[:, None], alpha[:, None])
-                pilot_name = f"_base_pilot_{pair_id}"
-                interpolation_name = f"_interpolation_{pair_id}"
-                self.register_buffer(pilot_name, pilot_grid[base, support])
-                self.register_buffer(interpolation_name, interpolation)
-                self._frequency_pairs.append(
-                    (base, partner, support_name, pilot_name, interpolation_name)
-                )
+            design = torch.cat(
+                (
+                    pilot_grid[base, support, None] * frequency_basis[support],
+                    pilot_grid[partner, support, None] * frequency_basis[support],
+                ),
+                dim=-1,
+            )
+            covariance = torch.linalg.pinv(design.mH @ design)
+            design_name = f"_design_{pair_id}"
+            covariance_name = f"_covariance_{pair_id}"
+            self.register_buffer(design_name, design)
+            self.register_buffer(covariance_name, covariance)
+            self._pairs.append((base, partner, design_name, support_name, covariance_name))
 
     def forward(self, y: torch.Tensor, no: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch, num_rx, num_rx_ant, _, _ = y.shape
@@ -706,58 +684,31 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
         no = torch.broadcast_to(no, (batch, num_rx, num_rx_ant))
         err_var = torch.zeros_like(h_hat.real)
         y_pilot = y[:, 0, :, self._dmrs_symbol, :]
-        if self.mode == "time":
-            for base, partner, design_name, support_name, covariance_name in self._pairs:
-                design = getattr(self, design_name).to(y.device)
-                support = getattr(self, support_name).to(y.device)
-                covariance = getattr(self, covariance_name).to(y.device)
-                observations = y_pilot.index_select(-1, support)
-                rhs = observations.permute(2, 0, 1).reshape(support.numel(), -1)
-                taps = torch.linalg.lstsq(design, rhs).solution
-                taps = taps.reshape(2 * self._num_taps, batch, num_rx_ant).permute(1, 2, 0)
-                for user, tap_slice in (
-                    (base, slice(0, self._num_taps)),
-                    (partner, slice(self._num_taps, 2 * self._num_taps)),
-                ):
-                    user_taps = taps[..., tap_slice]
-                    h_freq = user_taps @ self._frequency_basis.to(y.device).T
-                    h_hat[:, 0, :, user, 0, :, :] = h_freq.unsqueeze(-2).expand(
-                        -1, -1, self._num_ofdm_symbols, -1
-                    )
-                    cov_user = covariance[tap_slice, tap_slice]
-                    basis = self._frequency_basis.to(y.device)
-                    frequency_error = torch.einsum(
-                        "nl,lm,nm->n", basis, cov_user, basis.conj()
-                    ).real.clamp_min(0.0)
-                    err_var[:, 0, :, user, 0, :, :] = (
-                        no[:, 0, :, None] * frequency_error[None, None, :]
-                    ).unsqueeze(-2).expand(-1, -1, self._num_ofdm_symbols, -1)
-            return h_hat, err_var
-
-        for base, partner, support_name, pilot_name, interpolation_name in self._frequency_pairs:
+        for base, partner, design_name, support_name, covariance_name in self._pairs:
+            design = getattr(self, design_name).to(y.device)
             support = getattr(self, support_name).to(y.device)
-            base_pilot = getattr(self, pilot_name).to(y.device)
-            interpolation = getattr(self, interpolation_name).to(y.device)
+            covariance = getattr(self, covariance_name).to(y.device)
             observations = y_pilot.index_select(-1, support)
-            despread = observations / base_pilot[None, None, :]
-            first = despread[..., 0::2]
-            second = despread[..., 1::2]
-            pilot_estimates = ((first + second) * 0.5, (first - second) * 0.5)
-            pilot_noise = no[:, 0, :, None] * 0.25 * (
-                base_pilot[0::2].abs().square().reciprocal()
-                + base_pilot[1::2].abs().square().reciprocal()
-            )[None, None, :]
-            interpolated_variance = torch.einsum(
-                "brp,fp->brf", pilot_noise, interpolation.square()
-            )
-            for user, pilot_estimate in ((base, pilot_estimates[0]), (partner, pilot_estimates[1])):
-                h_freq = torch.einsum("brp,fp->brf", pilot_estimate, interpolation.to(y.dtype))
+            rhs = observations.permute(2, 0, 1).reshape(support.numel(), -1)
+            taps = torch.linalg.lstsq(design, rhs).solution
+            taps = taps.reshape(2 * self._num_taps, batch, num_rx_ant).permute(1, 2, 0)
+            for user, tap_slice in (
+                (base, slice(0, self._num_taps)),
+                (partner, slice(self._num_taps, 2 * self._num_taps)),
+            ):
+                user_taps = taps[..., tap_slice]
+                h_freq = user_taps @ self._frequency_basis.to(y.device).T
                 h_hat[:, 0, :, user, 0, :, :] = h_freq.unsqueeze(-2).expand(
                     -1, -1, self._num_ofdm_symbols, -1
                 )
-                err_var[:, 0, :, user, 0, :, :] = interpolated_variance.unsqueeze(-2).expand(
-                    -1, -1, self._num_ofdm_symbols, -1
-                )
+                cov_user = covariance[tap_slice, tap_slice]
+                basis = self._frequency_basis.to(y.device)
+                frequency_error = torch.einsum(
+                    "nl,lm,nm->n", basis, cov_user, basis.conj()
+                ).real.clamp_min(0.0)
+                err_var[:, 0, :, user, 0, :, :] = (
+                    no[:, 0, :, None] * frequency_error[None, None, :]
+                ).unsqueeze(-2).expand(-1, -1, self._num_ofdm_symbols, -1)
         return h_hat, err_var
 
 
@@ -865,7 +816,6 @@ class NrPuschRx:
                 tx.resource_grid,
                 l_min=l_min,
                 l_max=l_max,
-                mode=input_domain,
             )
         else:
             estimator = "perfect"
@@ -1005,7 +955,7 @@ class NrPuschRx:
                 else "Frequency LMMSE pre-equalization, IDFT despreading, then damped time-domain spatial EP with Gaussian residual-ISI covariance."
             ),
             "decoder": "Sionna NR TBDecoder",
-            "channel_estimator": "perfect CDL CSI" if self.channel_estimator == "perfect" else "DFT-s-OFDM DMRS OCC LS",
+            "channel_estimator": "perfect CDL CSI" if self.channel_estimator == "perfect" else "DFT-s-OFDM frequency DMRS OCC LS tap fit",
             "crc_status_axes": ["batch", "user"],
             "bits_axes": ["batch", "user", "transport_block_bit"],
             "sample_rate_hz": self.sample_rate_hz,

@@ -48,6 +48,28 @@ class PuschReceiverTest(unittest.TestCase):
         self.assertTrue(torch.all(dmrs_result.crc_status).item())
         torch.testing.assert_close(dmrs_result.bits, tx_result.bits, rtol=0, atol=0)
 
+        # Once time IQ has been OFDM-demodulated, both receiver input modes
+        # must use exactly the same frequency-domain DMRS and detector chain.
+        demodulated_grid = dmrs_rx._receiver._ofdm_demodulator(noisy.iq.unsqueeze(1))
+        grid_rx = NrPuschRx(
+            settings,
+            channel_estimator="dmrs",
+            max_delay_spread_s=channel_settings.channel.max_delay_spread_s,
+            input_domain="frequency",
+            device="cpu",
+        )
+        time_h, time_err = dmrs_rx._receiver._channel_estimator(
+            demodulated_grid, noisy.noise_variance
+        )
+        grid_h, grid_err = grid_rx._receiver._channel_estimator(
+            demodulated_grid, noisy.noise_variance
+        )
+        torch.testing.assert_close(time_h, grid_h, rtol=0, atol=0)
+        torch.testing.assert_close(time_err, grid_err, rtol=0, atol=0)
+        grid_result = grid_rx.receive_frequency_grid(demodulated_grid, noisy.noise_variance)
+        torch.testing.assert_close(grid_result.bits, dmrs_result.bits, rtol=0, atol=0)
+        self.assertTrue(torch.equal(grid_result.crc_status, dmrs_result.crc_status))
+
         sic_rx = NrPuschRx(
             settings,
             channel_estimator="dmrs",
