@@ -556,7 +556,10 @@ class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
             llr_final[:, user] = llr[:, user]
 
             decoded_bits, crc_status = self._sic_decoder(llr)
-            cancel_mask = crc_status[:, user]
+            # Sionna may retain a singleton transport-block axis on CRC status
+            # (for example [batch, user, 1]); flatten the selected UE to keep
+            # cancellation masks aligned with the batch axis.
+            cancel_mask = crc_status[:, user].reshape(-1)
             crc_by_user[:, user] = cancel_mask
             if not torch.any(cancel_mask).item():
                 continue
@@ -566,7 +569,10 @@ class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
                 dtype=torch.float32,
                 device=y.device,
             )
-            tx_bits[:, user] = decoded_bits[:, user].to(dtype=tx_bits.dtype)
+            decoded_user_bits = decoded_bits[:, user].reshape(
+                y.shape[0], self._transport_block_size
+            )
+            tx_bits[:, user] = decoded_user_bits.to(dtype=tx_bits.dtype)
             reconstructed_grid = self._reencoder.generate(
                 batch_size=y.shape[0], bits=tx_bits
             ).frequency_grid[:, user, 0]

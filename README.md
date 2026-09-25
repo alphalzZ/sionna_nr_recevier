@@ -48,6 +48,39 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 扫描会逐 SNR 点发射随机 transport blocks、通过 CDL、按每个接收天线的测得信号功率注入复 AWGN，再用 CRC 与 payload 比对统计 BLER。CSV 包含 SNR、BLER、CRC fail rate、BER 和样本数，JSON sidecar 保存配置及完整统计；BLER 将 CRC fail 或任何 payload bit 错误都计为 block error。`bler_smoke.toml` 是短时连通性配置，正式仿真应增加 `max_frames_per_snr` 和 `target_block_errors`。
 
+### GPU batch 选择与频域/时域对照
+
+在 NVIDIA GeForce RTX 3060 Laptop GPU（6 GiB，测试时约有 1.3 GiB 被其他进程占用）上，用 CUDA、4 用户 DFT-s-OFDM、CDL-A、DMRS 信道估计、LMMSE 检测和 30 dB SNR 测量单批吞吐。表中帧吞吐为重复运行的均值；每帧含 4 个 UE transport blocks。
+
+| Batch frames | 帧/秒 | TB/秒 | PyTorch 峰值保留显存 | 结果 |
+| ---: | ---: | ---: | ---: | --- |
+| 24 | 8.96 | 35.8 | 3.12 GiB | 稳定，显存余量较好 |
+| 28 | 10.00 | 40.0 | 3.62 GiB | 推荐日常使用 |
+| 32 | 10.78 | 43.1 | 4.13 GiB | 两次完成，显存余量很小 |
+| 36 | — | — | — | OOM |
+| 48 | — | — | — | OOM |
+
+在这台有其他进程占用显存的机器上，建议频域 BLER 使用 batch 28；仅在 GPU 空闲且追求吞吐时使用 32。batch 28 比 24 快约 12%，比 32 慢约 7.8%，但少占约 0.51 GiB 峰值保留显存。该结论对应上述硬件和 LMMSE/DMRS 工作负载，不代表其他检测器或 GPU 的最优值。
+
+频域与时域的大规模对照复用了既有时域全面仿真 `/tmp/pusch_mimo_detection_comparison_ep_full_18_39.csv/json` 中的 LMMSE 结果，没有重跑时域链路。频域使用 batch 28、相同的 18–39 dB SNR 点、seed、DMRS、LMMSE 和每个 SNR 点相同的帧数，共 2,857 帧/11,428 个 TB。数据如下：
+
+两组运行使用相同 seed 和每点样本数，但 batch 分段不同（时域 1、频域 28），因此不是逐帧配对的同一组随机 IQ；低 SNR 点样本数也较少，主要看作趋势对照。历史时域 LMMSE 运行耗时合计约 747 秒，本次频域约 195 秒。
+
+| SNR (dB) | 时域帧数 | 时域 BLER | 频域帧数 | 频域 BLER |
+| ---: | ---: | ---: | ---: | ---: |
+| 18 | 26 | 0.9904 | 26 | 1.0000 |
+| 21 | 27 | 0.9259 | 27 | 0.9815 |
+| 24 | 35 | 0.7357 | 35 | 0.8929 |
+| 27 | 53 | 0.4717 | 53 | 0.6132 |
+| 30 | 143 | 0.1766 | 143 | 0.3077 |
+| 33 | 573 | 0.0436 | 573 | 0.1405 |
+| 36 | 1,000 | 0.0065 | 1,000 | 0.0703 |
+| 39 | 1,000 | 0.00125 | 1,000 | 0.0480 |
+
+本次对照**没有通过频域/时域 BLER 接近性验证**：频域 BLER 在中高 SNR 明显偏高，39 dB 处出现约 0.048 的误块平台；8 个点的平均绝对 BLER 差约 0.088。频域路径的 LMMSE/DMRS 诊断还显示，perfect-CSI 频域链路在 33 dB、140 帧时 BLER 为 0.0089，而 DMRS 频域链路为 0.1375，偏差集中在频域 DMRS 信道估计链路。当前频域链路适合高吞吐实验，但不应把其 DMRS BLER 当作与历史时域结果等价的曲线；需要继续校准估计误差、噪声方差和频域/时域等效条件。
+
+全面仿真 CSV/JSON 保存在 `/tmp/pusch_mimo_detection_comparison_ep_full_18_39.csv/json`（既有时域全检测器结果）及 `/tmp/pusch_frequency_vs_previous_time.csv/json`（本次频域结果和对照）。短时诊断、batch 扫描原始文件和临时脚本不作为结果归档。
+
 接收端也可独立加载 NPZ：`iq` 使用 `[batch,rx_antenna,sample]` 轴；`perfect` 模式另需 `channel_taps`（`[batch,user,rx_antenna,time,tap]`），`dmrs` 模式从 PUSCH DMRS 估计 CSI。
 
 ```bash
