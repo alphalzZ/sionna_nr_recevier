@@ -2,13 +2,17 @@
 # Aggregate receive SNR is set independently per RX antenna from measured power.
 snr_db = [-5.0, 0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0]
 batch_size = 2
+# Prior local runs completed LMMSE and LMMSE-SIC at 20, then K-best hit CUDA OOM.
+# K-best, MMSE-PIC, and EP use conservative initial values; tune them individually.
+detector_batch_sizes = { lmmse = 20, "lmmse-sic" = 20, "k-best" = 1, "mmse-pic" = 1, ep = 1 }
 max_frames_per_snr = 1000
 target_block_errors = 100
 seed = 20260924
 num_decoder_iterations = 20
 # dmrs uses the configured single-slot OCC pilot arrangement; perfect provides an ideal-CSI bound.
 channel_estimator = "dmrs"
-# Compare each detector under the same seed, CDL profile, SNR grid, and payload sequence.
+# Compare detectors with the same initial seed, CDL profile, and SNR grid.
+# Different batch grouping does not guarantee identical per-frame payloads.
 detectors = ["lmmse", "lmmse-sic", "k-best", "mmse-pic", "ep"]
 # SIC decodes the strongest UE first and only cancels a CRC-passing TB.
 detector = "lmmse-sic"

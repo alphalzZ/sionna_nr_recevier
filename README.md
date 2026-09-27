@@ -48,6 +48,8 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 将 `device` 写为 `cpu`、`cuda:0` 或 `auto` 可从 TOML 控制运算设备；`configs/bler_4ue_cdl_gpu.toml` 提供显式 CUDA 示例。若以 `--device cuda` 覆盖，程序会将其规范化为 Sionna 接受的 `cuda:0`。批大小受 GPU 显存约束；频域信道一般比时域线性卷积更节省显存。
 
+不同检测器可在 `[bler]` 中单独设置批大小；未列出的检测器使用 `batch_size`，每个 SNR 点最后一批仍受 `max_frames_per_snr` 截断。例如 `detector_batch_sizes = { lmmse = 20, "lmmse-sic" = 20, "k-best" = 1, "mmse-pic" = 1, ep = 1 }`。此前两次本机 GPU 运行均在 batch 20 下完成 LMMSE 和 LMMSE-SIC，随后在 K-best 阶段 CUDA OOM；示例因此将 K-best 改为 1。MMSE-PIC 和 EP 的值也是保守起点，尚未测定最优吞吐，可逐项调高。网页的仿真 TOML 编辑器同样支持该字段。不同批大小改变随机数的分组，因此各检测器共享初始 seed 和统计条件，但不保证逐帧使用完全相同的 payload、信道和噪声样本。
+
 扫描会逐 SNR 点发射随机 transport blocks、通过 CDL、按每个接收天线的测得信号功率注入复 AWGN，再用 CRC 与 payload 比对统计 BLER。CSV 包含 SNR、BLER、CRC fail rate、BER 和样本数，JSON sidecar 保存配置及完整统计；BLER 将 CRC fail 或任何 payload bit 错误都计为 block error。`bler_smoke.toml` 是短时连通性配置，正式仿真应增加 `max_frames_per_snr` 和 `target_block_errors`。
 
 ### 网页仿真界面

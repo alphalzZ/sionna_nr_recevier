@@ -72,6 +72,7 @@ def simulate_bler(
         raise RuntimeError("发送端与接收端 sample rate 不一致")
 
     points: list[BlerPoint] = []
+    effective_batch_size = simulation_settings.batch_size_for_detector()
     tb_size = transmitter.transport_block_size
     frame_seed = simulation_settings.seed
     for snr_db in simulation_settings.snr_db:
@@ -82,7 +83,7 @@ def simulate_bler(
             and block_errors < simulation_settings.target_block_errors
         ):
             batch_size = min(
-                simulation_settings.batch_size,
+                effective_batch_size,
                 simulation_settings.max_frames_per_snr - frames,
             )
             tx_result = transmitter.generate(batch_size=batch_size, seed=frame_seed)
