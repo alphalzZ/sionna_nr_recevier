@@ -98,6 +98,26 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 全面仿真 CSV/JSON 保存在 `/tmp/pusch_mimo_detection_comparison_ep_full_18_39.csv/json`（既有时域全检测器结果）及 `/tmp/pusch_frequency_vs_previous_time.csv/json`（本次频域结果和对照）。短时诊断、batch 扫描原始文件和临时脚本不作为结果归档。
 
+### 当前统一接收链路的全量检测器对照
+
+`configs/bler_4ue_cdl_gpu.toml`（SNR 20–50 dB、`max_frames_per_snr = 1000`、`target_block_errors = 100`、seed 20260924、频域信道、DMRS 估计、每检测器 batch 26/26/10/26/26）的一次完整运行，任务 `1313e4fe353d`，共 35 个点、约 55 分钟、结果在 `runs/web/1313e4fe353d/`（该目录被 Git 忽略）：
+
+| SNR (dB) | LMMSE | LMMSE-SIC | K-best(16) | MMSE-PIC(4) | EP(10) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 20 | 0.9808 | 0.9808 | 1.0000 | 0.9712 | 0.9808 |
+| 25 | 0.6394 | 0.4071 | 0.8188 | 0.5721 | 0.6731 |
+| 30 | 0.1987 | 0.0598 | 0.2917 | 0.1079 | 0.4359 |
+| 35 | 0.0140 | 0.0030 | 0.0170 | 0.0040 | 0.2428 |
+| 40 | 0.0015 | 0.0000 | 0.0005 | 0.0005 | 0.0125 |
+| 45 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0010 |
+| 50 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+
+所有检测器的 BLER 随 SNR 单调下降到 0，当前统一接收链路没有旧实现中 39 dB 处的误块平台；这与旧表使用的信道转换和 DMRS 插值实现不同，但两次运行未做逐帧配对，归因属于推断。45 dB 起 LMMSE、LMMSE-SIC、K-best 和 MMSE-PIC 的 4,000 个 TB 全部 CRC 通过，EP 到 50 dB 归零。排序为 LMMSE-SIC 最好、MMSE-PIC 次之，LMMSE 与 K-best 接近，EP 在整个 SNR 范围内落后于 LMMSE（35 dB 处 0.243 对 0.014）；EP 的零时延等效空间信道近似与 QAM 矩匹配仍是最主要的性能差距来源，尚未用参考向量定位。
+
+同一运行的满额点吞吐（4,000 TB/点）分别为 LMMSE 55.2 TB/s、K-best 45.7 TB/s、MMSE-PIC 51.5 TB/s、EP 53.5 TB/s、LMMSE-SIC 13.3 TB/s；这是 batch 26 单点测量，不是历史表格那种 batch 扫描，batch 推荐值仍需按新实现重测。
+
+复现性说明：`simulate_bler` 每次以 `sionna.phy.config.seed` 重置 Sionna 的全局生成器，CDL 实现按调用顺序从该流取随机数。因此只有整个扫描配置完全一致（相同 batch 分组和相同停止条件）时结果才逐点相同；只改 `max_frames_per_snr` 或 `target_block_errors` 会改变前序 SNR 点的信道抽样次数，从而让后续点换用不同的信道实现。例：早前 `max_frames_per_snr = 100` 的短时运行在 35 dB 首个 26 帧内有 59 个误块，而本次 1,000 帧共 56 个误块，说明两组并非逐帧配对，跨运行比较只能按趋势看待。
+
 接收端也可独立加载 NPZ：`iq` 使用 `[batch,rx_antenna,sample]` 轴；`perfect` 模式另需 `channel_taps`（`[batch,user,rx_antenna,time,tap]`），`dmrs` 模式从 PUSCH DMRS 估计 CSI。
 
 ```bash
