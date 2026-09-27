@@ -8,7 +8,7 @@ import csv
 import json
 import time
 from dataclasses import replace
-from typing import Any
+from typing import Any, Callable
 
 import sionna.phy
 import torch
@@ -45,6 +45,7 @@ def simulate_bler(
     simulation_settings: BlerSettings,
     *,
     device: str | None = None,
+    on_point: Callable[[BlerPoint], None] | None = None,
 ) -> list[BlerPoint]:
     """Run the configured SNR sweep; perfect CDL CSI is the default baseline."""
     simulation_settings.validate()
@@ -148,6 +149,8 @@ def simulate_bler(
                 runtime_s=time.perf_counter() - started,
             )
         )
+        if on_point is not None:
+            on_point(points[-1])
     return points
 
 
@@ -157,12 +160,18 @@ def simulate_detector_comparison(
     simulation_settings: BlerSettings,
     *,
     device: str | None = None,
+    on_point: Callable[[BlerPoint], None] | None = None,
 ) -> list[BlerPoint]:
     """Run each configured detector from the same seed and channel profile."""
     points: list[BlerPoint] = []
     for detector in simulation_settings.detectors:
         run_settings = replace(simulation_settings, detector=detector, detectors=(detector,))
-        points.extend(simulate_bler(tx_settings, channel_settings, run_settings, device=device))
+        points.extend(
+            simulate_bler(
+                tx_settings, channel_settings, run_settings,
+                device=device, on_point=on_point,
+            )
+        )
     return points
 
 

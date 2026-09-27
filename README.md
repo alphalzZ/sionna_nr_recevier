@@ -50,6 +50,17 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 扫描会逐 SNR 点发射随机 transport blocks、通过 CDL、按每个接收天线的测得信号功率注入复 AWGN，再用 CRC 与 payload 比对统计 BLER。CSV 包含 SNR、BLER、CRC fail rate、BER 和样本数，JSON sidecar 保存配置及完整统计；BLER 将 CRC fail 或任何 payload bit 错误都计为 block error。`bler_smoke.toml` 是短时连通性配置，正式仿真应增加 `max_frames_per_snr` 和 `target_block_errors`。
 
+### 网页仿真界面
+
+在仓库根目录使用指定虚拟环境安装后启动本地服务：
+
+```bash
+/home/le-lei/workspace/test/.venv/bin/pip install -e .
+/home/le-lei/workspace/test/.venv/bin/nr-pusch-web --host 127.0.0.1 --port 8765
+```
+
+浏览器打开 `http://127.0.0.1:8765/`。页面可选择并编辑发送、CDL 信道和 BLER TOML profile；“保存配置”会校验并覆盖所选 `configs/*.toml`，而直接“启动仿真”使用当前编辑器文本创建独立快照，无需先保存。建议先用 `bler_smoke.toml` 熟悉操作，再选择完整扫描配置。运行任务按提交顺序串行执行，避免多个任务同时争用 GPU；页面显示每个检测器和 SNR 点的进度、BLER 曲线、统计表和日志，结果可下载为 CSV/JSON。任务及配置快照保存在被 Git 忽略的 `runs/web/<任务 ID>/`，服务重启后仍可查看已有结果；正在运行的进程因服务中断而结束时，任务会标记为失败。网页只绑定本机回环地址；需要从其他机器访问时请使用 SSH 端口转发。
+
 ### 历史 GPU batch 扫描与频域/时域对照
 
 在 NVIDIA GeForce RTX 3060 Laptop GPU（6 GiB，测试时约有 1.3 GiB 被其他进程占用）上，用 CUDA、4 用户 DFT-s-OFDM、CDL-A、DMRS 信道估计、LMMSE 检测和 30 dB SNR 测量单批吞吐。表中帧吞吐为重复运行的均值；每帧含 4 个 UE transport blocks。

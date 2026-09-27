@@ -18,6 +18,10 @@ nr-pusch-tx = "nr_pusch.cli.tx:main"
 nr-pusch-channel = "nr_pusch.cli.channel:main"
 nr-pusch-bler = "nr_pusch.cli.bler:main"
 nr-pusch-rx = "nr_pusch.cli.rx:main"
+nr-pusch-web = "nr_pusch.cli.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+nr_pusch = ["web_static/*.html", "web_static/*.css", "web_static/*.js"]

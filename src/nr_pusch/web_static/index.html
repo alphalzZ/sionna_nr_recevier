@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>NR PUSCH 仿真实验台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="NR PUSCH 仿真实验台首页">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span><b>NR PUSCH</b><small>仿真实验台</small></span>
+    </a>
+    <div class="topbar-status"><span class="live-dot"></span><span>本地计算节点</span><b id="active-count">0 个任务</b></div>
+  </header>
+
+  <main class="workspace">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">5G NR · BLER SIMULATION</p>
+        <h1>从参数到曲线，<br><em>一次完成。</em></h1>
+        <p class="hero-copy">配置 PUSCH、信道与扫频策略，启动仿真并实时查看不同检测器的误块率表现。</p>
+      </div>
+      <div class="hero-actions">
+        <button class="button button-primary" id="run-button" type="button">
+          <span class="play" aria-hidden="true"></span>启动 BLER 仿真
+        </button>
+        <p id="run-hint">将使用当前三个编辑器中的配置</p>
+      </div>
+    </section>
+
+    <div class="alert hidden" id="global-alert" role="alert"><span id="alert-text"></span><button type="button" id="alert-close" aria-label="关闭">×</button></div>
+
+    <section class="panel config-panel">
+      <div class="panel-heading">
+        <div><span class="step">01</span><h2>实验配置</h2></div>
+        <p>选择已有配置，按需修改后保存</p>
+      </div>
+      <div class="config-tabs" role="tablist" aria-label="配置类型">
+        <button class="config-tab active" type="button" data-kind="tx" role="tab" aria-selected="true"><span>TX</span>发射机</button>
+        <button class="config-tab" type="button" data-kind="channel" role="tab" aria-selected="false"><span>CH</span>信道</button>
+        <button class="config-tab" type="button" data-kind="simulation" role="tab" aria-selected="false"><span>SIM</span>仿真</button>
+      </div>
+      <div class="editor-toolbar">
+        <label for="profile-select">配置文件</label>
+        <select id="profile-select" aria-label="选择配置文件"></select>
+        <span class="dirty-indicator hidden" id="dirty-indicator">未保存</span>
+        <button class="button button-quiet" type="button" id="reload-button">重新载入</button>
+        <button class="button button-dark" type="button" id="save-button">保存配置</button>
+      </div>
+      <div class="editor-shell">
+        <div class="line-numbers" id="line-numbers" aria-hidden="true">1</div>
+        <textarea id="config-editor" spellcheck="false" aria-label="TOML 配置编辑器" placeholder="正在加载配置…"></textarea>
+      </div>
+    </section>
+
+    <section class="panel run-panel">
+      <div class="panel-heading">
+        <div><span class="step">02</span><h2>运行状态</h2></div>
+        <div class="run-toolbar">
+          <span class="status-pill idle" id="status-pill">等待任务</span>
+          <button class="button button-danger hidden" id="cancel-button" type="button">取消任务</button>
+        </div>
+      </div>
+      <div class="run-summary" id="run-summary">
+        <div><span>任务编号</span><strong id="job-id">—</strong></div>
+        <div><span>创建时间</span><strong id="job-created">—</strong></div>
+        <div><span>运行耗时</span><strong id="job-duration">—</strong></div>
+        <div><span>结果点</span><strong id="job-points">0</strong></div>
+      </div>
+      <div class="progress-track" aria-hidden="true"><span id="progress-bar"></span></div>
+      <div class="log-head"><h3>运行日志</h3><button type="button" id="log-toggle">收起</button></div>
+      <pre class="log-view" id="log-view"><span>尚未启动仿真。</span></pre>
+    </section>
+
+    <section class="panel results-panel">
+      <div class="panel-heading">
+        <div><span class="step">03</span><h2>仿真结果</h2></div>
+        <div class="result-actions"><p id="result-subtitle">完成仿真后将在此显示结果</p><a class="download-link hidden" id="download-csv" href="#" download>下载 CSV</a><a class="download-link hidden" id="download-json" href="#" download>下载 JSON</a></div>
+      </div>
+      <div class="results-empty" id="results-empty">
+        <div class="empty-graphic" aria-hidden="true"><span></span><span></span><span></span><span></span><i></i></div>
+        <h3>等待第一组数据</h3><p>启动任务后，曲线和指标表会随结果自动更新。</p>
+      </div>
+      <div class="results-content hidden" id="results-content">
+        <div class="chart-card">
+          <div class="chart-title"><div><h3>SNR vs. BLER</h3><p>对数刻度；空心点表示零误块，绘于 1/TB 统计上限</p></div><div class="legend" id="chart-legend"></div></div>
+          <div class="canvas-wrap"><canvas id="bler-chart" role="img" aria-label="SNR 与 BLER 曲线图"></canvas></div>
+        </div>
+        <div class="table-card">
+          <div class="table-title"><h3>测量明细</h3><span id="table-count"></span></div>
+          <div class="table-scroll"><table><thead><tr><th>检测器</th><th>SNR (dB)</th><th>BLER</th><th>BER</th><th>CRC 失败率</th><th>帧数</th><th>传输块</th><th>误块</th><th>耗时</th></tr></thead><tbody id="metrics-body"></tbody></table></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel history-panel">
+      <div class="panel-heading">
+        <div><span class="step">04</span><h2>运行历史</h2></div>
+        <button class="button button-quiet" id="refresh-history" type="button">刷新</button>
+      </div>
+      <div class="history-list" id="history-list"><p class="muted">正在加载历史记录…</p></div>
+    </section>
+  </main>
+
+  <footer><span>NR PUSCH Simulation Workbench</span><span>本地运行 · 数据不会离开计算节点</span></footer>
+  <script src="/app.js" defer></script>
+</body>
+</html>

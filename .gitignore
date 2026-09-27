@@ -20,3 +20,6 @@ runs/
 .env
 .env.*
 !.env.example
+
+# Local Codex routing usage history
+.codex/model-routing-history.jsonl
