@@ -16,6 +16,7 @@ import torch
 from .channel import NrPuschCdlChannel
 from .channel_config import ChannelSettings
 from .config import TxSettings
+from .device import use_device
 from .noise import add_awgn, add_awgn_resource_grid
 from .receiver import NrPuschRx
 from .simulation_config import BlerSettings
@@ -39,6 +40,25 @@ class BlerPoint:
     runtime_s: float
 
 
+@dataclass(frozen=True)
+class SkippedPoint:
+    """An SNR point that was not simulated because an earlier point reached BLER 0."""
+
+    detector: str
+    device: str
+    snr_db: float
+    trigger_snr_db: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class BlerSweep:
+    """Measured SNR points together with the points skipped by the stop policy."""
+
+    points: tuple[BlerPoint, ...]
+    skipped: tuple[SkippedPoint, ...]
+
+
 def simulate_bler(
     tx_settings: TxSettings,
     channel_settings: ChannelSettings,
@@ -46,10 +66,16 @@ def simulate_bler(
     *,
     device: str | None = None,
     on_point: Callable[[BlerPoint], None] | None = None,
-) -> list[BlerPoint]:
-    """Run the configured SNR sweep; perfect CDL CSI is the default baseline."""
+    on_skip: Callable[[SkippedPoint], None] | None = None,
+) -> BlerSweep:
+    """Run the configured SNR sweep; perfect CDL CSI is the default baseline.
+
+    With ``stop_at_zero_bler`` enabled, a detector stops sweeping once a point
+    measures no block error, and the remaining higher SNRs are reported as
+    skipped instead of simulated. This assumes BLER does not grow with SNR.
+    """
     simulation_settings.validate()
-    device = _resolve_device(device or simulation_settings.device)
+    device = use_device(device or simulation_settings.device)
     sionna.phy.config.seed = simulation_settings.seed
     torch.manual_seed(simulation_settings.seed)
 
@@ -72,10 +98,10 @@ def simulate_bler(
         raise RuntimeError("发送端与接收端 sample rate 不一致")
 
     points: list[BlerPoint] = []
+    skipped: list[SkippedPoint] = []
     effective_batch_size = simulation_settings.batch_size_for_detector()
-    tb_size = transmitter.transport_block_size
     frame_seed = simulation_settings.seed
-    for snr_db in simulation_settings.snr_db:
+    for snr_index, snr_db in enumerate(simulation_settings.snr_db):
         started = time.perf_counter()
         frames = transport_blocks = block_errors = crc_failures = bit_errors = bits = 0
         while (
@@ -152,7 +178,20 @@ def simulate_bler(
         )
         if on_point is not None:
             on_point(points[-1])
-    return points
+        if simulation_settings.stop_at_zero_bler and block_errors == 0:
+            for remaining_snr_db in simulation_settings.snr_db[snr_index + 1:]:
+                skipped_point = SkippedPoint(
+                    detector=simulation_settings.detector,
+                    device=device,
+                    snr_db=float(remaining_snr_db),
+                    trigger_snr_db=float(snr_db),
+                    reason="bler_at_zero",
+                )
+                skipped.append(skipped_point)
+                if on_skip is not None:
+                    on_skip(skipped_point)
+            break
+    return BlerSweep(points=tuple(points), skipped=tuple(skipped))
 
 
 def simulate_detector_comparison(
@@ -162,32 +201,24 @@ def simulate_detector_comparison(
     *,
     device: str | None = None,
     on_point: Callable[[BlerPoint], None] | None = None,
-) -> list[BlerPoint]:
+    on_skip: Callable[[SkippedPoint], None] | None = None,
+) -> BlerSweep:
     """Run each configured detector from the same seed and channel profile."""
     points: list[BlerPoint] = []
+    skipped: list[SkippedPoint] = []
     for detector in simulation_settings.detectors:
         run_settings = replace(simulation_settings, detector=detector, detectors=(detector,))
-        points.extend(
-            simulate_bler(
-                tx_settings, channel_settings, run_settings,
-                device=device, on_point=on_point,
-            )
+        sweep = simulate_bler(
+            tx_settings, channel_settings, run_settings,
+            device=device, on_point=on_point, on_skip=on_skip,
         )
-    return points
-
-
-def _resolve_device(requested: str) -> str:
-    if requested == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    if requested == "cuda" or requested.startswith("cuda:"):
-        if not torch.cuda.is_available():
-            raise RuntimeError("配置请求 CUDA，但当前 PyTorch 环境没有可用 GPU/CUDA")
-        return "cuda:0" if requested == "cuda" else requested
-    return requested
+        points.extend(sweep.points)
+        skipped.extend(sweep.skipped)
+    return BlerSweep(points=tuple(points), skipped=tuple(skipped))
 
 
 def save_bler_results(
-    points: list[BlerPoint],
+    sweep: BlerSweep,
     output: str | Path,
     *,
     tx_settings: TxSettings,
@@ -202,14 +233,19 @@ def save_bler_results(
     with output.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(asdict(point) for point in points)
+        writer.writerows(asdict(point) for point in sweep.points)
     manifest_path = output.with_suffix(".json")
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "transmit_settings": tx_settings.to_dict(),
         "channel_settings": channel_settings.to_dict(),
         "simulation_settings": simulation_settings.to_dict(),
-        "results": [asdict(point) for point in points],
+        "results": [asdict(point) for point in sweep.points],
+        "skipped_points": [asdict(point) for point in sweep.skipped],
+        "skip_policy": (
+            "stop_at_zero_bler=true ends a detector sweep at the first SNR point with zero block "
+            "errors; the remaining higher SNRs are listed in skipped_points and are not simulated"
+        ),
         "bler_definition": "TB block error if CRC fails or any decoded payload bit differs",
         "channel_domain": simulation_settings.channel_domain,
         "detector_validity_note": (

@@ -7,7 +7,7 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 
-from nr_pusch.bler import save_bler_results, simulate_detector_comparison
+from nr_pusch.bler import BlerSweep, SkippedPoint, save_bler_results, simulate_detector_comparison
 from nr_pusch.channel_config import ChannelSettings
 from nr_pusch.config import TxSettings
 from nr_pusch.simulation_config import BlerSettings
@@ -20,7 +20,10 @@ def main() -> None:
     parser.add_argument("--simulation-config", required=True, help="TOML BLER simulation settings")
     parser.add_argument("--output", required=True, help="Output CSV path (JSON manifest is also written)")
     parser.add_argument("--device", default=None, help="Override configured device: cpu, cuda, cuda:0, or auto")
-    parser.add_argument("--progress-jsonl", default=None, help="Append one JSON object per completed SNR point")
+    parser.add_argument(
+        "--progress-jsonl", default=None,
+        help="Append one JSON object per completed or skipped SNR point",
+    )
     args = parser.parse_args()
 
     tx_settings = TxSettings.from_toml(args.tx_config)
@@ -31,29 +34,42 @@ def main() -> None:
         progress_path.parent.mkdir(parents=True, exist_ok=True)
         progress_path.write_text("", encoding="utf-8")
 
-    def report_point(point) -> None:
+    def write_progress(record) -> None:
         if progress_path is not None:
             with progress_path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(asdict(point), ensure_ascii=False) + "\n")
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    points = simulate_detector_comparison(
+    def report_point(point) -> None:
+        write_progress({**asdict(point), "skipped": False})
+
+    def report_skip(point: SkippedPoint) -> None:
+        write_progress({**asdict(point), "skipped": True})
+
+    sweep: BlerSweep = simulate_detector_comparison(
         tx_settings, channel_settings, simulation_settings,
-        device=args.device, on_point=report_point,
+        device=args.device, on_point=report_point, on_skip=report_skip,
     )
     csv_path, manifest_path = save_bler_results(
-        points,
+        sweep,
         args.output,
         tx_settings=tx_settings,
         channel_settings=channel_settings,
         simulation_settings=simulation_settings,
     )
     print("Detector  Device  SNR [dB]  BLER      CRC fail  BER       TB errors / TBs  Runtime [s]")
-    for point in points:
+    for point in sweep.points:
         print(
             f"{point.detector:9s} {point.device:6s} {point.snr_db:8.2f}  {point.bler:8.4g}  "
             f"{point.crc_fail_rate:8.4g}  {point.ber:8.4g}  "
             f"{point.block_errors}/{point.transport_blocks}  {point.runtime_s:.2f}"
         )
+    if sweep.skipped:
+        print("Skipped SNR points (BLER reached 0):")
+        for point in sweep.skipped:
+            print(
+                f"{point.detector:9s} {point.device:6s} {point.snr_db:8.2f}  "
+                f"skipped after BLER 0 at {point.trigger_snr_db:.2f} dB ({point.reason})"
+            )
     print(f"CSV: {csv_path}")
     print(f"Manifest: {manifest_path}")
 

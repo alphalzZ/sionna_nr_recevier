@@ -185,11 +185,16 @@ function renderJob(job) {
   $("job-id").textContent = job.id || "—";
   $("job-created").textContent = formatTime(job.created_at);
   $("job-duration").textContent = formatDuration(job);
-  const pointCount = Array.isArray(job.points) ? job.points.length : 0;
+  const allPoints = Array.isArray(job.points) ? job.points : [];
+  const skippedCount = allPoints.filter((point) => point && point.skipped).length;
+  const pointCount = allPoints.length - skippedCount;
   const totalPoints = Number(job.total_points) || 0;
-  $("job-points").textContent = totalPoints ? `${pointCount} / ${totalPoints}` : String(pointCount);
+  const donePoints = pointCount + skippedCount;
+  $("job-points").textContent = totalPoints
+    ? `${pointCount} / ${totalPoints}${skippedCount ? `（跳过 ${skippedCount}）` : ""}`
+    : String(pointCount);
   $("progress-bar").style.width = totalPoints
-    ? `${Math.min(100, pointCount / totalPoints * 100)}%`
+    ? `${Math.min(100, donePoints / totalPoints * 100)}%`
     : job.status === "completed" ? "100%" : "0";
   for (const [key, url] of [["download-csv", job.output_csv], ["download-json", job.output_manifest]]) {
     const link = $(key);
@@ -200,7 +205,7 @@ function renderJob(job) {
   $("log-view").textContent = logs.length ? logs.join("\n") : active ? "任务已提交，等待日志…" : (job.error || "暂无运行日志。");
   $("log-view").scrollTop = $("log-view").scrollHeight;
   if (job.error) showAlert(job.error);
-  renderResults(Array.isArray(job.points) ? job.points : []);
+  renderResults(allPoints);
   updateActiveCount();
 }
 
@@ -320,11 +325,15 @@ function formatMetric(value, digits = 4) {
   return number.toFixed(digits).replace(/0+$/, "").replace(/\.$/, "");
 }
 
-function renderResults(points) {
+function renderResults(allPoints) {
+  const skippedCount = allPoints.filter((point) => point && point.skipped).length;
+  const points = allPoints.filter((point) => point && !point.skipped);
   const hasPoints = points.length > 0;
   $("results-empty").classList.toggle("hidden", hasPoints);
   $("results-content").classList.toggle("hidden", !hasPoints);
-  $("result-subtitle").textContent = hasPoints ? `${new Set(points.map((point) => point.detector)).size} 个检测器 · ${points.length} 个测量点` : "完成仿真后将在此显示结果";
+  $("result-subtitle").textContent = hasPoints
+    ? `${new Set(points.map((point) => point.detector)).size} 个检测器 · ${points.length} 个测量点${skippedCount ? ` · 跳过 ${skippedCount} 个点` : ""}`
+    : "完成仿真后将在此显示结果";
   if (!hasPoints) return;
   const body = $("metrics-body");
   body.replaceChildren();

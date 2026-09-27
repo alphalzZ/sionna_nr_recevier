@@ -8,6 +8,10 @@ detector_batch_sizes = { lmmse = 26, "lmmse-sic" = 26, "k-best" = 10, "mmse-pic"
 max_frames_per_snr = 1000
 target_block_errors = 100
 seed = 20260924
+# Stop a detector's sweep at the first SNR point with zero block errors; the
+# remaining higher SNRs are reported as skipped instead of simulated. This
+# assumes BLER does not grow with SNR, which holds for the current profile.
+stop_at_zero_bler = true
 num_decoder_iterations = 20
 # dmrs uses the configured single-slot OCC pilot arrangement; perfect provides an ideal-CSI bound.
 channel_estimator = "dmrs"

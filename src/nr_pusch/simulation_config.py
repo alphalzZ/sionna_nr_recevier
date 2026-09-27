@@ -25,6 +25,7 @@ class BlerSettings:
     device: str
     channel_domain: str = "frequency"
     detector_batch_sizes: dict[str, int] = field(default_factory=dict)
+    stop_at_zero_bler: bool = False
 
     _SUPPORTED_DETECTORS = frozenset({"lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic"})
 
@@ -41,6 +42,7 @@ class BlerSettings:
         values.setdefault("detector_damping", 0.25)
         values["detectors"] = tuple(values.get("detectors", (values["detector"],)))
         values.setdefault("device", "cpu")
+        values.setdefault("stop_at_zero_bler", False)
         values.setdefault("channel_domain", "frequency")
         settings = cls(**values)
         settings.validate()
@@ -82,6 +84,8 @@ class BlerSettings:
             raise ValueError("device 仅支持 cpu、cuda、cuda:N 或 auto")
         if self.channel_domain not in {"frequency", "time"}:
             raise ValueError("channel_domain 仅支持 frequency 或 time")
+        if not isinstance(self.stop_at_zero_bler, bool):
+            raise ValueError("stop_at_zero_bler 必须为布尔值")
 
     def batch_size_for_detector(self, detector: str | None = None) -> int:
         """Return the configured batch size for a detector, with base-size fallback."""
