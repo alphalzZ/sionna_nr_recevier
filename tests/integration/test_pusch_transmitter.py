@@ -2,6 +2,7 @@ from pathlib import Path
 import unittest
 
 import numpy as np
+import sionna.phy
 import torch
 
 from nr_pusch.config import TxSettings
@@ -48,6 +49,22 @@ class PuschTransmitterTest(unittest.TestCase):
         generated_zeros = np.count_nonzero(np.abs(grid) < 1e-12, axis=(1, 3))
         reference_zeros = np.count_nonzero(np.abs(reference.frequency_grid) < 1e-12, axis=(2, 3))
         np.testing.assert_array_equal(generated_zeros, reference_zeros)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "需要可用的 CUDA 设备才能复现全局默认设备与请求设备不一致的场景")
+    def test_explicit_cpu_device_overrides_sionna_default_device(self):
+        settings = TxSettings.from_toml(ROOT / "configs" / "pusch_4ue.toml")
+        previous = sionna.phy.config.device
+        self.addCleanup(setattr, sionna.phy.config, "device", previous)
+        sionna.phy.config.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.assertNotEqual(sionna.phy.config.device, "cpu")
+
+        tx = NrPuschTx(settings, device="cpu")
+        result = tx.generate(batch_size=1, seed=23)
+
+        self.assertEqual(tx.device, "cpu")
+        self.assertEqual(sionna.phy.config.device, "cpu")
+        self.assertEqual(result.frequency_grid.device.type, "cpu")
+        self.assertEqual(result.iq.device.type, "cpu")
 
 
 if __name__ == "__main__":

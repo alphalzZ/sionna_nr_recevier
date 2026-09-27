@@ -23,6 +23,7 @@ from sionna.phy.ofdm import (
 )
 
 from .config import TxSettings
+from .device import use_device
 from .transmitter import NrPuschTx
 
 
@@ -754,8 +755,8 @@ class NrPuschRx:
             raise ValueError("max_delay_spread_s 必须大于 0")
         if not 0.0 < detector_damping <= 1.0:
             raise ValueError("detector_damping 必须位于 (0, 1]")
-
         self.settings = settings
+        device = use_device(device)
         self.device = device
         self.input_domain = input_domain
         self.l_min = l_min

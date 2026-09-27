@@ -15,6 +15,7 @@ from sionna.phy.channel import (
 from sionna.phy.channel.tr38901 import AntennaArray, CDL
 
 from .channel_config import ChannelSettings
+from .device import use_device
 
 
 @dataclass
@@ -51,6 +52,7 @@ class NrPuschCdlChannel:
         device: str | None = None,
     ) -> None:
         settings.validate()
+        device = use_device(device)
         self.settings = settings
         self.device = device
         c = settings.channel

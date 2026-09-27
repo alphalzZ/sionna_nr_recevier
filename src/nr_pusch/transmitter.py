@@ -11,6 +11,7 @@ from sionna.phy.nr import PUSCHTransmitter
 from sionna.phy.ofdm import OFDMModulator
 
 from .config import TxSettings
+from .device import use_device
 
 
 @dataclass
@@ -35,6 +36,7 @@ class NrPuschTx:
         settings.validate()
         self.settings = settings
         self.configs = settings.to_sionna_configs()
+        device = use_device(device)
         self._tx_freq = PUSCHTransmitter(
             self.configs,
             return_bits=False,
