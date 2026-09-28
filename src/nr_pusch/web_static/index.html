@@ -17,6 +17,14 @@
   </header>
 
   <main class="workspace">
+    <nav class="workflow-tabs" aria-label="工作流">
+      <button class="workflow-tab active" id="bler-workflow-tab" type="button" role="tab" aria-selected="true" aria-controls="bler-workflow"><span>01</span>BLER 仿真</button>
+      <button class="workflow-tab" id="rx-workflow-tab" type="button" role="tab" aria-selected="false" aria-controls="rx-workflow"><span>02</span>接收分析</button>
+    </nav>
+
+    <div class="alert hidden" id="global-alert" role="alert"><span id="alert-text"></span><button type="button" id="alert-close" aria-label="关闭">×</button></div>
+
+    <div id="bler-workflow" class="workflow-view" role="tabpanel" aria-labelledby="bler-workflow-tab">
     <section class="hero">
       <div>
         <p class="eyebrow">5G NR · BLER SIMULATION</p>
@@ -30,8 +38,6 @@
         <p id="run-hint">将使用当前三个编辑器中的配置</p>
       </div>
     </section>
-
-    <div class="alert hidden" id="global-alert" role="alert"><span id="alert-text"></span><button type="button" id="alert-close" aria-label="关闭">×</button></div>
 
     <section class="panel config-panel">
       <div class="panel-heading">
@@ -103,6 +109,99 @@
       </div>
       <div class="history-list" id="history-list"><p class="muted">正在加载历史记录…</p></div>
     </section>
+    </div>
+
+    <div id="rx-workflow" class="workflow-view hidden" role="tabpanel" aria-labelledby="rx-workflow-tab">
+      <section class="rx-hero">
+        <div>
+          <p class="eyebrow">EXTERNAL IQ · RECEIVE ANALYSIS</p>
+          <h1>导入采集 IQ，<br><em>完成接收分析。</em></h1>
+          <p>上传 MATLAB HDF5 或 NPZ 波形，选择接收机参数并查看星座图与各 UE 的 CRC 结果。</p>
+        </div>
+        <div class="rx-hero-badge"><span>支持格式</span><strong>.h5 · .hdf5 · .npz</strong></div>
+      </section>
+
+      <form id="rx-form">
+        <section class="panel rx-input-panel">
+          <div class="panel-heading">
+            <div><span class="step">01</span><h2>输入与配置</h2></div>
+            <p>选择 IQ 文件和 RX TOML 配置</p>
+          </div>
+          <div class="rx-form-grid">
+            <div class="rx-fields">
+              <label class="field-label" for="rx-file">外部 IQ 文件</label>
+              <label class="rx-default-toggle" for="rx-use-default">
+                <input id="rx-use-default" type="checkbox" disabled>
+                <span><strong>使用内置默认采集</strong><small id="rx-default-meta">正在检查本地默认夹具…</small></span>
+              </label>
+              <label class="file-picker" id="rx-file-picker" for="rx-file">
+                <input id="rx-file" type="file" accept=".h5,.hdf5,.npz">
+                <span class="file-icon" aria-hidden="true">↑</span>
+                <span><strong id="rx-file-name">选择 .h5、.hdf5 或 .npz 文件</strong><small id="rx-file-meta">本地处理 · 单文件上限 12 MiB</small></span>
+              </label>
+
+              <div class="field-row">
+                <label><span>RX 配置（可选）</span><select id="rx-config-select"><option value="">正在加载…</option></select></label>
+                <label><span>输入域</span><select id="rx-input-domain"><option value="time">时域</option><option value="frequency">频域</option></select></label>
+              </div>
+              <div class="field-row">
+                <label><span>检测器</span><select id="rx-detector"><option value="lmmse">LMMSE</option><option value="lmmse-sic">LMMSE-SIC</option><option value="k-best">K-Best</option><option value="ep">EP</option><option value="mmse-pic">MMSE-PIC</option></select></label>
+                <label><span>设备</span><select id="rx-device"><option value="cpu">CPU</option><option value="cuda">CUDA</option></select></label>
+              </div>
+              <div class="field-row">
+                <label title="H5 参考夹具不含噪声功率元数据；无噪声参考请设为 0"><span>噪声方差</span><input id="rx-noise-variance" type="number" min="0" step="any" value="0" required></label>
+                <label><span id="rx-parameter-label">检测器参数（可选）</span><input id="rx-detector-parameter" type="number" min="1" step="1" placeholder="留空使用默认值"></label>
+              </div>
+              <div class="field-row detector-options">
+                <label><span>阻尼系数（可选）</span><input id="rx-detector-damping" type="number" min="0" max="1" step="any" placeholder="0–1"></label>
+              </div>
+            </div>
+
+            <div class="rx-config-block">
+              <div class="rx-config-head"><div><span>RX TOML 配置</span><small>可使用所选文件，或直接粘贴完整配置</small></div><button class="button button-quiet" id="rx-clear-config" type="button">清空</button></div>
+              <textarea id="rx-config-editor" spellcheck="false" aria-label="RX TOML 配置" placeholder="# 选择已有 RX 配置，或粘贴完整 TOML 配置"></textarea>
+            </div>
+          </div>
+          <div class="rx-submit-bar">
+            <p id="rx-submit-hint">选择输入文件后开始解码</p>
+            <button class="button button-primary" id="rx-decode-button" type="submit"><span class="play" aria-hidden="true"></span><span id="rx-decode-label">开始接收分析</span></button>
+          </div>
+        </section>
+      </form>
+
+      <section class="panel rx-results-panel">
+        <div class="panel-heading">
+          <div><span class="step">02</span><h2>接收结果</h2></div>
+          <div class="result-actions"><span class="status-pill idle" id="rx-status-pill">等待输入</span><a class="download-link hidden" id="rx-download-npz" href="#" download>下载 NPZ</a><a class="download-link hidden" id="rx-download-json" href="#" download>下载 JSON</a></div>
+        </div>
+        <div class="results-empty" id="rx-results-empty">
+          <div class="rx-empty-graphic" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+          <h3>等待接收数据</h3><p>完成解码后，此处将显示输入元数据、星座图和 CRC 状态。</p>
+        </div>
+        <div class="rx-results-content hidden" id="rx-results-content">
+          <div class="rx-summary-grid">
+            <div><span>解码编号</span><strong id="rx-decode-id">—</strong></div>
+            <div><span>检测器</span><strong id="rx-result-detector">—</strong></div>
+            <div><span>CRC 通过</span><strong id="rx-crc-summary">—</strong></div>
+            <div><span>Bits 形状</span><strong id="rx-bits-shape">—</strong></div>
+          </div>
+          <div class="rx-result-grid">
+            <div class="chart-card">
+              <div class="chart-title"><div><h3>接收星座图</h3><p id="rx-constellation-count">检测器软输出的 QAM 符号估计</p></div></div>
+              <div class="constellation-wrap"><canvas id="rx-constellation" role="img" aria-label="接收 IQ 星座散点图"></canvas></div>
+            </div>
+            <div class="metadata-card">
+              <div class="table-title"><h3>输入分析</h3></div>
+              <dl id="rx-metadata"></dl>
+            </div>
+          </div>
+          <div class="table-card rx-crc-card">
+            <div class="table-title"><h3>逐 UE CRC 状态</h3><span id="rx-crc-count"></span></div>
+            <div class="table-scroll"><table><thead><tr><th>UE</th><th>CRC 状态</th></tr></thead><tbody id="rx-crc-body"></tbody></table></div>
+          </div>
+        </div>
+      </section>
+    </div>
   </main>
 
   <footer><span>NR PUSCH Simulation Workbench</span><span>本地运行 · 数据不会离开计算节点</span></footer>

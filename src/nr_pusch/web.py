@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import csv
+import base64
+import binascii
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -22,6 +25,8 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import numpy as np
+
 from .channel_config import ChannelSettings
 from .config import TxSettings
 from .simulation_config import BlerSettings
@@ -30,6 +35,10 @@ from .simulation_config import BlerSettings
 _PROFILES = {"tx": "pusch_", "channel": "cdl_", "simulation": "bler_"}
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.toml$")
 _JOB_ID = re.compile(r"^[0-9a-f]{12}$")
+_RX_CONFIG_NAME = re.compile(r"^rx_[A-Za-z0-9][A-Za-z0-9_.-]*\.toml$")
+_DETECTORS = {"lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic"}
+_DECODE_ID = re.compile(r"^[0-9a-f]{12}$")
+_MAX_CAPTURE_BYTES = 12 * 1024 * 1024
 _ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
@@ -81,9 +90,10 @@ class SimulationWebApp:
                 continue
 
     def _profile_path(self, kind: str, name: str) -> Path:
-        if kind not in _PROFILES or not _NAME.fullmatch(name):
+        prefixes = {**_PROFILES, "rx": "rx_"}
+        if kind not in prefixes or not _NAME.fullmatch(name):
             raise ApiError(404, "配置不存在")
-        if not name.startswith(_PROFILES[kind]):
+        if not name.startswith(prefixes[kind]):
             raise ApiError(404, "配置类型与文件名不匹配")
         path = self.config_dir / name
         if path.resolve().parent != self.config_dir or not path.is_file():
@@ -91,13 +101,18 @@ class SimulationWebApp:
         return path
 
     def list_configs(self) -> dict[str, list[str]]:
-        return {
+        configs = {
             kind: sorted(
                 path.name for path in self.config_dir.glob(f"{prefix}*.toml")
                 if path.is_file() and _NAME.fullmatch(path.name)
             )
             for kind, prefix in _PROFILES.items()
         }
+        configs["rx"] = sorted(
+            path.name for path in self.config_dir.glob("rx_*.toml")
+            if path.is_file() and _RX_CONFIG_NAME.fullmatch(path.name)
+        )
+        return configs
 
     def get_config(self, kind: str, name: str) -> dict[str, str]:
         return {"kind": kind, "name": name, "text": self._profile_path(kind, name).read_text(encoding="utf-8")}
@@ -106,7 +121,8 @@ class SimulationWebApp:
     def _validate(kind: str, path: Path) -> None:
         with path.open("rb") as stream:
             tomllib.load(stream)
-        {"tx": TxSettings, "channel": ChannelSettings, "simulation": BlerSettings}[kind].from_toml(path)
+        {"tx": TxSettings, "rx": TxSettings, "channel": ChannelSettings,
+         "simulation": BlerSettings}[kind].from_toml(path)
 
     def save_config(self, kind: str, name: str, text: str) -> dict[str, str]:
         destination = self._profile_path(kind, name)
@@ -307,6 +323,230 @@ class SimulationWebApp:
             raise ApiError(404, "结果文件不存在")
         return path
 
+    def _decode_dir(self, decode_id: str) -> Path:
+        if not _DECODE_ID.fullmatch(decode_id):
+            raise ApiError(404, "译码记录不存在")
+        return self.runs_dir / "rx-decodes" / decode_id
+
+    def rx_defaults(self) -> dict[str, Any]:
+        """Describe the repository's ready-to-run local receive example."""
+        config_path = self.config_dir / "rx_pusch_4ue.toml"
+        capture_path = self.config_dir.parent / "tests" / "fixtures" / "matlab_h5" / "RxTestVector.h5"
+        available = config_path.is_file() and capture_path.is_file()
+        result: dict[str, Any] = {
+            "available": available,
+            "config_name": config_path.name if config_path.is_file() else None,
+            "input_name": capture_path.name if capture_path.is_file() else None,
+            "input_format": "matlab-h5",
+            "input_domain": "frequency",
+            "noise_variance": 0.0,
+        }
+        if available:
+            result["input_bytes"] = capture_path.stat().st_size
+        return result
+
+    def decode_file(self, decode_id: str, name: str) -> Path:
+        if name not in {"decoded.npz", "decoded.json"}:
+            raise ApiError(404, "译码文件不存在")
+        path = self._decode_dir(decode_id) / name
+        if not path.is_file():
+            raise ApiError(404, "译码文件不存在")
+        return path
+
+    def decode_external(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Analyze and decode one uploaded H5 or NPZ capture using the RX CLI."""
+        config_name = data.get("config_name")
+        config_text = data.get("config_text")
+        input_name = data.get("input_name")
+        encoded = data.get("input_base64")
+        use_default_capture = data.get("use_default_capture", False)
+        if not isinstance(use_default_capture, bool):
+            raise ApiError(400, "use_default_capture 必须是布尔值")
+        default_case = self.rx_defaults()
+        default_capture_path = (
+            self.config_dir.parent / "tests" / "fixtures" / "matlab_h5" / "RxTestVector.h5"
+        )
+        if use_default_capture:
+            if not default_case["available"]:
+                raise ApiError(404, "仓库默认 IQ 夹具或 RX 配置不存在")
+            input_name = default_case["input_name"]
+            encoded = None
+            if not config_name:
+                config_name = default_case["config_name"]
+            if not config_text:
+                config_text = (self.config_dir / str(default_case["config_name"])).read_text(encoding="utf-8")
+        input_format = data.get(
+            "input_format", default_case["input_format"] if use_default_capture else None
+        )
+        input_domain = data.get(
+            "input_domain", default_case["input_domain"] if use_default_capture else "time"
+        )
+        detector = data.get("detector", "lmmse")
+        device = data.get("device", "cpu")
+        try:
+            noise_variance = float(
+                data.get("noise_variance", default_case["noise_variance"] if use_default_capture else None)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ApiError(400, "noise_variance 必须是非负数") from exc
+        if not math.isfinite(noise_variance) or noise_variance < 0:
+            raise ApiError(400, "noise_variance 必须是有限的非负数")
+        if config_name is None:
+            config_name = ""
+        if not isinstance(config_name, str):
+            raise ApiError(400, "config_name 必须是配置名或空字符串")
+        config_path: Path | None = None
+        if config_name:
+            if not _RX_CONFIG_NAME.fullmatch(config_name):
+                raise ApiError(400, "RX 配置名必须匹配 rx_*.toml")
+            config_path = self.config_dir / config_name
+            if config_path.resolve().parent != self.config_dir or not config_path.is_file():
+                raise ApiError(404, "接收配置不存在")
+        if config_text is None:
+            config_text = ""
+        if not isinstance(config_text, str):
+            raise ApiError(400, "接收配置内容必须是 TOML 文本")
+        if not config_text.strip():
+            if config_path is None:
+                raise ApiError(400, "请粘贴完整 RX TOML 配置，或选择已有配置文件")
+            config_text = config_path.read_text(encoding="utf-8")
+        if not isinstance(input_name, str) or Path(input_name).name != input_name:
+            raise ApiError(400, "上传文件名无效")
+        suffix = Path(input_name).suffix.lower()
+        formats = {".h5": "matlab-h5", ".hdf5": "matlab-h5", ".npz": "npz"}
+        if suffix not in formats:
+            raise ApiError(400, "仅支持 H5/HDF5 或 NPZ 文件")
+        detected_format = formats[suffix]
+        if input_format not in {None, "auto", detected_format}:
+            raise ApiError(400, "文件扩展名与指定输入格式不匹配")
+        if input_domain not in {"time", "frequency"}:
+            raise ApiError(400, "input_domain 只支持 time 或 frequency")
+        if detected_format == "matlab-h5" and input_domain != "frequency":
+            raise ApiError(400, "MATLAB H5 接收夹具是频域网格")
+        if detector not in _DETECTORS:
+            raise ApiError(400, "不支持的 MIMO 检测算法")
+        if device not in {"cpu", "cuda", "cuda:0"}:
+            raise ApiError(400, "device 只支持 cpu 或 cuda:0")
+        if device == "cuda":
+            device = "cuda:0"
+        parameter = data.get("detector_parameter")
+        if parameter is not None:
+            if isinstance(parameter, bool) or not isinstance(parameter, int) or not 1 <= parameter <= 256:
+                raise ApiError(400, "detector_parameter 必须是 1 到 256 的整数")
+        try:
+            damping = float(data.get("detector_damping", 0.25))
+        except (TypeError, ValueError) as exc:
+            raise ApiError(400, "detector_damping 必须位于 (0, 1]") from exc
+        if not math.isfinite(damping) or not 0 < damping <= 1:
+            raise ApiError(400, "detector_damping 必须位于 (0, 1]")
+        if use_default_capture:
+            payload = default_capture_path.read_bytes()
+        else:
+            if not isinstance(encoded, str):
+                raise ApiError(400, "缺少上传文件数据")
+            try:
+                payload = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ApiError(400, "上传文件编码无效") from exc
+        if not payload or len(payload) > _MAX_CAPTURE_BYTES:
+            raise ApiError(413, "上传文件为空或超过 12 MiB")
+
+        decode_id = uuid4().hex[:12]
+        directory = self._decode_dir(decode_id)
+        directory.mkdir(parents=True, exist_ok=False)
+        try:
+            config_copy = directory / "rx.toml"
+            capture = directory / f"capture{suffix}"
+            output = directory / "decoded.npz"
+            config_copy.write_text(config_text, encoding="utf-8")
+            try:
+                self._validate("rx", config_copy)
+            except (OSError, ValueError, KeyError, TypeError, tomllib.TOMLDecodeError) as exc:
+                raise ApiError(400, f"接收配置无效: {exc}") from exc
+            capture.write_bytes(payload)
+            command = [
+                self.python, "-u", "-m", "nr_pusch.cli.rx",
+                "--rx-config", str(config_copy), "--input", str(capture),
+                "--input-format", detected_format,
+                "--noise-variance", str(noise_variance),
+                "--channel-estimator", "dmrs", "--input-domain",
+                input_domain,
+                "--detector", detector, "--detector-damping", str(damping),
+                "--output", str(output), "--device", device,
+            ]
+            if parameter is not None:
+                command.extend(("--detector-parameter", str(parameter)))
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+            if completed.returncode != 0 or not output.is_file():
+                detail = (completed.stdout + "\n" + completed.stderr).strip()[-3000:]
+                raise ApiError(422, f"接收处理失败: {detail or '解码器没有生成结果'}")
+            manifest_path = output.with_suffix(".json")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            with np.load(output, allow_pickle=False) as result:
+                crc = np.asarray(result["crc_status"], dtype=np.bool_)
+                bits_shape = list(result["bits"].shape)
+                real = np.asarray(result["constellation_real"], dtype=np.float32)
+                imag = np.asarray(result["constellation_imag"], dtype=np.float32)
+            crc_flat = crc.reshape(-1).tolist()
+            configured_users = manifest.get("settings", {}).get("users", [])
+            user_names = [
+                str(user.get("name", f"UE{index}"))
+                for index, user in enumerate(configured_users)
+                if isinstance(user, dict)
+            ] or [f"UE{index}" for index in range(crc.shape[-1])]
+            constellation_users: list[dict[str, Any]] = []
+            for user_index in range(real.shape[1]):
+                user_real = real[:, user_index, :].reshape(-1)
+                user_imag = imag[:, user_index, :].reshape(-1)
+                sample_indices = np.linspace(
+                    0, user_real.size - 1, min(1500, user_real.size), dtype=np.int64
+                )
+                constellation_users.append({
+                    "name": user_names[user_index % len(user_names)],
+                    "real": user_real[sample_indices].tolist(),
+                    "imag": user_imag[sample_indices].tolist(),
+                })
+            crc_labels = [
+                user_names[index % len(user_names)]
+                if crc.ndim < 2 or crc.shape[0] == 1
+                else f"Frame {index // len(user_names) + 1} · {user_names[index % len(user_names)]}"
+                for index in range(len(crc_flat))
+            ]
+            return {
+                "decode_id": decode_id,
+                "input": {
+                    "name": input_name,
+                    "format": detected_format,
+                    "source": "repository-default" if use_default_capture else "upload",
+                    "bytes": len(payload),
+                    **manifest.get("input_analysis", {}),
+                },
+                "crc_status": crc_flat,
+                "crc_labels": crc_labels,
+                "crc_pass_count": int(crc.sum()),
+                "block_count": int(crc.size),
+                "bits_shape": bits_shape,
+                "constellation": {"users": constellation_users},
+                "detector": detector,
+                "used_default_capture": use_default_capture,
+                "receiver": manifest.get("receiver", {}),
+                "output_npz_url": f"/api/rx/decode/{decode_id}/decoded.npz",
+                "output_json_url": f"/api/rx/decode/{decode_id}/decoded.json",
+                "logs": completed.stdout.splitlines()[-12:],
+            }
+        except subprocess.TimeoutExpired as exc:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise ApiError(504, "译码超过 5 分钟，已终止") from exc
+        except Exception:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+
     def shutdown(self) -> None:
         """Stop child simulations before the web process exits."""
         with self._lock:
@@ -348,13 +588,13 @@ def make_handler(app: SimulationWebApp) -> type[BaseHTTPRequestHandler]:
         def _json(self, status: int, value: Any) -> None:
             self._send(status, json.dumps(value, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
-        def _body(self) -> dict[str, Any]:
+        def _body(self, max_bytes: int = 512_000) -> dict[str, Any]:
             try:
                 size = int(self.headers.get("Content-Length", "0"))
             except ValueError as exc:
                 raise ApiError(400, "Content-Length 无效") from exc
-            if not 0 < size <= 512_000:
-                raise ApiError(413, "请求体为空或超过 500 KiB")
+            if not 0 < size <= max_bytes:
+                raise ApiError(413, f"请求体为空或超过 {max_bytes // 1024} KiB")
             if self.headers.get_content_type() != "application/json":
                 raise ApiError(415, "请求必须使用 application/json")
             try:
@@ -374,6 +614,10 @@ def make_handler(app: SimulationWebApp) -> type[BaseHTTPRequestHandler]:
                     self._send(200, (static_dir / name).read_bytes(), mime)
                 elif method == "GET" and path == "/api/configs":
                     self._json(200, app.list_configs())
+                elif method == "GET" and path == "/api/rx/configs":
+                    self._json(200, {"configs": app.list_configs()["rx"]})
+                elif method == "GET" and path == "/api/rx/defaults":
+                    self._json(200, app.rx_defaults())
                 elif len(parts) == 4 and parts[:2] == ["api", "configs"] and method in {"GET", "PUT"}:
                     kind, name = parts[2:]
                     if method == "GET":
@@ -384,6 +628,12 @@ def make_handler(app: SimulationWebApp) -> type[BaseHTTPRequestHandler]:
                     self._json(200, app.list_runs())
                 elif path == "/api/runs" and method == "POST":
                     self._json(HTTPStatus.CREATED, app.create_run(self._body()))
+                elif path == "/api/rx/decode" and method == "POST":
+                    self._json(200, app.decode_external(self._body(max_bytes=18 * 1024 * 1024)))
+                elif len(parts) == 5 and parts[:3] == ["api", "rx", "decode"] and method == "GET":
+                    file = app.decode_file(parts[3], parts[4])
+                    mime = "application/json; charset=utf-8" if file.suffix == ".json" else "application/octet-stream"
+                    self._send(200, file.read_bytes(), mime)
                 elif len(parts) == 3 and parts[:2] == ["api", "runs"] and method == "GET":
                     self._json(200, app.get_run(parts[2]))
                 elif len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "cancel" and method == "POST":

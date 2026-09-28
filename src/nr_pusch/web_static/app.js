@@ -9,12 +9,33 @@ const state = {
   currentJob: null,
   runs: [],
   pollTimer: null,
+  rxResult: null,
+  rxBusy: false,
+  rxDefaults: {
+    available: false,
+    config_name: "",
+    input_name: "",
+    input_format: "matlab-h5",
+    input_domain: "frequency",
+    noise_variance: 0,
+  },
 };
 
 const $ = (id) => document.getElementById(id);
 const editor = $("config-editor");
 const statusLabels = { queued: "排队中", running: "运行中", completed: "已完成", failed: "失败", cancelled: "已取消" };
 const detectorColors = ["#315fdf", "#e97832", "#8b55d9", "#3b9b6c", "#d4a719", "#d34e70"];
+
+function switchWorkflow(name) {
+  const rxActive = name === "rx";
+  $("bler-workflow").classList.toggle("hidden", rxActive);
+  $("rx-workflow").classList.toggle("hidden", !rxActive);
+  for (const [id, active] of [["bler-workflow-tab", !rxActive], ["rx-workflow-tab", rxActive]]) {
+    $(id).classList.toggle("active", active);
+    $(id).setAttribute("aria-selected", String(active));
+  }
+  if (rxActive && state.rxResult) requestAnimationFrame(() => drawConstellation(state.rxResult.constellation));
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -26,6 +47,9 @@ async function api(path, options = {}) {
   if (!response.ok) {
     const detail = payload && (payload.detail || payload.error || payload.message);
     throw new Error(detail || `请求失败（HTTP ${response.status}）`);
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error(`服务接口 ${path} 没有返回有效的 JSON 对象；请刷新页面并确认网页服务已更新。`);
   }
   return payload;
 }
@@ -325,6 +349,321 @@ function formatMetric(value, digits = 4) {
   return number.toFixed(digits).replace(/0+$/, "").replace(/\.$/, "");
 }
 
+async function initRxConfigs() {
+  const [defaultsResult, configsResult] = await Promise.allSettled([
+    api("/api/rx/defaults"),
+    api("/api/rx/configs"),
+  ]);
+  if (configsResult.status === "rejected") throw configsResult.reason;
+  if (defaultsResult.status === "fulfilled" && defaultsResult.value && typeof defaultsResult.value === "object") {
+    state.rxDefaults = { ...state.rxDefaults, ...defaultsResult.value };
+  }
+  const payload = configsResult.value;
+  const configs = Array.isArray(payload.configs) ? payload.configs : [];
+  const select = $("rx-config-select");
+  select.replaceChildren();
+  if (!configs.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "无可用 RX 配置";
+    select.append(option);
+    select.disabled = true;
+  } else {
+    configs.forEach((name) => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      select.append(option);
+    });
+    if (state.rxDefaults.config_name && !configs.includes(state.rxDefaults.config_name)) {
+      const option = document.createElement("option");
+      option.value = state.rxDefaults.config_name;
+      option.textContent = state.rxDefaults.config_name;
+      select.append(option);
+    }
+    select.disabled = false;
+    select.value = state.rxDefaults.config_name && [...select.options].some((option) => option.value === state.rxDefaults.config_name)
+      ? state.rxDefaults.config_name : select.options[0]?.value || "";
+    await loadRxConfig(select.value);
+  }
+  const defaultToggle = $("rx-use-default");
+  defaultToggle.disabled = !state.rxDefaults.available;
+  defaultToggle.checked = Boolean(state.rxDefaults.available);
+  $("rx-default-meta").textContent = state.rxDefaults.available
+    ? `${state.rxDefaults.input_name || "本地默认夹具"} · ${state.rxDefaults.config_name || "默认配置"}`
+    : "未发现本地默认夹具，请选择上传文件";
+  setRxInputMode(defaultToggle.checked);
+}
+
+async function loadRxConfig(name) {
+  if (!name) return;
+  const config = await api(`/api/configs/rx/${encodeURIComponent(name)}`);
+  $("rx-config-editor").value = config.text || "";
+}
+
+function formatFileSize(bytes) {
+  const size = Number(bytes);
+  if (!Number.isFinite(size) || size < 0) return "未知大小";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 ** 2) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 ** 2).toFixed(1)} MB`;
+}
+
+function selectedInputFormat(file) {
+  const extension = String(file?.name || "").split(".").pop().toLowerCase();
+  if (extension === "npz") return "npz";
+  if (extension === "h5" || extension === "hdf5") return "matlab-h5";
+  return "";
+}
+
+function isUsingDefaultRxCapture() {
+  return Boolean(state.rxDefaults.available && $("rx-use-default").checked);
+}
+
+function setRxInputMode(useDefault) {
+  const defaultMode = Boolean(useDefault && state.rxDefaults.available);
+  const fileInput = $("rx-file");
+  const picker = $("rx-file-picker");
+  const domain = $("rx-input-domain");
+  const defaults = state.rxDefaults;
+  fileInput.disabled = state.rxBusy || defaultMode;
+  picker.classList.toggle("is-default", defaultMode);
+  if (defaultMode) {
+    fileInput.value = "";
+    $("rx-file-name").textContent = defaults.input_name || "内置默认采集";
+    $("rx-file-meta").textContent = `MATLAB HDF5 · ${defaults.input_domain === "frequency" ? "频域" : "时域"} · 本地内置夹具`;
+    domain.value = defaults.input_domain || "frequency";
+    domain.disabled = true;
+    $("rx-noise-variance").value = String(defaults.noise_variance ?? 0);
+    $("rx-submit-hint").textContent = `将使用内置采集 ${defaults.input_name || "默认夹具"} 开始解码`;
+    return;
+  }
+  const file = fileInput.files[0];
+  if (!file) {
+    $("rx-file-name").textContent = "选择 .h5、.hdf5 或 .npz 文件";
+    $("rx-file-meta").textContent = "本地处理 · 单文件上限 12 MiB";
+    domain.disabled = false;
+    domain.value = "time";
+  }
+  $("rx-submit-hint").textContent = file ? "已选择输入文件，可以开始解码" : "选择输入文件后开始解码";
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      const result = String(reader.result || "");
+      const comma = result.indexOf(",");
+      if (comma < 0) reject(new Error("无法编码输入文件。"));
+      else resolve(result.slice(comma + 1));
+    });
+    reader.addEventListener("error", () => reject(new Error("读取输入文件失败。")));
+    reader.readAsDataURL(file);
+  });
+}
+
+function setRxBusy(busy) {
+  state.rxBusy = busy;
+  const button = $("rx-decode-button");
+  button.disabled = busy;
+  $("rx-file").disabled = busy || isUsingDefaultRxCapture();
+  $("rx-use-default").disabled = busy || !state.rxDefaults.available;
+  $("rx-config-select").disabled = busy;
+  $("rx-decode-label").textContent = busy ? "正在分析…" : "开始接收分析";
+  $("rx-submit-hint").textContent = busy
+    ? (isUsingDefaultRxCapture() ? "内置采集正在解码，可能需要数秒" : "文件正在上传并解码，较大波形可能需要数秒")
+    : (isUsingDefaultRxCapture() ? `将使用内置采集 ${state.rxDefaults.input_name || "默认夹具"} 开始解码` : "选择输入文件后开始解码");
+  $("rx-status-pill").textContent = busy ? "分析中" : state.rxResult ? "已完成" : "等待输入";
+  $("rx-status-pill").className = `status-pill ${busy ? "running" : state.rxResult ? "completed" : "idle"}`;
+}
+
+function displayMetadata(input) {
+  const list = $("rx-metadata");
+  list.replaceChildren();
+  const entries = input && typeof input === "object" ? Object.entries(input) : [];
+  if (!entries.length) entries.push(["输入", "无元数据"]);
+  entries.forEach(([key, value]) => {
+    const term = document.createElement("dt");
+    const description = document.createElement("dd");
+    term.textContent = String(key).replaceAll("_", " ");
+    if (value === null || value === undefined) description.textContent = "—";
+    else if (typeof value === "object") description.textContent = JSON.stringify(value);
+    else description.textContent = String(value);
+    list.append(term, description);
+  });
+}
+
+function renderRxResult(result) {
+  if (!result || typeof result !== "object" || typeof result.decode_id !== "string") {
+    throw new Error("接收分析接口没有返回译码记录编号。请确认网页和后端来自同一版本后重试。");
+  }
+  state.rxResult = result;
+  $("rx-results-empty").classList.add("hidden");
+  $("rx-results-content").classList.remove("hidden");
+  $("rx-decode-id").textContent = result.decode_id || "—";
+  $("rx-result-detector").textContent = result.detector || "—";
+  const statuses = Array.isArray(result.crc_status) ? result.crc_status : [];
+  const passed = Number.isFinite(Number(result.crc_pass_count)) ? Number(result.crc_pass_count) : statuses.filter(Boolean).length;
+  const total = Number.isFinite(Number(result.block_count)) ? Number(result.block_count) : statuses.length;
+  $("rx-crc-summary").textContent = `${passed} / ${total}`;
+  $("rx-bits-shape").textContent = Array.isArray(result.bits_shape) ? result.bits_shape.join(" × ") : "—";
+  displayMetadata(result.input);
+
+  const body = $("rx-crc-body");
+  body.replaceChildren();
+  statuses.forEach((status, index) => {
+    const row = document.createElement("tr");
+    const label = document.createElement("td");
+    const value = document.createElement("td");
+    const badge = document.createElement("span");
+    label.textContent = Array.isArray(result.crc_labels) && result.crc_labels[index]
+      ? result.crc_labels[index] : `UE${index}`;
+    badge.className = `crc-badge ${status ? "pass" : "fail"}`;
+    badge.textContent = status ? "通过" : "失败";
+    value.append(badge);
+    row.append(label, value);
+    body.append(row);
+  });
+  if (!statuses.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 2;
+    cell.className = "muted";
+    cell.textContent = "响应中没有逐块 CRC 数据。";
+    row.append(cell);
+    body.append(row);
+  }
+  $("rx-crc-count").textContent = `${statuses.length} 条记录`;
+  for (const [id, url] of [["rx-download-npz", result.output_npz_url], ["rx-download-json", result.output_json_url]]) {
+    const link = $(id);
+    link.classList.toggle("hidden", !url);
+    if (url) link.href = url;
+  }
+  const users = Array.isArray(result.constellation?.users) ? result.constellation.users : [];
+  const count = users.reduce((total, user) => total + Math.min(user.real?.length || 0, user.imag?.length || 0), 0);
+  $("rx-constellation-count").textContent = `${count} 个复数符号 · 按 UE 着色`;
+  requestAnimationFrame(() => drawConstellation(result.constellation));
+}
+
+function drawConstellation(constellation) {
+  const canvas = $("rx-constellation");
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.round(rect.width * ratio);
+  canvas.height = Math.round(rect.height * ratio);
+  const ctx = canvas.getContext("2d");
+  ctx.scale(ratio, ratio);
+  const users = Array.isArray(constellation?.users) ? constellation.users : [];
+  const series = users.length ? users : [{
+    name: "接收流",
+    real: Array.isArray(constellation?.real) ? constellation.real : [],
+    imag: Array.isArray(constellation?.imag) ? constellation.imag : [],
+  }];
+  let maxAbs = 0;
+  const plotted = series.map((user) => {
+    const count = Math.min(user.real?.length || 0, user.imag?.length || 0);
+    const step = Math.max(1, Math.ceil(count / 6000));
+    const points = [];
+    for (let i = 0; i < count; i += step) {
+      const x = Number(user.real[i]), y = Number(user.imag[i]);
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        points.push([x, y]);
+        maxAbs = Math.max(maxAbs, Math.abs(x), Math.abs(y));
+      }
+    }
+    return { name: user.name || "接收流", points };
+  }).filter((user) => user.points.length);
+  const width = rect.width, height = rect.height;
+  const pad = 32;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#fbfcfa";
+  ctx.fillRect(0, 0, width, height);
+  if (!plotted.length) {
+    ctx.fillStyle = "#74807b";
+    ctx.font = "12px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("没有可绘制的星座点", width / 2, height / 2);
+    return;
+  }
+  maxAbs = Math.max(1e-9, maxAbs) * 1.08;
+  const px = (value) => pad + ((value + maxAbs) / (2 * maxAbs)) * (width - pad * 2);
+  const py = (value) => height - pad - ((value + maxAbs) / (2 * maxAbs)) * (height - pad * 2);
+  ctx.strokeStyle = "#e1e7e3";
+  ctx.lineWidth = 1;
+  for (let i = -2; i <= 2; i++) {
+    const value = maxAbs * i / 2;
+    ctx.beginPath(); ctx.moveTo(px(value), pad); ctx.lineTo(px(value), height - pad); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pad, py(value)); ctx.lineTo(width - pad, py(value)); ctx.stroke();
+  }
+  ctx.strokeStyle = "#9ba7a1";
+  ctx.beginPath(); ctx.moveTo(px(0), pad); ctx.lineTo(px(0), height - pad); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(pad, py(0)); ctx.lineTo(width - pad, py(0)); ctx.stroke();
+  const legend = document.createElement("span");
+  legend.className = "rx-constellation-legend";
+  plotted.forEach((user, index) => {
+    const color = detectorColors[index % detectorColors.length];
+    ctx.fillStyle = `${color}88`;
+    user.points.forEach(([x, y]) => { ctx.beginPath(); ctx.arc(px(x), py(y), 1.7, 0, Math.PI * 2); ctx.fill(); });
+    const item = document.createElement("i");
+    item.style.setProperty("--legend-color", color);
+    item.textContent = user.name;
+    legend.append(item);
+  });
+  const chartTitle = canvas.closest(".chart-card")?.querySelector(".chart-title");
+  if (chartTitle) {
+    chartTitle.querySelector(".rx-constellation-legend")?.remove();
+    chartTitle.append(legend);
+  }
+  ctx.fillStyle = "#66736e";
+  ctx.font = "10px ui-monospace, monospace";
+  ctx.fillText("I", width - pad + 8, py(0) - 6);
+  ctx.fillText("Q", px(0) + 7, pad - 8);
+}
+
+async function decodeRx(event) {
+  event.preventDefault();
+  if (state.rxBusy) return;
+  const useDefaultCapture = isUsingDefaultRxCapture();
+  const file = $("rx-file").files[0];
+  const inputFormat = selectedInputFormat(file);
+  if (!useDefaultCapture && (!file || !inputFormat)) return showAlert("请选择 .h5、.hdf5 或 .npz 输入文件。", true);
+  const configName = $("rx-config-select").value;
+  const configText = $("rx-config-editor").value.trim();
+  if (!configName && !configText) return showAlert("请选择已有 RX 配置，或在右侧粘贴完整 TOML 配置。", true);
+  const noiseVariance = Number($("rx-noise-variance").value);
+  if (!Number.isFinite(noiseVariance) || noiseVariance < 0) return showAlert("噪声方差必须是非负数。", true);
+  setRxBusy(true);
+  try {
+    const payload = {
+      use_default_capture: useDefaultCapture,
+      config_name: configName,
+      config_text: configText,
+      input_name: useDefaultCapture ? state.rxDefaults.input_name : file.name,
+      input_format: useDefaultCapture ? (state.rxDefaults.input_format || "matlab-h5") : inputFormat,
+      input_domain: useDefaultCapture ? (state.rxDefaults.input_domain || "frequency") : $("rx-input-domain").value,
+      noise_variance: noiseVariance,
+      detector: $("rx-detector").value,
+      device: $("rx-device").value,
+    };
+    if (!useDefaultCapture) payload.input_base64 = await fileToBase64(file);
+    const parameter = $("rx-detector-parameter").value.trim();
+    const damping = $("rx-detector-damping").value.trim();
+    if (parameter) payload.detector_parameter = Number(parameter);
+    if (damping) payload.detector_damping = Number(damping);
+    const result = await api("/api/rx/decode", { method: "POST", body: JSON.stringify(payload) });
+    renderRxResult(result);
+  } catch (error) {
+    showAlert(error.message);
+    setRxBusy(false);
+    $("rx-status-pill").textContent = "失败";
+    $("rx-status-pill").className = "status-pill failed";
+    return;
+  } finally {
+    if (state.rxBusy) setRxBusy(false);
+  }
+}
+
 function renderResults(allPoints) {
   const skippedCount = allPoints.filter((point) => point && point.skipped).length;
   const points = allPoints.filter((point) => point && !point.skipped);
@@ -403,6 +742,44 @@ function drawChart(points) {
 }
 
 document.querySelectorAll(".config-tab").forEach((tab) => tab.addEventListener("click", () => switchKind(tab.dataset.kind).catch((error) => showAlert(error.message))));
+$("bler-workflow-tab").addEventListener("click", () => switchWorkflow("bler"));
+$("rx-workflow-tab").addEventListener("click", () => switchWorkflow("rx"));
+$("rx-form").addEventListener("submit", decodeRx);
+$("rx-config-select").addEventListener("change", (event) => loadRxConfig(event.target.value).catch((error) => showAlert(error.message)));
+$("rx-clear-config").addEventListener("click", () => { $("rx-config-editor").value = ""; $("rx-config-editor").focus(); });
+$("rx-use-default").addEventListener("change", (event) => setRxInputMode(event.target.checked));
+$("rx-file").addEventListener("change", (event) => {
+  const file = event.target.files[0];
+  const format = selectedInputFormat(file);
+  if (file && isUsingDefaultRxCapture()) {
+    $("rx-use-default").checked = false;
+    setRxInputMode(false);
+  }
+  if (!file) {
+    setRxInputMode(false);
+    return;
+  }
+  $("rx-file-name").textContent = file.name;
+  $("rx-file-meta").textContent = `${format === "matlab-h5" ? "MATLAB HDF5" : format.toUpperCase()} · ${formatFileSize(file.size)}`;
+  if (format === "matlab-h5") {
+    $("rx-input-domain").value = "frequency";
+    $("rx-input-domain").disabled = true;
+  } else {
+    $("rx-input-domain").disabled = false;
+    $("rx-input-domain").value = "time";
+  }
+  $("rx-submit-hint").textContent = "已选择输入文件，可以开始解码";
+});
+$("rx-detector").addEventListener("change", (event) => {
+  const method = event.target.value;
+  const labels = { "k-best": "K 候选数（可选）", ep: "迭代次数（可选）", "mmse-pic": "迭代次数（可选）" };
+  const parameter = $("rx-detector-parameter");
+  parameter.disabled = !Object.hasOwn(labels, method);
+  $("rx-parameter-label").textContent = labels[method] || "该检测器使用默认参数";
+  const supportsDamping = method === "ep" || method === "mmse-pic";
+  $("rx-detector-damping").disabled = !supportsDamping;
+});
+$("rx-detector").dispatchEvent(new Event("change"));
 $("profile-select").addEventListener("change", async (event) => {
   const kind = state.activeKind;
   if (editor.value !== state.savedTexts[kind] && !window.confirm("当前配置尚未保存，切换文件会丢失修改。确定继续吗？")) {
@@ -429,6 +806,9 @@ $("cancel-button").addEventListener("click", cancelRun);
 $("refresh-history").addEventListener("click", loadRuns);
 $("alert-close").addEventListener("click", () => $("global-alert").classList.add("hidden"));
 $("log-toggle").addEventListener("click", () => { const hidden = $("log-view").classList.toggle("hidden"); $("log-toggle").textContent = hidden ? "展开" : "收起"; });
-window.addEventListener("resize", () => { if (state.currentJob && state.currentJob.points?.length) drawChart(state.currentJob.points); });
+window.addEventListener("resize", () => {
+  if (state.currentJob && state.currentJob.points?.length) drawChart(state.currentJob.points);
+  if (state.rxResult) drawConstellation(state.rxResult.constellation);
+});
 
-Promise.all([initConfigs(), loadRuns()]).catch((error) => showAlert(error.message));
+Promise.all([initConfigs(), loadRuns(), initRxConfigs()]).catch((error) => showAlert(error.message));

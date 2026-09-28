@@ -80,6 +80,7 @@ class DftSOfdmMimoDetector(torch.nn.Module):
         )
         self._num_data_symbols = int(ordered_indices.numel())
         self._num_bits_per_symbol = bps
+        self.last_llr: torch.Tensor | None = None
 
     def forward(
         self,
@@ -116,7 +117,9 @@ class DftSOfdmMimoDetector(torch.nn.Module):
             no_eff = no_eff.reshape(batch, 1, 1, 1, 1).expand_as(x_hat.real)
         x_hat = x_hat.reshape(batch, num_tx, num_streams, self._num_data_symbols)
         no_eff = no_eff.reshape_as(x_hat.real)
-        return self._demapper(x_hat, no_eff)
+        llr = self._demapper(x_hat, no_eff)
+        self.last_llr = llr
+        return llr
 
 
 class DftSOfdmKBestDetector(DftSOfdmMimoDetector):
@@ -244,7 +247,9 @@ class DftSOfdmKBestDetector(DftSOfdmMimoDetector):
         post_detection_variance = post_detection_variance.permute(0, 3, 1, 2).reshape(
             batch, num_rx_ant, 1, self._num_data_symbols
         )
-        return self._demapper(symbols, post_detection_variance)
+        llr = self._demapper(symbols, post_detection_variance)
+        self.last_llr = llr
+        return llr
 
 
 class DftSOfdmEpDetector(DftSOfdmMimoDetector):
@@ -383,7 +388,9 @@ class DftSOfdmEpDetector(DftSOfdmMimoDetector):
         variances = posterior_var.reshape(
             batch, self._num_spread_symbols, self._fft_size, num_users
         ).permute(0, 3, 1, 2).reshape(batch, num_users, 1, self._num_data_symbols)
-        return self._demapper(means, variances)
+        llr = self._demapper(means, variances)
+        self.last_llr = llr
+        return llr
 
 
 class DftSOfdmMmsePicDetector(DftSOfdmMimoDetector):
@@ -503,6 +510,7 @@ class DftSOfdmMmsePicDetector(DftSOfdmMimoDetector):
             )
             llr = (1.0 - self.damping) * llr + self.damping * llr_new
 
+        self.last_llr = llr
         return llr
 
 
@@ -590,6 +598,7 @@ class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
         if llr_final is None:
             raise RuntimeError("SIC detector has no users to process")
         self.last_crc_status = crc_by_user
+        self.last_llr = llr_final
         return llr_final
 
 
@@ -717,6 +726,7 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
 class RxResult:
     bits: torch.Tensor  # [batch, user, transport_block_bit]
     crc_status: torch.Tensor  # [batch, user], True means CRC pass
+    constellation: torch.Tensor  # [batch, user, data_symbol], soft QAM estimates
     metadata: dict[str, Any]
 
 
@@ -758,6 +768,7 @@ class NrPuschRx:
         self.settings = settings
         device = use_device(device)
         self.device = device
+        self.device = device
         self.input_domain = input_domain
         self.l_min = l_min
         tx = PUSCHTransmitter(
@@ -768,6 +779,7 @@ class NrPuschRx:
         )
         self.sample_rate_hz = int(tx.resource_grid.fft_size * tx.resource_grid.subcarrier_spacing)
         self._num_ofdm_symbols = tx.resource_grid.num_ofdm_symbols
+        self._num_bits_per_symbol = int(torch.as_tensor(tx._num_bits_per_symbol).reshape(-1)[0])
         self._fft_size = tx.resource_grid.fft_size
         _, l_max = time_lag_discrete_time_channel(self.sample_rate_hz, max_delay_spread_s)
         stream_management = StreamManagement(np.ones((1, len(settings.users)), dtype=bool), 1)
@@ -928,6 +940,17 @@ class NrPuschRx:
         h: torch.Tensor | None,
     ) -> RxResult:
         bits, crc_status = self._receiver(y, no, h)
+        mimo_detector = self._receiver._mimo_detector
+        llr = getattr(mimo_detector, "last_llr", None)
+        if llr is None:
+            raise RuntimeError("MIMO detector did not retain its soft outputs for analysis")
+        symbol_logits = LLRs2SymbolLogits(
+            self._num_bits_per_symbol, device=self.device
+        )(llr.reshape(*llr.shape[:-1], -1, self._num_bits_per_symbol))
+        constellation, _ = SymbolLogits2Moments(
+            constellation=mimo_detector._constellation, device=self.device
+        )(symbol_logits)
+        constellation = constellation.squeeze(2)
         sic_metadata = {}
         if self.detector == "lmmse-sic":
             sic_detector = self._receiver._mimo_detector
@@ -959,7 +982,13 @@ class NrPuschRx:
             "channel_estimator": "perfect CDL CSI" if self.channel_estimator == "perfect" else "DFT-s-OFDM frequency DMRS OCC LS tap fit",
             "crc_status_axes": ["batch", "user"],
             "bits_axes": ["batch", "user", "transport_block_bit"],
+            "constellation_axes": ["batch", "user", "qam_symbol"],
             "sample_rate_hz": self.sample_rate_hz,
             **sic_metadata,
         }
-        return RxResult(bits=bits, crc_status=crc_status, metadata=metadata)
+        return RxResult(
+            bits=bits,
+            crc_status=crc_status,
+            constellation=constellation,
+            metadata=metadata,
+        )

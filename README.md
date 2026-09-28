@@ -120,11 +120,29 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 复现性说明：`simulate_bler` 每次以 `sionna.phy.config.seed` 重置 Sionna 的全局生成器，CDL 实现按调用顺序从该流取随机数。因此只有整个扫描配置完全一致（相同 batch 分组和相同停止条件）时结果才逐点相同；只改 `max_frames_per_snr` 或 `target_block_errors` 会改变前序 SNR 点的信道抽样次数，从而让后续点换用不同的信道实现。例：早前 `max_frames_per_snr = 100` 的短时运行在 35 dB 首个 26 帧内有 59 个误块，而本次 1,000 帧共 56 个误块，说明两组并非逐帧配对，跨运行比较只能按趋势看待。
 
-接收端也可独立加载 NPZ：`iq` 使用 `[batch,rx_antenna,sample]` 轴；`perfect` 模式另需 `channel_taps`（`[batch,user,rx_antenna,time,tap]`），`dmrs` 模式从 PUSCH DMRS 估计 CSI。
+接收端可独立加载时域 IQ 或频域资源网格 NPZ：`iq` 使用 `[batch,rx_antenna,sample]` 轴，`grid` 使用接收机频域网格轴；`perfect` 模式另需真实 `channel_taps` 或 `channel_frequency_response`，`dmrs` 模式从输入中的 PUSCH DMRS 估计 CSI。输入扩展名为 `.h5`/`.hdf5` 时会自动作为 MATLAB H5 接收夹具读取，也可用 `--input-format matlab-h5` 指定。当前 MATLAB 接口读取 `FreqData/IQdataPdu_real` 与 `FreqData/IQdataPdu_imag`，原始轴为 `[ofdm_symbol,rx_antenna,active_subcarrier]`，并会附加 batch 和 stream 轴供接收机处理。若 H5 中有 `data_*` 和 `pilot_*`，JSON sidecar 还会记录分离数组形状、天线平均功率和峰值幅度，便于抓包分析。
 
 ```bash
-nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /path/to/capture.npz --noise-variance 0.001 --channel-estimator dmrs --detector lmmse-sic --max-delay-spread-s 3e-6 --output /tmp/decoded.npz
+nr-pusch-rx --rx-config configs/rx_pusch_4ue.toml --input /path/to/capture.npz --noise-variance 0.001 --channel-estimator dmrs --detector lmmse-sic --max-delay-spread-s 3e-6 --output /tmp/decoded.npz
 ```
+
+使用仓库提供的 MATLAB H5 接收向量进行分析和 CRC 解码（夹具没有噪声功率或真实信道元数据，因此使用 DMRS 信道估计，并对无噪声参考数据设置 `--noise-variance 0`）：
+
+```bash
+nr-pusch-rx --rx-config configs/rx_pusch_4ue.toml --input tests/fixtures/matlab_h5/RxTestVector.h5 --noise-variance 0 --channel-estimator dmrs --input-domain frequency --output /tmp/rx_test_vector_decode.npz
+```
+
+接收输出 NPZ 保存解码 bits 和逐用户 CRC 状态，旁边的 JSON 文件保存使用的配置及输入分析摘要。旧参数名 `--tx-config` 仍作为 `--rx-config` 的兼容别名。
+
+### 网页外部接收分析
+
+启动本地网页后，“接收分析”默认选用仓库内的 `configs/rx_pusch_4ue.toml` 和 `tests/fixtures/matlab_h5/RxTestVector.h5`，可直接启动默认 LMMSE 解码。也可上传 `.h5`/`.hdf5` 或 `.npz` 文件，选择其他 RX TOML 配置，或粘贴完整 TOML 覆盖，再设置输入域、LMMSE/LMMSE-SIC/K-best/EP/MMSE-PIC 检测器及其参数。页面显示输入网格摘要、按 UE 着色的软 QAM 星座点、逐 UE CRC 状态，并提供 bits/CRC NPZ 与 JSON 清单下载。H5 当前按 MATLAB `FreqData/IQdataPdu` 频域格式读取；NPZ 时域数组为 `iq`，频域数组为 `grid`。单文件上传上限为 12 MiB，数据由本地 Web 服务处理。
+
+```bash
+nr-pusch-web --host 127.0.0.1 --port 8765 --config-dir configs --runs-dir runs/web
+```
+
+对提供的 `RxTestVector.h5`，噪声方差应设为 `0`（该夹具不含噪声功率元数据）；DMRS 信道估计下 LMMSE 的四个 UE 均通过 CRC。
 
 ## 运行
 
