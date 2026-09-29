@@ -48,7 +48,7 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 将 `device` 写为 `cpu`、`cuda:0` 或 `auto` 可从 TOML 控制运算设备；`configs/bler_4ue_cdl_gpu.toml` 提供显式 CUDA 示例。若以 `--device cuda` 覆盖，程序会将其规范化为 Sionna 接受的 `cuda:0`。请求的设备同时会写入 Sionna 的全局 `sionna.phy.config.device`：Sionna 的 PUSCH 导频图案按该全局值分配，而资源网格按显式设备分配，两者不一致时（例如在有 GPU 的机器上跑 `--device cpu`）会在建图阶段报设备不匹配。批大小受 GPU 显存约束；频域信道一般比时域线性卷积更节省显存。
 
-不同检测器可在 `[bler]` 中单独设置批大小；未列出的检测器使用 `batch_size`，每个 SNR 点最后一批仍受 `max_frames_per_snr` 截断。例如 `detector_batch_sizes = { lmmse = 20, "lmmse-sic" = 20, "k-best" = 1, "mmse-pic" = 1, ep = 1 }`。此前两次本机 GPU 运行均在 batch 20 下完成 LMMSE 和 LMMSE-SIC，随后在 K-best 阶段 CUDA OOM；示例因此将 K-best 改为 1。MMSE-PIC 和 EP 的值也是保守起点，尚未测定最优吞吐，可逐项调高。网页的仿真 TOML 编辑器同样支持该字段。不同批大小改变随机数的分组，因此各检测器共享初始 seed 和统计条件，但不保证逐帧使用完全相同的 payload、信道和噪声样本。
+不同检测器可在 `[bler]` 中单独设置批大小；未列出的检测器使用 `batch_size`，每个 SNR 点最后一批仍受 `max_frames_per_snr` 截断。当前 `configs/bler_4ue_cdl_gpu.toml` 使用 `{ lmmse = 26, "lmmse-sic" = 26, "k-best" = 10, "mmse-pic" = 26, ep = 26 }`（`batch_size = 20` 仅作未列出检测器的兜底）。K-best 的路径搜索在显存上最重，batch 必须明显低于其他检测器；本机 6 GiB GPU 上 LMMSE/LMMSE-SIC/MMSE-PIC 在 26 完成了全量扫描。网页的仿真 TOML 编辑器同样支持该字段。不同批大小改变随机数的分组，因此各检测器共享初始 seed 和统计条件，但不保证逐帧使用完全相同的 payload、信道和噪声样本。
 
 扫描会逐 SNR 点发射随机 transport blocks、通过 CDL、按每个接收天线的测得信号功率注入复 AWGN，再用 CRC 与 payload 比对统计 BLER。CSV 包含 SNR、BLER、CRC fail rate、BER 和样本数，JSON sidecar 保存配置及完整统计；BLER 将 CRC fail 或任何 payload bit 错误都计为 block error。`bler_smoke.toml` 是短时连通性配置，正式仿真应增加 `max_frames_per_snr` 和 `target_block_errors`。
 
@@ -122,27 +122,47 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 接收端可独立加载时域 IQ 或频域资源网格 NPZ：`iq` 使用 `[batch,rx_antenna,sample]` 轴，`grid` 使用接收机频域网格轴；`perfect` 模式另需真实 `channel_taps` 或 `channel_frequency_response`，`dmrs` 模式从输入中的 PUSCH DMRS 估计 CSI。输入扩展名为 `.h5`/`.hdf5` 时会自动作为 MATLAB H5 接收夹具读取，也可用 `--input-format matlab-h5` 指定。当前 MATLAB 接口读取 `FreqData/IQdataPdu_real` 与 `FreqData/IQdataPdu_imag`，原始轴为 `[ofdm_symbol,rx_antenna,active_subcarrier]`，并会附加 batch 和 stream 轴供接收机处理。若 H5 中有 `data_*` 和 `pilot_*`，JSON sidecar 还会记录分离数组形状、天线平均功率和峰值幅度，便于抓包分析。
 
+抓包分析中 `bit_errors` 只是与参考链路载荷的比对值，不能单独作为译码正确的判据：参考链路自身可能CRC 失败。sidecar 的 `reference_comparison` 因此同时记录 `crc_status`、`crc_verified_users` 和说明，CLI 也会在出现“CRC 通过但与参考不一致”的用户时显式提示。BLER 仿真不涉及该问题，因为发送与接收使用同一套比特。
+
+接收端还有两个与 MATLAB 参考链路对齐的可选处理，默认关闭，实测效果如下（判据只用 CRC）：`--estimate-delay` 按“FFT 峰值 + 抛物线插值”估计每根天线的整体时延（单位：采样），只写入 JSON sidecar 的 `estimated_bulk_delay_samples`，不改动 CSI，因此结果与基线完全一致（4/4、4/4、3/4）；把该时延作为相位斜坡补回 CSI 会使两个正常抓包从 4/4 掉到 1/4，说明当前整数抽头栅格已经足以承载该信道，正确的补偿需要按天线做分数时延重拟合而不是后置旋转。`--spatial-denoise` 实现“宽带空间协方差 → 主特征向量空间签名 → 逐子载波投影重构”，实测把两个正常抓包从 4/4 降到 3/4，对 `RxTestVectorCase78914` 无效（3/4 不变），因为该抓包每用户在 4 根天线上的信道并非秩一。两级 CPE 相位补偿（盲四阶矩 + 判决引导）按参考实现接入后同样使 4/4 降到 3/4，且在 `RxTestVector.h5` 上出现非有限值，故未保留。
+
+MATLAB 抓包还可能使用与 RNTI 无关的 `c_init` 加扰，此时标准解扰器必然解不出 TB。`nr-pusch-rx --scrambling <h5>` 读取每用户 `ue<k>_scrambSeq`（长度须等于 TB 编码后的 46,800 bit）并替换 TB 解码器的解扰器；sidecar 的 `scrambling_source` 记录所用来源，profile 本身不携带序列。译码判据只取本机 CRC：抓包 H5 里的 `ue*_tx_bits` 来自参考链路，参考链路自身 CRC 失败时该载荷不可信。
+
+#### 三组 MATLAB 抓包的译码结果
+
+共同参数：频域输入、DMRS 信道估计、`max_delay_spread_s = 6e-6`、噪声方差 0.001、MMSE-PIC（8 次迭代、阻尼 0.5），即 `configs/rx_pusch_4ue.toml` 的 `[receiver]` 默认值。
+
+| 抓包 | 加扰序列 | 检测器 | 迭代 / 阻尼 | 时延基 | 噪声方差 | 译码结果 |
+| --- | --- | --- | --- | ---: | ---: | --- |
+| `RxTestVector.h5` | 标准 RNTI | MMSE-PIC | 8 / 0.5 | 6 µs | 0.001 | **4/4 CRC**，0 bit 错误 |
+| `RxTestVectorCase11121314.h5` | `scrambSeqCase11121314.h5` | MMSE-PIC | 8 / 0.5 | 6 µs | 0.001 | **4/4 CRC**，0 bit 错误 |
+| `RxTestVectorCase78914.h5` | `scrambSeqCase78914.h5` | MMSE-PIC | 8 / 0.5 | 6 µs | 0.001 | **3/4 CRC**（ue1/ue2/ue3 通过，ue0 未解出） |
+
+三组抓包的 DMRS 端口映射都是 0/1/2/3，`max_delay_spread_s` 从 3 µs 放宽到 6 µs 是 78914 与 11121314 能否解出的关键（前者 1/4→3/4，后者 1/4→4/4）。
+
+`RxTestVectorCase78914.h5` 的检测器对比（噪声 0.001/0.003 × 时延 3/6 µs，取每种检测器的最好结果）：MMSE-PIC 3/4，LMMSE、LMMSE-SIC、EP 各 2/4，K-best(16) 1/4；MMSE-PIC 的迭代次数（4–32）与阻尼（0.25–0.75）对结果影响小于 100 bit 错误。ue0 在所有配置下都失败（BER≈18%）：更换检测器族、PIC 迭代与阻尼、抽头窗口下界（−6/−10/−14）均无改善，DMRS 端口置换实验显示现有排列唯一正确（任何非恒等排列都会把另一个用户打到 ≈50% 误码）。因此 ue0 属于该抓包本身的弱用户，接收侧已无可调空间。ue2 与 H5 参考载荷相差 2628 bit，是参考链路自身 CRC 失败所致，以本机 CRC 为准。
+
 ```bash
-nr-pusch-rx --rx-config configs/rx_pusch_4ue.toml --input /path/to/capture.npz --noise-variance 0.001 --channel-estimator dmrs --detector lmmse-sic --max-delay-spread-s 3e-6 --output /tmp/decoded.npz
+nr-pusch-rx --rx-config configs/rx_pusch_4ue.toml --input /path/to/capture.npz --output /tmp/decoded.npz
 ```
 
-使用仓库提供的 MATLAB H5 接收向量进行分析和 CRC 解码（夹具没有噪声功率或真实信道元数据，因此使用 DMRS 信道估计，并对无噪声参考数据设置 `--noise-variance 0`）：
+使用仓库提供的 MATLAB H5 接收向量进行分析和 CRC 解码。当前 `configs/rx_pusch_4ue.toml` 为该向量配置 DMRS 信道估计、频域输入和 MMSE-PIC 参数；接收机设置集中在 `[receiver]`，CLI 不带覆盖参数时会读取这些默认值：
 
 ```bash
-nr-pusch-rx --rx-config configs/rx_pusch_4ue.toml --input tests/fixtures/matlab_h5/RxTestVector.h5 --noise-variance 0 --channel-estimator dmrs --input-domain frequency --output /tmp/rx_test_vector_decode.npz
+nr-pusch-rx --rx-config configs/rx_pusch_4ue.toml --input tests/fixtures/matlab_h5/RxTestVector.h5 --output /tmp/rx_test_vector_decode.npz --device cpu
 ```
 
-接收输出 NPZ 保存解码 bits 和逐用户 CRC 状态，旁边的 JSON 文件保存使用的配置及输入分析摘要。旧参数名 `--tx-config` 仍作为 `--rx-config` 的兼容别名。
+该 H5 夹具包含与接收 IQ 同源的 `ue*_tx_bits` 参考数据。CLI 的 JSON sidecar 会给出逐 UE bit error/BER/exact-match 与 `crc_status`、`crc_verified_users`；判据以本机 CRC 为准，参考比对只作辅助（参考链路自身可能 CRC 失败，此时参考 bits 不可信）。当前 profile 对该向量得到 4/4 CRC pass 与 0 bit error。配置中的 `noise_variance = 0.001` 是在这些接收向量上调出的检测参数，不是 H5 提供的实测噪声元数据，也不应直接视为其他现网抓包的噪声估计；分析其他抓包时应按对应采集链路估计并覆盖该值。接收输出 NPZ 保存解码 bits 和逐用户 CRC 状态。旧参数名 `--tx-config` 仍作为 `--rx-config` 的兼容别名。
 
 ### 网页外部接收分析
 
-启动本地网页后，“接收分析”默认选用仓库内的 `configs/rx_pusch_4ue.toml` 和 `tests/fixtures/matlab_h5/RxTestVector.h5`，可直接启动默认 LMMSE 解码。也可上传 `.h5`/`.hdf5` 或 `.npz` 文件，选择其他 RX TOML 配置，或粘贴完整 TOML 覆盖，再设置输入域、LMMSE/LMMSE-SIC/K-best/EP/MMSE-PIC 检测器及其参数。页面显示输入网格摘要、按 UE 着色的软 QAM 星座点、逐 UE CRC 状态，并提供 bits/CRC NPZ 与 JSON 清单下载。H5 当前按 MATLAB `FreqData/IQdataPdu` 频域格式读取；NPZ 时域数组为 `iq`，频域数组为 `grid`。单文件上传上限为 12 MiB，数据由本地 Web 服务处理。
+启动本地网页后，“接收分析”默认选用仓库内的 `configs/rx_pusch_4ue.toml` 和 `tests/fixtures/matlab_h5/RxTestVector.h5`，并从 RX TOML 的 `[receiver]` 读取噪声方差和检测器默认值。也可上传 `.h5`/`.hdf5` 或 `.npz` 文件，选择其他 RX TOML 配置，或粘贴完整 TOML 覆盖，再设置输入域、LMMSE/LMMSE-SIC/K-best/EP/MMSE-PIC 检测器及其参数。页面显示输入网格摘要、按 UE 着色的软 QAM 星座点和逐 UE CRC；下载的 JSON 清单记录 H5 参考比特比较结果。页面也提供 bits/CRC NPZ 下载。H5 当前按 MATLAB `FreqData/IQdataPdu` 频域格式读取；NPZ 时域数组为 `iq`，频域数组为 `grid`。单文件上传上限为 12 MiB，数据由本地 Web 服务处理。
 
 ```bash
 nr-pusch-web --host 127.0.0.1 --port 8765 --config-dir configs --runs-dir runs/web
 ```
 
-对提供的 `RxTestVector.h5`，噪声方差应设为 `0`（该夹具不含噪声功率元数据）；DMRS 信道估计下 LMMSE 的四个 UE 均通过 CRC。
+`RxTestVector.h5` 不包含实测噪声方差或真实信道元数据。仓库的调优 profile 使用 DMRS 信道估计和 MMSE-PIC（8 次迭代、阻尼 0.5、噪声方差参数 0.001、`max_delay_spread_s = 6e-6`）；修改检测器或接收参数后，判据取本机 CRC，`reference_comparison` 只用于交叉核对。
 
 ## 运行
 

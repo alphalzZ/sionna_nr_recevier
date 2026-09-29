@@ -2,6 +2,7 @@
 
 import base64
 from http.server import ThreadingHTTPServer
+import io
 import json
 from pathlib import Path
 import shutil
@@ -10,6 +11,9 @@ from threading import Thread
 from urllib.request import Request, urlopen
 import unittest
 
+import numpy as np
+
+from nr_pusch.iq import read_matlab_rx_reference
 from nr_pusch.web import SimulationWebApp, make_handler
 
 
@@ -54,8 +58,11 @@ class WebRxImportTest(unittest.TestCase):
                     "input_format": "matlab-h5",
                     "input_domain": "frequency",
                     "input_base64": base64.b64encode(FIXTURE.read_bytes()).decode("ascii"),
-                    "noise_variance": 0.0,
-                    "detector": "lmmse",
+                    "noise_variance": 0.003,
+                    "detector": "mmse-pic",
+                    "detector_parameter": 16,
+                    "detector_damping": 0.75,
+                    "max_delay_spread_s": 3e-6,
                     "device": "cpu",
                 }).encode(), headers={"Content-Type": "application/json"}, method="POST")
                 with urlopen(request, timeout=60) as response:
@@ -64,6 +71,8 @@ class WebRxImportTest(unittest.TestCase):
                 self.assertEqual(payload["crc_labels"], ["ue0", "ue1", "ue2", "ue3"])
                 self.assertEqual(payload["crc_pass_count"], 4)
                 self.assertEqual(payload["block_count"], 4)
+                self.assertTrue(payload["reference_comparison"]["exact_match"])
+                self.assertEqual(payload["reference_comparison"]["bit_errors"], [0, 0, 0, 0])
                 self.assertEqual(payload["input"]["format"], "matlab-h5")
                 self.assertEqual([user["name"] for user in payload["constellation"]["users"]], ["ue0", "ue1", "ue2", "ue3"])
                 self.assertTrue(payload["constellation"]["users"][0]["real"])
@@ -74,11 +83,15 @@ class WebRxImportTest(unittest.TestCase):
                 for output_url in (payload["output_npz_url"], payload["output_json_url"]):
                     with urlopen(f"{base_url}{output_url}", timeout=5) as response:
                         self.assertGreater(len(response.read()), 0)
+                with urlopen(f"{base_url}{payload['output_npz_url']}", timeout=5) as response:
+                    with np.load(io.BytesIO(response.read()), allow_pickle=False) as decoded:
+                        decoded_bits = decoded["bits"][0]
+                np.testing.assert_array_equal(
+                    decoded_bits, read_matlab_rx_reference(FIXTURE).transmitted_bits
+                )
 
                 default_request = Request(f"{base_url}/api/rx/decode", data=json.dumps({
                     "use_default_capture": True,
-                    "noise_variance": 0.0,
-                    "detector": "lmmse",
                     "device": "cpu",
                 }).encode(), headers={"Content-Type": "application/json"}, method="POST")
                 with urlopen(default_request, timeout=60) as response:
@@ -86,6 +99,7 @@ class WebRxImportTest(unittest.TestCase):
                 self.assertTrue(default_result["used_default_capture"])
                 self.assertEqual(default_result["input"]["source"], "repository-default")
                 self.assertEqual(default_result["crc_status"], [True, True, True, True])
+                self.assertTrue(default_result["reference_comparison"]["exact_match"])
             finally:
                 server.shutdown()
                 server.server_close()

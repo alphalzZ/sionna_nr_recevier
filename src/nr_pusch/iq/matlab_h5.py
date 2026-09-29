@@ -31,6 +31,7 @@ class MatlabRxReference:
     source: Path
     data_grid: np.ndarray | None = None
     pilot_grid: np.ndarray | None = None
+    transmitted_bits: np.ndarray | None = None
 
 
 def read_matlab_rx_reference(path: str | Path, num_rx_antennas: int = 4) -> MatlabRxReference:
@@ -70,6 +71,21 @@ def read_matlab_rx_reference(path: str | Path, num_rx_antennas: int = 4) -> Matl
         _read_split_complex(source, pilot_real_key, pilot_imag_key, ndim=2, label="pilot")
         if pilot_present else None
     )
+    tx_bit_keys = [f"ue{user}_tx_bits" for user in range(4)]
+    names = _dataset_names(source)
+    tx_bits_present = [key in names for key in tx_bit_keys]
+    if any(tx_bits_present) and not all(tx_bits_present):
+        missing = [key for key, present in zip(tx_bit_keys, tx_bits_present) if not present]
+        raise ValueError(f"{source} 发送参考 bits 不完整，缺少: {', '.join(missing)}")
+    transmitted_bits = None
+    if all(tx_bits_present):
+        with h5py.File(source, "r") as h5:
+            bit_rows = [np.asarray(h5[key], dtype=np.float64).reshape(-1) for key in tx_bit_keys]
+        if len({row.size for row in bit_rows}) != 1:
+            raise ValueError("各 UE 的发送参考 bits 长度必须一致")
+        if any(not np.isfinite(row).all() or not np.isin(row, (0.0, 1.0)).all() for row in bit_rows):
+            raise ValueError("发送参考 bits 必须只包含有限的 0/1")
+        transmitted_bits = np.stack(bit_rows).astype(np.uint8, copy=False)
     if data_grid is not None and data_grid.shape[0] != num_rx_antennas:
         raise ValueError("FreqData/data 的接收天线数量与 IQdataPdu 不一致")
     if pilot_grid is not None and pilot_grid.shape[0] != num_rx_antennas:
@@ -80,7 +96,32 @@ def read_matlab_rx_reference(path: str | Path, num_rx_antennas: int = 4) -> Matl
         source=source,
         data_grid=data_grid,
         pilot_grid=pilot_grid,
+        transmitted_bits=transmitted_bits,
     )
+
+
+def read_matlab_scrambling_sequences(
+    path: str | Path, num_users: int = 4
+) -> np.ndarray:
+    """Read per-UE 5G data scrambling sequences as ``[user, bit]`` 0/1 values.
+
+    MATLAB captures may scramble PUSCH code bits with a case-specific
+    initialization value instead of the RNTI-derived ``c_init`` that Sionna
+    uses, so the recorded sequences are passed to the receiver verbatim.
+    """
+    source = Path(path)
+    keys = [f"ue{user}_scrambSeq" for user in range(num_users)]
+    with h5py.File(source, "r") as h5:
+        missing = [key for key in keys if key not in h5]
+        if missing:
+            raise ValueError(f"{source} 缺少加扰序列: {', '.join(missing)}")
+        rows = [np.asarray(h5[key], dtype=np.float64).reshape(-1) for key in keys]
+    lengths = {row.size for row in rows}
+    if len(lengths) != 1:
+        raise ValueError(f"{source} 各 UE 的加扰序列长度必须一致")
+    if not all(np.isin(row, (0.0, 1.0)).all() for row in rows):
+        raise ValueError(f"{source} 加扰序列只能包含 0/1")
+    return np.stack(rows).astype(np.float32, copy=False)
 
 
 def _dataset_names(source: Path) -> set[str]:

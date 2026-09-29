@@ -18,6 +18,11 @@ const state = {
     input_format: "matlab-h5",
     input_domain: "frequency",
     noise_variance: 0,
+    channel_estimator: "dmrs",
+    detector: "lmmse",
+    detector_parameter: null,
+    detector_damping: 0.25,
+    max_delay_spread_s: 3e-6,
   },
 };
 
@@ -389,6 +394,11 @@ async function initRxConfigs() {
   const defaultToggle = $("rx-use-default");
   defaultToggle.disabled = !state.rxDefaults.available;
   defaultToggle.checked = Boolean(state.rxDefaults.available);
+  $("rx-input-domain").value = state.rxDefaults.input_domain || "frequency";
+  $("rx-detector").value = state.rxDefaults.detector || "lmmse";
+  $("rx-detector-parameter").value = state.rxDefaults.detector_parameter ?? "";
+  $("rx-detector-damping").value = String(state.rxDefaults.detector_damping ?? 0.25);
+  $("rx-detector").dispatchEvent(new Event("change"));
   $("rx-default-meta").textContent = state.rxDefaults.available
     ? `${state.rxDefaults.input_name || "本地默认夹具"} · ${state.rxDefaults.config_name || "默认配置"}`
     : "未发现本地默认夹具，请选择上传文件";
@@ -643,9 +653,13 @@ async function decodeRx(event) {
       input_format: useDefaultCapture ? (state.rxDefaults.input_format || "matlab-h5") : inputFormat,
       input_domain: useDefaultCapture ? (state.rxDefaults.input_domain || "frequency") : $("rx-input-domain").value,
       noise_variance: noiseVariance,
+      channel_estimator: useDefaultCapture ? (state.rxDefaults.channel_estimator || "dmrs") : "dmrs",
       detector: $("rx-detector").value,
       device: $("rx-device").value,
     };
+    if (useDefaultCapture && Number.isFinite(Number(state.rxDefaults.max_delay_spread_s))) {
+      payload.max_delay_spread_s = Number(state.rxDefaults.max_delay_spread_s);
+    }
     if (!useDefaultCapture) payload.input_base64 = await fileToBase64(file);
     const parameter = $("rx-detector-parameter").value.trim();
     const damping = $("rx-detector-damping").value.trim();

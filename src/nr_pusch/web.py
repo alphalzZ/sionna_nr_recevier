@@ -333,13 +333,26 @@ class SimulationWebApp:
         config_path = self.config_dir / "rx_pusch_4ue.toml"
         capture_path = self.config_dir.parent / "tests" / "fixtures" / "matlab_h5" / "RxTestVector.h5"
         available = config_path.is_file() and capture_path.is_file()
+        profile: dict[str, Any] = {}
+        if config_path.is_file():
+            try:
+                profile = tomllib.loads(config_path.read_text(encoding="utf-8")).get("receiver", {})
+            except (OSError, tomllib.TOMLDecodeError):
+                profile = {}
+        if not isinstance(profile, dict):
+            profile = {}
         result: dict[str, Any] = {
             "available": available,
             "config_name": config_path.name if config_path.is_file() else None,
             "input_name": capture_path.name if capture_path.is_file() else None,
             "input_format": "matlab-h5",
-            "input_domain": "frequency",
-            "noise_variance": 0.0,
+            "input_domain": profile.get("input_domain", "frequency"),
+            "noise_variance": profile.get("noise_variance", 0.0),
+            "channel_estimator": profile.get("channel_estimator", "dmrs"),
+            "detector": profile.get("detector", "lmmse"),
+            "detector_parameter": profile.get("detector_parameter"),
+            "detector_damping": profile.get("detector_damping", 0.25),
+            "max_delay_spread_s": profile.get("max_delay_spread_s", 3e-6),
         }
         if available:
             result["input_bytes"] = capture_path.stat().st_size
@@ -381,7 +394,10 @@ class SimulationWebApp:
         input_domain = data.get(
             "input_domain", default_case["input_domain"] if use_default_capture else "time"
         )
-        detector = data.get("detector", "lmmse")
+        detector = data.get("detector", default_case["detector"] if use_default_capture else "lmmse")
+        channel_estimator = data.get(
+            "channel_estimator", default_case["channel_estimator"] if use_default_capture else "dmrs"
+        )
         device = data.get("device", "cpu")
         try:
             noise_variance = float(
@@ -429,16 +445,32 @@ class SimulationWebApp:
             raise ApiError(400, "device 只支持 cpu 或 cuda:0")
         if device == "cuda":
             device = "cuda:0"
-        parameter = data.get("detector_parameter")
+        parameter = data.get(
+            "detector_parameter",
+            default_case["detector_parameter"] if use_default_capture else None,
+        )
         if parameter is not None:
             if isinstance(parameter, bool) or not isinstance(parameter, int) or not 1 <= parameter <= 256:
                 raise ApiError(400, "detector_parameter 必须是 1 到 256 的整数")
         try:
-            damping = float(data.get("detector_damping", 0.25))
+            damping = float(
+                data.get("detector_damping", default_case["detector_damping"] if use_default_capture else 0.25)
+            )
         except (TypeError, ValueError) as exc:
             raise ApiError(400, "detector_damping 必须位于 (0, 1]") from exc
         if not math.isfinite(damping) or not 0 < damping <= 1:
             raise ApiError(400, "detector_damping 必须位于 (0, 1]")
+        try:
+            max_delay_spread_s = float(
+                data.get(
+                    "max_delay_spread_s",
+                    default_case["max_delay_spread_s"] if use_default_capture else 3e-6,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ApiError(400, "max_delay_spread_s 必须是正数") from exc
+        if not math.isfinite(max_delay_spread_s) or max_delay_spread_s <= 0:
+            raise ApiError(400, "max_delay_spread_s 必须是正数")
         if use_default_capture:
             payload = default_capture_path.read_bytes()
         else:
@@ -469,9 +501,10 @@ class SimulationWebApp:
                 "--rx-config", str(config_copy), "--input", str(capture),
                 "--input-format", detected_format,
                 "--noise-variance", str(noise_variance),
-                "--channel-estimator", "dmrs", "--input-domain",
+                "--channel-estimator", channel_estimator, "--input-domain",
                 input_domain,
                 "--detector", detector, "--detector-damping", str(damping),
+                "--max-delay-spread-s", str(max_delay_spread_s),
                 "--output", str(output), "--device", device,
             ]
             if parameter is not None:
@@ -536,6 +569,7 @@ class SimulationWebApp:
                 "detector": detector,
                 "used_default_capture": use_default_capture,
                 "receiver": manifest.get("receiver", {}),
+                "reference_comparison": manifest.get("reference_comparison"),
                 "output_npz_url": f"/api/rx/decode/{decode_id}/decoded.npz",
                 "output_json_url": f"/api/rx/decode/{decode_id}/decoded.json",
                 "logs": completed.stdout.splitlines()[-12:],
