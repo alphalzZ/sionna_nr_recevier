@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from nr_pusch.config import TxSettings
-from nr_pusch.iq import read_matlab_rx_reference
+from nr_pusch.iq import read_matlab_rx_reference, read_matlab_scrambling_sequences
 from nr_pusch.receiver import NrPuschRx
 
 
@@ -71,6 +71,67 @@ class MatlabRxCaptureTest(unittest.TestCase):
             self.assertTrue(all(isinstance(value, bool) for value in status[user]))
         self.assertTrue(all(all(status[user]) for user in range(4)))
 
+
+    def test_high_rate_capture_recovers_third_user_with_shifted_dmrs_window(self):
+        profile_path = ROOT / "configs" / "rx_pusch_4ue_mcs27.toml"
+        fixture_dir = ROOT / "tests" / "fixtures" / "matlab_h5"
+        settings = TxSettings.from_toml(profile_path)
+        with profile_path.open("rb") as stream:
+            profile = tomllib.load(stream)["receiver"]
+        reference = read_matlab_rx_reference(fixture_dir / "RxTestVectorCase123427.h5")
+        sequences = read_matlab_scrambling_sequences(
+            fixture_dir / "scrambSeqCase123427.h5"
+        )
+        receiver = NrPuschRx(
+            settings,
+            channel_estimator=profile["channel_estimator"],
+            detector=profile["detector"],
+            detector_parameter=profile["detector_parameter"],
+            detector_damping=profile["detector_damping"],
+            input_domain=profile["input_domain"],
+            l_min=profile["l_min"],
+            max_delay_spread_s=profile["max_delay_spread_s"],
+            scrambling_sequences=torch.from_numpy(sequences),
+            track_cb_crc=True,
+            device="cpu",
+        )
+
+        result = receiver.receive_frequency_grid(
+            torch.from_numpy(reference.frequency_grid[None, None]),
+            noise_variance=profile["noise_variance"],
+        )
+
+        self.assertTrue(torch.all(result.crc_status[0, :3]).item())
+        self.assertTrue(all(result.metadata["cb_crc_status"][2]))
+
+    def test_sic_uses_capture_scrambling_for_crc_gated_cancellation(self):
+        profile_path = ROOT / "configs" / "rx_pusch_4ue_mcs27.toml"
+        fixture_dir = ROOT / "tests" / "fixtures" / "matlab_h5"
+        settings = TxSettings.from_toml(profile_path)
+        with profile_path.open("rb") as stream:
+            profile = tomllib.load(stream)["receiver"]
+        reference = read_matlab_rx_reference(fixture_dir / "RxTestVectorCase123427.h5")
+        sequences = read_matlab_scrambling_sequences(
+            fixture_dir / "scrambSeqCase123427.h5"
+        )
+        receiver = NrPuschRx(
+            settings,
+            channel_estimator="dmrs",
+            detector="lmmse-sic",
+            input_domain="frequency",
+            l_min=profile["l_min"],
+            max_delay_spread_s=profile["max_delay_spread_s"],
+            scrambling_sequences=torch.from_numpy(sequences),
+            device="cpu",
+        )
+
+        result = receiver.receive_frequency_grid(
+            torch.from_numpy(reference.frequency_grid[None, None]),
+            noise_variance=profile["noise_variance"],
+        )
+
+        self.assertEqual(result.metadata["sic_crc_before_cancel"][0][:2], [True, True])
+        self.assertTrue(torch.all(result.crc_status[0, :2]).item())
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,51 @@ from .transmitter import NrPuschTx
 _MIN_NOISE_VARIANCE = 1e-12
 
 
+def _validate_scrambling_sequences(
+    sequences: torch.Tensor, num_users: int, num_code_bits: int
+) -> None:
+    if tuple(sequences.shape) != (num_users, num_code_bits):
+        raise ValueError(
+            f"scrambling_sequences 形状应为 ({num_users}, {num_code_bits})，"
+            f"实际为 {tuple(sequences.shape)}"
+        )
+    if not bool(torch.all((sequences == 0) | (sequences == 1))):
+        raise ValueError("scrambling_sequences 只能包含 0/1")
+
+
+def _use_explicit_scrambling(
+    tb_decoder: TBDecoder,
+    sequences: torch.Tensor,
+    num_users: int,
+    num_code_bits: int,
+) -> None:
+    """Replace an NR TB decoder's RNTI-derived descrambling sequence."""
+    _validate_scrambling_sequences(sequences, num_users, num_code_bits)
+    scrambler = Scrambler(
+        sequence=sequences.to(dtype=torch.float32),
+        binary=False,
+        device=tb_decoder.device,
+    )
+    tb_decoder._descrambler = Descrambler(
+        scrambler, binary=False, device=tb_decoder.device
+    )
+
+
+def _use_explicit_tx_scrambling(
+    transmitter: NrPuschTx,
+    sequences: torch.Tensor,
+    num_users: int,
+    num_code_bits: int,
+) -> None:
+    """Replace an NR TB encoder's RNTI-derived scrambling sequence."""
+    _validate_scrambling_sequences(sequences, num_users, num_code_bits)
+    transmitter._tx_freq._tb_encoder._scrambler = Scrambler(
+        sequence=sequences.to(dtype=torch.float32),
+        binary=True,
+        device=transmitter.device,
+    )
+
+
 class DftSOfdmMimoDetector(torch.nn.Module):
     """Detect spread symbols, undo DFT spreading, then produce QAM LLRs."""
 
@@ -528,6 +573,7 @@ class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
         *,
         num_decoder_iterations: int,
         device: str | None,
+        scrambling_sequences: torch.Tensor | None = None,
     ) -> None:
         super().__init__(transmitter, stream_management, method="lmmse")
         self._sic_decoder = TBDecoder(
@@ -537,6 +583,21 @@ class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
         )
         self._reencoder = NrPuschTx(settings, device=device)
         self._num_users = len(settings.users)
+        if scrambling_sequences is not None:
+            sequences = scrambling_sequences.to(device=transmitter.device)
+            num_code_bits = int(transmitter._tb_encoder.n)
+            _use_explicit_scrambling(
+                self._sic_decoder,
+                sequences,
+                self._num_users,
+                num_code_bits,
+            )
+            _use_explicit_tx_scrambling(
+                self._reencoder,
+                sequences,
+                self._num_users,
+                num_code_bits,
+            )
         self._transport_block_size = self._reencoder.transport_block_size
         self.last_user_order: list[int] = []
         self.last_crc_status: torch.Tensor | None = None
@@ -856,7 +917,6 @@ class NrPuschRx:
         self.settings = settings
         device = use_device(device)
         self.device = device
-        self.device = device
         self.input_domain = input_domain
         self.l_min = l_min
         tx = PUSCHTransmitter(
@@ -878,6 +938,7 @@ class NrPuschRx:
                 settings,
                 num_decoder_iterations=num_decoder_iterations,
                 device=device,
+                scrambling_sequences=scrambling_sequences,
             )
         elif detector == "k-best":
             detector_block = DftSOfdmKBestDetector(
@@ -933,7 +994,7 @@ class NrPuschRx:
                 tb_decoder._cb_crc_decoder, self._cb_crc_status
             )
         if scrambling_sequences is not None:
-            self._use_explicit_scrambling(
+            _use_explicit_scrambling(
                 tb_decoder,
                 scrambling_sequences.to(device=device),
                 len(settings.users),
@@ -965,33 +1026,6 @@ class NrPuschRx:
         self._estimator = estimator
         self.track_cb_crc = track_cb_crc
 
-    @staticmethod
-    def _use_explicit_scrambling(
-        tb_decoder: TBDecoder,
-        sequences: torch.Tensor,
-        num_users: int,
-        num_code_bits: int,
-    ) -> None:
-        """Descramble with recorded per-UE sequences instead of the RNTI ones.
-
-        MATLAB captures can scramble PUSCH code bits with a case-specific
-        initialization value, so the recorded 0/1 sequences replace the
-        RNTI-derived descrambler that the transport block decoder builds from
-        the transmit configuration.
-        """
-        if tuple(sequences.shape) != (num_users, num_code_bits):
-            raise ValueError(
-                f"scrambling_sequences 形状应为 ({num_users}, {num_code_bits})，"
-                f"实际为 {tuple(sequences.shape)}"
-            )
-        if not bool(torch.all((sequences == 0) | (sequences == 1))):
-            raise ValueError("scrambling_sequences 只能包含 0/1")
-        scrambler = Scrambler(
-            sequence=sequences.to(dtype=torch.float32), binary=False, device=tb_decoder.device
-        )
-        tb_decoder._descrambler = Descrambler(
-            scrambler, binary=False, device=tb_decoder.device
-        )
 
     def receive(
         self,

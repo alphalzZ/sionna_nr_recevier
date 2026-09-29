@@ -38,6 +38,10 @@ def main() -> None:
     parser.add_argument("--detector-parameter", type=int, default=None)
     parser.add_argument("--detector-damping", type=float, default=None)
     parser.add_argument(
+        "--l-min", type=int, default=None,
+        help="Minimum discrete-time DMRS channel tap (default -6)",
+    )
+    parser.add_argument(
         "--max-delay-spread-s",
         type=float,
         default=None,
@@ -91,6 +95,10 @@ def main() -> None:
         args.max_delay_spread_s
         if args.max_delay_spread_s is not None
         else float(receiver_profile.get("max_delay_spread_s", 3e-6))
+    )
+    l_min = (
+        args.l_min if args.l_min is not None
+        else int(receiver_profile.get("l_min", -6))
     )
     input_format = args.input_format
     if input_format == "auto":
@@ -177,6 +185,7 @@ def main() -> None:
         detector_damping=detector_damping,
         input_domain=input_domain,
         max_delay_spread_s=max_delay_spread_s,
+        l_min=l_min,
         device=args.device,
         scrambling_sequences=scrambling_sequences,
         spatial_denoise=spatial_denoise,

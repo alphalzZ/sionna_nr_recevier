@@ -46,11 +46,11 @@ dmrs_port = 3
 [receiver]
 channel_estimator = "dmrs"
 input_domain = "frequency"
-# Same receiver settings as rx_pusch_4ue.toml; only the MCS differs, so this
-# profile targets the higher-rate capture RxTestVectorCase123427.h5.
-noise_variance = 0.001
+# The capture has dominant beams with a negative timing offset. Shift the
+# joint DMRS tap window so its strong paths lie inside the fitted basis.
+l_min = -44
+noise_variance = 0.0003
 detector = "mmse-pic"
-# PIC iterations and soft-symbol damping for the mmse-pic detector.
 detector_parameter = 8
 detector_damping = 0.5
-max_delay_spread_s = 6e-6
+max_delay_spread_s = 2e-6
