@@ -1,0 +1,56 @@
+[carrier]
+subcarrier_spacing_khz = 30
+cyclic_prefix = "normal"
+n_cell_id = 0
+n_size_grid = 50
+n_start_grid = 0
+frame_number = 0
+slot_number = 0
+
+[pusch]
+waveform = "dft_s_ofdm"
+mapping_type = "A"
+symbol_allocation = [0, 14]
+n_size_bwp = 50
+n_start_bwp = 0
+mcs_table = 1
+# Table 1 index 27: 64-QAM at target rate 0.92578125, the geometry of
+# RxTestVectorCase123427.h5 (43032-bit transport block, 46800 code bits).
+mcs_index = 27
+dmrs_config_type = 1
+dmrs_type_a_position = 2
+dmrs_additional_position = 0
+dmrs_num_cdm_groups_without_data = 2
+dmrs_beta = 1.4125375446227544
+
+[[users]]
+name = "ue0"
+n_rnti = 1456
+dmrs_port = 0
+
+[[users]]
+name = "ue1"
+n_rnti = 1460
+dmrs_port = 1
+
+[[users]]
+name = "ue2"
+n_rnti = 1457
+dmrs_port = 2
+
+[[users]]
+name = "ue3"
+n_rnti = 1459
+dmrs_port = 3
+
+[receiver]
+channel_estimator = "dmrs"
+input_domain = "frequency"
+# Same receiver settings as rx_pusch_4ue.toml; only the MCS differs, so this
+# profile targets the higher-rate capture RxTestVectorCase123427.h5.
+noise_variance = 0.001
+detector = "mmse-pic"
+# PIC iterations and soft-symbol damping for the mmse-pic detector.
+detector_parameter = 8
+detector_damping = 0.5
+max_delay_spread_s = 6e-6

@@ -128,17 +128,29 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 MATLAB 抓包还可能使用与 RNTI 无关的 `c_init` 加扰，此时标准解扰器必然解不出 TB。`nr-pusch-rx --scrambling <h5>` 读取每用户 `ue<k>_scrambSeq`（长度须等于 TB 编码后的 46,800 bit）并替换 TB 解码器的解扰器；sidecar 的 `scrambling_source` 记录所用来源，profile 本身不携带序列。译码判据只取本机 CRC：抓包 H5 里的 `ue*_tx_bits` 来自参考链路，参考链路自身 CRC 失败时该载荷不可信。
 
-#### 三组 MATLAB 抓包的译码结果
+#### 四组 MATLAB 抓包的译码结果
 
-共同参数：频域输入、DMRS 信道估计、`max_delay_spread_s = 6e-6`、噪声方差 0.001、MMSE-PIC（8 次迭代、阻尼 0.5），即 `configs/rx_pusch_4ue.toml` 的 `[receiver]` 默认值。
+低码率三组（`RxTestVector.h5`、`RxTestVectorCase11121314.h5`、`RxTestVectorCase78914.h5`）共用
+`configs/rx_pusch_4ue.toml`：`mcs_index = 20`（目标码率 0.6015625，28,168 bit TB，46,800 码比特，4 个码块），
+`[receiver]` 默认 MMSE-PIC（8 次迭代、阻尼 0.5）、`max_delay_spread_s = 6e-6`、噪声方差 0.001。
+高码率一组（`RxTestVectorCase123427.h5`）用 `configs/rx_pusch_4ue_mcs27.toml`：`mcs_index = 27`
+（目标码率 0.92578125，43,032 bit TB，同样 46,800 码比特但分成 6 个码块），接收机参数与上面一致，
+噪声方差下调到 0.0003、时延基 3e-6 略优。
 
-| 抓包 | 加扰序列 | 检测器 | 迭代 / 阻尼 | 时延基 | 噪声方差 | 译码结果 |
-| --- | --- | --- | --- | ---: | ---: | --- |
-| `RxTestVector.h5` | 标准 RNTI | MMSE-PIC | 8 / 0.5 | 6 µs | 0.001 | **4/4 CRC**，0 bit 错误 |
-| `RxTestVectorCase11121314.h5` | `scrambSeqCase11121314.h5` | MMSE-PIC | 8 / 0.5 | 6 µs | 0.001 | **4/4 CRC**，0 bit 错误 |
-| `RxTestVectorCase78914.h5` | `scrambSeqCase78914.h5` | MMSE-PIC | 8 / 0.5 | 6 µs | 0.001 | **3/4 CRC**（ue1/ue2/ue3 通过，ue0 未解出） |
+| 抓包 | profile（MCS） | 加扰序列 | 检测器 | 迭代 / 阻尼 | 时延基 | 噪声方差 | TB CRC | 码块 CRC |
+| --- | --- | --- | --- | --- | ---: | ---: | --- | --- |
+| `RxTestVector.h5` | `rx_pusch_4ue`（20） | 标准 RNTI | MMSE-PIC | 8 / 0.5 | 6 µs | 0.001 | **4/4** | 全部 4/4 |
+| `RxTestVectorCase11121314.h5` | `rx_pusch_4ue`（20） | `scrambSeqCase11121314.h5` | MMSE-PIC | 8 / 0.5 | 6 µs | 0.001 | **4/4** | 全部 4/4 |
+| `RxTestVectorCase78914.h5` | `rx_pusch_4ue`（20） | `scrambSeqCase78914.h5` | MMSE-PIC | 8 / 0.5 | 6 µs | 0.001 | **3/4**（ue0 未解出） | ue0 0/4，其余 4/4 |
+| `RxTestVectorCase123427.h5` | `rx_pusch_4ue_mcs27`（27） | `scrambSeqCase123427.h5` | MMSE-PIC | 8 / 0.5 | 3 µs | 0.0003 | **2/4**（ue0/ue1） | ue0、ue1 6/6；ue3 1/6；ue2 0/6 |
 
-三组抓包的 DMRS 端口映射都是 0/1/2/3，`max_delay_spread_s` 从 3 µs 放宽到 6 µs 是 78914 与 11121314 能否解出的关键（前者 1/4→3/4，后者 1/4→4/4）。
+`nr-pusch-rx --cb-crc` 记录每个用户的逐码块 CRC 判定（`RxResult.metadata["cb_crc_status"]`，sidecar
+同名字段）。失败用户呈现"整块全败"特征：case78914 的 ue0 是 0/4，case123427 的 ue2 是 0/6，
+说明这些用户的软信息质量整体不达标，而不是个别码块受扰。
+
+四组抓包的 DMRS 端口映射都是 0/1/2/3。低码率组把 `max_delay_spread_s` 从 3 µs 放宽到 6 µs 是 78914 与 11121314 能否解出的关键（前者 1/4→3/4，后者 1/4→4/4）。
+
+`RxTestVectorCase123427.h5` 的码率 0.92578125 留给纠错的余量很小：五种检测器（MMSE-PIC、LMMSE-SIC、LMMSE、EP、K-best）在噪声 0.0003/0.001 × 时延 3/6 µs 下的最好结果都只有 **2/4**，噪声升到 0.003 全部掉到 0/4；PIC 迭代 4–32、阻尼 0.25–0.75 与空间签名降噪都只改变个位到几十 bit 错误，无法改变 TB CRC 判定。ue2（0/6 码块）与 ue3（1/6）属于信道估计质量不足导致的整体失败。
 
 `RxTestVectorCase78914.h5` 的检测器对比（噪声 0.001/0.003 × 时延 3/6 µs，取每种检测器的最好结果）：MMSE-PIC 3/4，LMMSE、LMMSE-SIC、EP 各 2/4，K-best(16) 1/4；MMSE-PIC 的迭代次数（4–32）与阻尼（0.25–0.75）对结果影响小于 100 bit 错误。ue0 在所有配置下都失败（BER≈18%）：更换检测器族、PIC 迭代与阻尼、抽头窗口下界（−6/−10/−14）均无改善，DMRS 端口置换实验显示现有排列唯一正确（任何非恒等排列都会把另一个用户打到 ≈50% 误码）。因此 ue0 属于该抓包本身的弱用户，接收侧已无可调空间。ue2 与 H5 参考载荷相差 2628 bit，是参考链路自身 CRC 失败所致，以本机 CRC 为准。
 

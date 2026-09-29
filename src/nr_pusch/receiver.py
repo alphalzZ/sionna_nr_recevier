@@ -800,6 +800,20 @@ class RxResult:
     metadata: dict[str, Any]
 
 
+class _CbCrcProbe(torch.nn.Module):
+    """Record the per-code-block CRC verdict the TB decoder otherwise drops."""
+
+    def __init__(self, decoder: torch.nn.Module, sink: list[torch.Tensor]) -> None:
+        super().__init__()
+        self._decoder = decoder
+        self._sink = sink
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        output = self._decoder(inputs)
+        self._sink.append(output[1].detach())
+        return output
+
+
 class NrPuschRx:
     """Decode time-domain captures or simulated samples for four PUSCH users.
 
@@ -818,6 +832,7 @@ class NrPuschRx:
         num_decoder_iterations: int = 20,
         spatial_denoise: bool = False,
         estimate_delay: bool = False,
+        track_cb_crc: bool = False,
         detector: str = "lmmse",
         detector_parameter: int | None = None,
         detector_damping: float = 0.25,
@@ -912,6 +927,11 @@ class NrPuschRx:
             num_bp_iter=num_decoder_iterations,
             device=device,
         )
+        self._cb_crc_status: list[torch.Tensor] = []
+        if track_cb_crc and tb_decoder._cb_crc_decoder is not None:
+            tb_decoder._cb_crc_decoder = _CbCrcProbe(
+                tb_decoder._cb_crc_decoder, self._cb_crc_status
+            )
         if scrambling_sequences is not None:
             self._use_explicit_scrambling(
                 tb_decoder,
@@ -943,6 +963,7 @@ class NrPuschRx:
         self.spatial_denoise = spatial_denoise
         self.estimate_delay = estimate_delay
         self._estimator = estimator
+        self.track_cb_crc = track_cb_crc
 
     @staticmethod
     def _use_explicit_scrambling(
@@ -1071,6 +1092,16 @@ class NrPuschRx:
             constellation=mimo_detector._constellation, device=self.device
         )(symbol_logits)
         constellation = constellation.squeeze(2)
+        cb_crc_status = None
+        if self.track_cb_crc and self._cb_crc_status:
+            latest = self._cb_crc_status[-1]
+            # The CRC decoder returns one flag per code block with a trailing
+            # singleton axis; flatten it so each entry is a plain boolean.
+            cb_crc_status = [
+                latest[0, user].reshape(-1).detach().cpu().tolist()
+                for user in range(len(self.settings.users))
+            ]
+            self._cb_crc_status.clear()
         delay_metadata = {}
         if self.channel_estimator == "dmrs" and getattr(self._estimator, "last_offsets", None) is not None:
             delay_metadata["estimated_bulk_delay_samples"] = (
@@ -1104,6 +1135,7 @@ class NrPuschRx:
                 else "Frequency LMMSE pre-equalization, IDFT despreading, then damped time-domain spatial EP with Gaussian residual-ISI covariance."
             ),
             "decoder": "Sionna NR TBDecoder",
+            "cb_crc_status": cb_crc_status,
             "delay_estimation": self.estimate_delay,
             "spatial_signature_denoise": self.spatial_denoise,
             "channel_estimator": "perfect CDL CSI" if self.channel_estimator == "perfect" else "DFT-s-OFDM frequency DMRS OCC LS tap fit",

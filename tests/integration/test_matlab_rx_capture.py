@@ -48,6 +48,29 @@ class MatlabRxCaptureTest(unittest.TestCase):
             reference.transmitted_bits,
         )
 
+    def test_cb_crc_tracking_reports_per_user_code_block_status(self):
+        settings = TxSettings.from_toml(CONFIG)
+        reference = read_matlab_rx_reference(FIXTURE)
+        received = torch.from_numpy(reference.frequency_grid[None, None, ...])
+        receiver = NrPuschRx(
+            settings,
+            channel_estimator="dmrs",
+            detector="mmse-pic",
+            input_domain="frequency",
+            max_delay_spread_s=6e-6,
+            device="cpu",
+            track_cb_crc=True,
+        )
+        result = receiver.receive_frequency_grid(received, noise_variance=0.001)
+
+        status = result.metadata["cb_crc_status"]
+        num_code_blocks = int(receiver._tb_encoder.num_cbs) if hasattr(receiver, "_tb_encoder") else 4
+        self.assertEqual(len(status), 4)
+        for user in range(4):
+            self.assertEqual(len(status[user]), num_code_blocks)
+            self.assertTrue(all(isinstance(value, bool) for value in status[user]))
+        self.assertTrue(all(all(status[user]) for user in range(4)))
+
 
 if __name__ == "__main__":
     unittest.main()

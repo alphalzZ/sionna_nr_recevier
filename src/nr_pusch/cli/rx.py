@@ -53,6 +53,10 @@ def main() -> None:
         help="Apply dominant-spatial-signature projection to the DMRS channel estimate",
     )
     parser.add_argument(
+        "--cb-crc", action="store_true", default=None,
+        help="Record the per-code-block CRC verdict for every user",
+    )
+    parser.add_argument(
         "--estimate-delay", action="store_true", default=None,
         help="Estimate and report the per-antenna bulk delay of the DMRS estimate",
     )
@@ -151,6 +155,9 @@ def main() -> None:
     spatial_denoise = args.spatial_denoise
     if spatial_denoise is None:
         spatial_denoise = bool(receiver_profile.get("spatial_denoise", False))
+    track_cb_crc = args.cb_crc
+    if track_cb_crc is None:
+        track_cb_crc = bool(receiver_profile.get("cb_crc", False))
     estimate_delay = args.estimate_delay
     if estimate_delay is None:
         estimate_delay = bool(receiver_profile.get("estimate_delay", False))
@@ -174,6 +181,7 @@ def main() -> None:
         scrambling_sequences=scrambling_sequences,
         spatial_denoise=spatial_denoise,
         estimate_delay=estimate_delay,
+        track_cb_crc=track_cb_crc,
     )
     if input_domain == "time":
         result = receiver.receive(received, noise_variance, channel_taps=channel)
@@ -257,6 +265,12 @@ def main() -> None:
                 + " pass CRC here but differ from the reference payload;"
                 " the reference link likely failed on those blocks"
             )
+    if result.metadata.get("cb_crc_status"):
+        for user, status in enumerate(result.metadata["cb_crc_status"]):
+            passed = sum(1 for value in status if value)
+            failed = [str(index) for index, value in enumerate(status) if not value]
+            suffix = f" (failed: {', '.join(failed)})" if failed else ""
+            print(f"CB CRC ue{user}: {passed}/{len(status)} code blocks passed{suffix}")
     print(f"Output: {output_path}")
 
 
