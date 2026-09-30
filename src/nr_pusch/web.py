@@ -36,7 +36,7 @@ _PROFILES = {"tx": "pusch_", "channel": "cdl_", "simulation": "bler_"}
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.toml$")
 _JOB_ID = re.compile(r"^[0-9a-f]{12}$")
 _RX_CONFIG_NAME = re.compile(r"^rx_[A-Za-z0-9][A-Za-z0-9_.-]*\.toml$")
-_DETECTORS = {"lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic"}
+_DETECTORS = {"lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic"}
 _DECODE_ID = re.compile(r"^[0-9a-f]{12}$")
 _MAX_CAPTURE_BYTES = 12 * 1024 * 1024
 _ASSETS = {
@@ -388,25 +388,6 @@ class SimulationWebApp:
                 config_name = default_case["config_name"]
             if not config_text:
                 config_text = (self.config_dir / str(default_case["config_name"])).read_text(encoding="utf-8")
-        input_format = data.get(
-            "input_format", default_case["input_format"] if use_default_capture else None
-        )
-        input_domain = data.get(
-            "input_domain", default_case["input_domain"] if use_default_capture else "time"
-        )
-        detector = data.get("detector", default_case["detector"] if use_default_capture else "lmmse")
-        channel_estimator = data.get(
-            "channel_estimator", default_case["channel_estimator"] if use_default_capture else "dmrs"
-        )
-        device = data.get("device", "cpu")
-        try:
-            noise_variance = float(
-                data.get("noise_variance", default_case["noise_variance"] if use_default_capture else None)
-            )
-        except (TypeError, ValueError) as exc:
-            raise ApiError(400, "noise_variance 必须是非负数") from exc
-        if not math.isfinite(noise_variance) or noise_variance < 0:
-            raise ApiError(400, "noise_variance 必须是有限的非负数")
         if config_name is None:
             config_name = ""
         if not isinstance(config_name, str):
@@ -426,6 +407,49 @@ class SimulationWebApp:
             if config_path is None:
                 raise ApiError(400, "请粘贴完整 RX TOML 配置，或选择已有配置文件")
             config_text = config_path.read_text(encoding="utf-8")
+        profile_receiver: dict[str, Any] = {}
+        try:
+            loaded = tomllib.loads(config_text).get("receiver", {})
+        except tomllib.TOMLDecodeError:
+            loaded = {}
+        if isinstance(loaded, dict):
+            profile_receiver = loaded
+
+        def receiver_default(key: str, fallback: Any) -> Any:
+            """Resolve like the RX CLI: request wins, then the profile's [receiver], then fallback."""
+            value = profile_receiver.get(key, fallback)
+            return fallback if value is None else value
+
+        input_format = data.get(
+            "input_format", default_case["input_format"] if use_default_capture else None
+        )
+        input_domain = data.get(
+            "input_domain",
+            default_case["input_domain"] if use_default_capture
+            else receiver_default("input_domain", "time"),
+        )
+        configured_detector = (
+            default_case["detector"] if use_default_capture
+            else receiver_default("detector", "lmmse")
+        )
+        detector = data.get("detector", configured_detector)
+        detector_overridden = detector != configured_detector
+        channel_estimator = data.get(
+            "channel_estimator",
+            default_case["channel_estimator"] if use_default_capture
+            else receiver_default("channel_estimator", "dmrs"),
+        )
+        device = data.get("device", "cpu")
+        try:
+            noise_variance = float(data.get(
+                "noise_variance",
+                default_case["noise_variance"] if use_default_capture
+                else receiver_default("noise_variance", 0.0),
+            ))
+        except (TypeError, ValueError) as exc:
+            raise ApiError(400, "noise_variance 必须是非负数") from exc
+        if not math.isfinite(noise_variance) or noise_variance < 0:
+            raise ApiError(400, "noise_variance 必须是有限的非负数")
         if not isinstance(input_name, str) or Path(input_name).name != input_name:
             raise ApiError(400, "上传文件名无效")
         suffix = Path(input_name).suffix.lower()
@@ -447,26 +471,32 @@ class SimulationWebApp:
             device = "cuda:0"
         parameter = data.get(
             "detector_parameter",
-            default_case["detector_parameter"] if use_default_capture else None,
+            None
+            if detector_overridden and detector == "soft-mmse-pic"
+            else default_case["detector_parameter"] if use_default_capture
+            else receiver_default("detector_parameter", None),
         )
         if parameter is not None:
             if isinstance(parameter, bool) or not isinstance(parameter, int) or not 1 <= parameter <= 256:
                 raise ApiError(400, "detector_parameter 必须是 1 到 256 的整数")
         try:
-            damping = float(
-                data.get("detector_damping", default_case["detector_damping"] if use_default_capture else 0.25)
-            )
+            damping = float(data.get(
+                "detector_damping",
+                0.25
+                if detector_overridden and detector == "soft-mmse-pic"
+                else default_case["detector_damping"] if use_default_capture
+                else receiver_default("detector_damping", 0.25),
+            ))
         except (TypeError, ValueError) as exc:
             raise ApiError(400, "detector_damping 必须位于 (0, 1]") from exc
         if not math.isfinite(damping) or not 0 < damping <= 1:
             raise ApiError(400, "detector_damping 必须位于 (0, 1]")
         try:
-            max_delay_spread_s = float(
-                data.get(
-                    "max_delay_spread_s",
-                    default_case["max_delay_spread_s"] if use_default_capture else 3e-6,
-                )
-            )
+            max_delay_spread_s = float(data.get(
+                "max_delay_spread_s",
+                default_case["max_delay_spread_s"] if use_default_capture
+                else receiver_default("max_delay_spread_s", 3e-6),
+            ))
         except (TypeError, ValueError) as exc:
             raise ApiError(400, "max_delay_spread_s 必须是正数") from exc
         if not math.isfinite(max_delay_spread_s) or max_delay_spread_s <= 0:
@@ -482,6 +512,24 @@ class SimulationWebApp:
                 raise ApiError(400, "上传文件编码无效") from exc
         if not payload or len(payload) > _MAX_CAPTURE_BYTES:
             raise ApiError(413, "上传文件为空或超过 12 MiB")
+        scrambling_name = data.get("scrambling_name")
+        scrambling_encoded = data.get("scrambling_base64")
+        if scrambling_encoded is not None and not isinstance(scrambling_encoded, str):
+            raise ApiError(400, "加扰序列文件编码无效")
+        scrambling_payload: bytes | None = None
+        if scrambling_encoded:
+            try:
+                scrambling_payload = base64.b64decode(scrambling_encoded, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ApiError(400, "加扰序列文件编码无效") from exc
+            if not scrambling_payload or len(scrambling_payload) > _MAX_CAPTURE_BYTES:
+                raise ApiError(413, "加扰序列文件为空或超过 12 MiB")
+            if not isinstance(scrambling_name, str) or Path(scrambling_name).name != scrambling_name:
+                raise ApiError(400, "加扰序列文件名无效")
+            if Path(scrambling_name).suffix.lower() not in {".h5", ".hdf5"}:
+                raise ApiError(400, "加扰序列仅支持 H5/HDF5 文件")
+        else:
+            scrambling_name = None
 
         decode_id = uuid4().hex[:12]
         directory = self._decode_dir(decode_id)
@@ -496,6 +544,10 @@ class SimulationWebApp:
             except (OSError, ValueError, KeyError, TypeError, tomllib.TOMLDecodeError) as exc:
                 raise ApiError(400, f"接收配置无效: {exc}") from exc
             capture.write_bytes(payload)
+            scrambling_copy: Path | None = None
+            if scrambling_payload is not None:
+                scrambling_copy = directory / f"scrambling{Path(str(scrambling_name)).suffix.lower()}"
+                scrambling_copy.write_bytes(scrambling_payload)
             command = [
                 self.python, "-u", "-m", "nr_pusch.cli.rx",
                 "--rx-config", str(config_copy), "--input", str(capture),
@@ -506,9 +558,12 @@ class SimulationWebApp:
                 "--detector", detector, "--detector-damping", str(damping),
                 "--max-delay-spread-s", str(max_delay_spread_s),
                 "--output", str(output), "--device", device,
+                "--cb-crc",
             ]
             if parameter is not None:
                 command.extend(("--detector-parameter", str(parameter)))
+            if scrambling_copy is not None:
+                command.extend(("--scrambling", str(scrambling_copy)))
             completed = subprocess.run(
                 command,
                 capture_output=True,
@@ -551,6 +606,20 @@ class SimulationWebApp:
                 else f"Frame {index // len(user_names) + 1} · {user_names[index % len(user_names)]}"
                 for index in range(len(crc_flat))
             ]
+            receiver_metadata = manifest.get("receiver", {})
+            cb_crc_users: list[dict[str, Any]] = []
+            cb_crc_rows = receiver_metadata.get("cb_crc_status")
+            if isinstance(cb_crc_rows, list):
+                for user_index, row in enumerate(cb_crc_rows):
+                    if not isinstance(row, list):
+                        continue
+                    status = [bool(value) for value in row]
+                    cb_crc_users.append({
+                        "name": user_names[user_index % len(user_names)],
+                        "status": status,
+                        "passed": sum(status),
+                        "total": len(status),
+                    })
             return {
                 "decode_id": decode_id,
                 "input": {
@@ -558,6 +627,7 @@ class SimulationWebApp:
                     "format": detected_format,
                     "source": "repository-default" if use_default_capture else "upload",
                     "bytes": len(payload),
+                    "scrambling": scrambling_name,
                     **manifest.get("input_analysis", {}),
                 },
                 "crc_status": crc_flat,
@@ -568,7 +638,8 @@ class SimulationWebApp:
                 "constellation": {"users": constellation_users},
                 "detector": detector,
                 "used_default_capture": use_default_capture,
-                "receiver": manifest.get("receiver", {}),
+                "cb_crc": {"available": bool(cb_crc_users), "users": cb_crc_users},
+                "receiver": receiver_metadata,
                 "reference_comparison": manifest.get("reference_comparison"),
                 "output_npz_url": f"/api/rx/decode/{decode_id}/decoded.npz",
                 "output_json_url": f"/api/rx/decode/{decode_id}/decoded.json",

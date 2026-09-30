@@ -398,6 +398,7 @@ async function initRxConfigs() {
   $("rx-detector").value = state.rxDefaults.detector || "lmmse";
   $("rx-detector-parameter").value = state.rxDefaults.detector_parameter ?? "";
   $("rx-detector-damping").value = String(state.rxDefaults.detector_damping ?? 0.25);
+  $("rx-max-delay-spread").value = state.rxDefaults.max_delay_spread_s ?? "";
   $("rx-detector").dispatchEvent(new Event("change"));
   $("rx-default-meta").textContent = state.rxDefaults.available
     ? `${state.rxDefaults.input_name || "本地默认夹具"} · ${state.rxDefaults.config_name || "默认配置"}`
@@ -405,10 +406,50 @@ async function initRxConfigs() {
   setRxInputMode(defaultToggle.checked);
 }
 
+function parseReceiverProfile(text) {
+  const profile = {};
+  let inReceiver = false;
+  String(text || "").split(/\r?\n/).forEach((raw) => {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) return;
+    if (line.startsWith("[")) { inReceiver = line === "[receiver]"; return; }
+    if (!inReceiver) return;
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/);
+    if (!match) return;
+    let value = match[2].split("#")[0].trim().replace(/,$/, "");
+    if (/^".*"$/.test(value) || /^'.*'$/.test(value)) value = value.slice(1, -1);
+    else if (value === "true" || value === "false") value = value === "true";
+    else if (/^-?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(value)) value = Number(value);
+    profile[match[1]] = value;
+  });
+  return profile;
+}
+
+// Mirror the RX CLI: the selected profile's [receiver] table seeds the form,
+// so the knobs shown are the ones that actually produce the decode.
+function applyReceiverProfile(text) {
+  const profile = parseReceiverProfile(text);
+  const set = (id, value) => {
+    if (value !== undefined && value !== null) $(id).value = String(value);
+  };
+  set("rx-detector", profile.detector);
+  if (profile.detector === "soft-mmse-pic") {
+    set("rx-detector-parameter", profile.detector_parameter ?? 1);
+    set("rx-detector-damping", profile.detector_damping ?? 0.25);
+  } else {
+    set("rx-detector-parameter", profile.detector_parameter);
+    set("rx-detector-damping", profile.detector_damping);
+  }
+  set("rx-noise-variance", profile.noise_variance);
+  set("rx-max-delay-spread", profile.max_delay_spread_s);
+  $("rx-detector").dispatchEvent(new Event("change"));
+}
+
 async function loadRxConfig(name) {
   if (!name) return;
   const config = await api(`/api/configs/rx/${encodeURIComponent(name)}`);
   $("rx-config-editor").value = config.text || "";
+  applyReceiverProfile(config.text);
 }
 
 function formatFileSize(bytes) {
@@ -440,6 +481,16 @@ function setRxInputMode(useDefault) {
   picker.classList.toggle("is-default", defaultMode);
   if (defaultMode) {
     fileInput.value = "";
+    $("rx-scrambling").value = "";
+    $("rx-scrambling").disabled = true;
+    $("rx-scrambling-name").textContent = "加扰序列 H5（可选）";
+    $("rx-scrambling-meta").textContent = "抓包使用非 RNTI 扰码时上传，否则按 RNTI 推导";
+    // The built-in capture only decodes against its own profile, so switch to it
+    // instead of silently applying a mismatched MCS to the fixture.
+    if (defaults.config_name && $("rx-config-select").value !== defaults.config_name) {
+      $("rx-config-select").value = defaults.config_name;
+      loadRxConfig(defaults.config_name).catch((error) => showAlert(error.message));
+    }
     $("rx-file-name").textContent = defaults.input_name || "内置默认采集";
     $("rx-file-meta").textContent = `MATLAB HDF5 · ${defaults.input_domain === "frequency" ? "频域" : "时域"} · 本地内置夹具`;
     domain.value = defaults.input_domain || "frequency";
@@ -448,6 +499,7 @@ function setRxInputMode(useDefault) {
     $("rx-submit-hint").textContent = `将使用内置采集 ${defaults.input_name || "默认夹具"} 开始解码`;
     return;
   }
+  $("rx-scrambling").disabled = state.rxBusy;
   const file = fileInput.files[0];
   if (!file) {
     $("rx-file-name").textContent = "选择 .h5、.hdf5 或 .npz 文件";
@@ -477,6 +529,7 @@ function setRxBusy(busy) {
   const button = $("rx-decode-button");
   button.disabled = busy;
   $("rx-file").disabled = busy || isUsingDefaultRxCapture();
+  $("rx-scrambling").disabled = busy || isUsingDefaultRxCapture();
   $("rx-use-default").disabled = busy || !state.rxDefaults.available;
   $("rx-config-select").disabled = busy;
   $("rx-decode-label").textContent = busy ? "正在分析…" : "开始接收分析";
@@ -503,7 +556,32 @@ function displayMetadata(input) {
   });
 }
 
+function cbCrcCell(entry) {
+  const cell = document.createElement("td");
+  if (!entry || !Array.isArray(entry.status) || !entry.status.length) {
+    cell.className = "muted";
+    cell.textContent = "—";
+    return cell;
+  }
+  const total = entry.status.length;
+  const passed = entry.status.filter(Boolean).length;
+  const summary = document.createElement("span");
+  summary.className = `cb-crc-summary ${passed === total ? "pass" : passed ? "partial" : "fail"}`;
+  summary.textContent = `${passed}/${total}`;
+  const grid = document.createElement("div");
+  grid.className = "cb-crc-cells";
+  entry.status.forEach((ok, blockIndex) => {
+    const block = document.createElement("span");
+    block.className = `cb-crc-cell ${ok ? "pass" : "fail"}`;
+    block.textContent = String(blockIndex);
+    block.title = `码块 ${blockIndex}：${ok ? "通过" : "失败"}`;
+    grid.append(block);
+  });
+  cell.append(summary, grid);
+  return cell;
+}
 function renderRxResult(result) {
+
   if (!result || typeof result !== "object" || typeof result.decode_id !== "string") {
     throw new Error("接收分析接口没有返回译码记录编号。请确认网页和后端来自同一版本后重试。");
   }
@@ -519,6 +597,7 @@ function renderRxResult(result) {
   $("rx-bits-shape").textContent = Array.isArray(result.bits_shape) ? result.bits_shape.join(" × ") : "—";
   displayMetadata(result.input);
 
+  const cbUsers = Array.isArray(result.cb_crc?.users) ? result.cb_crc.users : [];
   const body = $("rx-crc-body");
   body.replaceChildren();
   statuses.forEach((status, index) => {
@@ -526,18 +605,22 @@ function renderRxResult(result) {
     const label = document.createElement("td");
     const value = document.createElement("td");
     const badge = document.createElement("span");
-    label.textContent = Array.isArray(result.crc_labels) && result.crc_labels[index]
+    const labelText = Array.isArray(result.crc_labels) && result.crc_labels[index]
       ? result.crc_labels[index] : `UE${index}`;
+    label.textContent = labelText;
     badge.className = `crc-badge ${status ? "pass" : "fail"}`;
     badge.textContent = status ? "通过" : "失败";
     value.append(badge);
-    row.append(label, value);
+    const entry = cbUsers.length === statuses.length
+      ? cbUsers[index]
+      : cbUsers.find((user) => user?.name === labelText) || null;
+    row.append(label, value, cbCrcCell(entry));
     body.append(row);
   });
   if (!statuses.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
-    cell.colSpan = 2;
+    cell.colSpan = 3;
     cell.className = "muted";
     cell.textContent = "响应中没有逐块 CRC 数据。";
     row.append(cell);
@@ -551,30 +634,24 @@ function renderRxResult(result) {
   }
   const users = Array.isArray(result.constellation?.users) ? result.constellation.users : [];
   const count = users.reduce((total, user) => total + Math.min(user.real?.length || 0, user.imag?.length || 0), 0);
-  $("rx-constellation-count").textContent = `${count} 个复数符号 · 按 UE 着色`;
+  $("rx-constellation-count").textContent = `${count} 个复数符号 · 每 UE 独立坐标`;
   requestAnimationFrame(() => drawConstellation(result.constellation));
 }
 
 function drawConstellation(constellation) {
-  const canvas = $("rx-constellation");
-  const rect = canvas.getBoundingClientRect();
-  if (!rect.width || !rect.height) return;
-  const ratio = window.devicePixelRatio || 1;
-  canvas.width = Math.round(rect.width * ratio);
-  canvas.height = Math.round(rect.height * ratio);
-  const ctx = canvas.getContext("2d");
-  ctx.scale(ratio, ratio);
+  const grid = $("rx-constellation-grid");
+  if (!grid) return;
   const users = Array.isArray(constellation?.users) ? constellation.users : [];
   const series = users.length ? users : [{
     name: "接收流",
     real: Array.isArray(constellation?.real) ? constellation.real : [],
     imag: Array.isArray(constellation?.imag) ? constellation.imag : [],
   }];
-  let maxAbs = 0;
-  const plotted = series.map((user) => {
+  const prepared = series.map((user) => {
     const count = Math.min(user.real?.length || 0, user.imag?.length || 0);
     const step = Math.max(1, Math.ceil(count / 6000));
     const points = [];
+    let maxAbs = 0;
     for (let i = 0; i < count; i += step) {
       const x = Number(user.real[i]), y = Number(user.imag[i]);
       if (Number.isFinite(x) && Number.isFinite(y)) {
@@ -582,23 +659,55 @@ function drawConstellation(constellation) {
         maxAbs = Math.max(maxAbs, Math.abs(x), Math.abs(y));
       }
     }
-    return { name: user.name || "接收流", points };
+    return { name: user.name || "接收流", points, maxAbs };
   }).filter((user) => user.points.length);
+  grid.replaceChildren();
+  if (!prepared.length) {
+    const empty = document.createElement("p");
+    empty.className = "muted constellation-empty";
+    empty.textContent = "没有可绘制的星座点";
+    grid.append(empty);
+    return;
+  }
+  prepared.forEach((user, index) => {
+    const color = detectorColors[index % detectorColors.length];
+    const cell = document.createElement("figure");
+    cell.className = "constellation-cell";
+    const caption = document.createElement("figcaption");
+    const swatch = document.createElement("i");
+    swatch.style.setProperty("--legend-color", color);
+    const name = document.createElement("b");
+    name.textContent = user.name;
+    const count = document.createElement("small");
+    count.textContent = `${user.points.length} 点`;
+    caption.append(swatch, name, count);
+    const canvas = document.createElement("canvas");
+    canvas.className = "constellation-canvas";
+    canvas.setAttribute("role", "img");
+    canvas.setAttribute("aria-label", `${user.name} 星座散点图`);
+    cell.append(caption, canvas);
+    grid.append(cell);
+    paintConstellation(canvas, user, color);
+  });
+}
+
+function paintConstellation(canvas, user, color) {
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.round(rect.width * ratio);
+  canvas.height = Math.round(rect.height * ratio);
+  const ctx = canvas.getContext("2d");
+  ctx.scale(ratio, ratio);
   const width = rect.width, height = rect.height;
-  const pad = 32;
+  const pad = 26;
+  // Each UE gets its own scale, otherwise a strong user flattens the others.
+  const maxAbs = Math.max(1e-9, user.maxAbs) * 1.08;
+  const px = (value) => pad + ((value + maxAbs) / (2 * maxAbs)) * (width - pad * 2);
+  const py = (value) => height - pad - ((value + maxAbs) / (2 * maxAbs)) * (height - pad * 2);
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#fbfcfa";
   ctx.fillRect(0, 0, width, height);
-  if (!plotted.length) {
-    ctx.fillStyle = "#74807b";
-    ctx.font = "12px sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText("没有可绘制的星座点", width / 2, height / 2);
-    return;
-  }
-  maxAbs = Math.max(1e-9, maxAbs) * 1.08;
-  const px = (value) => pad + ((value + maxAbs) / (2 * maxAbs)) * (width - pad * 2);
-  const py = (value) => height - pad - ((value + maxAbs) / (2 * maxAbs)) * (height - pad * 2);
   ctx.strokeStyle = "#e1e7e3";
   ctx.lineWidth = 1;
   for (let i = -2; i <= 2; i++) {
@@ -609,26 +718,12 @@ function drawConstellation(constellation) {
   ctx.strokeStyle = "#9ba7a1";
   ctx.beginPath(); ctx.moveTo(px(0), pad); ctx.lineTo(px(0), height - pad); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(pad, py(0)); ctx.lineTo(width - pad, py(0)); ctx.stroke();
-  const legend = document.createElement("span");
-  legend.className = "rx-constellation-legend";
-  plotted.forEach((user, index) => {
-    const color = detectorColors[index % detectorColors.length];
-    ctx.fillStyle = `${color}88`;
-    user.points.forEach(([x, y]) => { ctx.beginPath(); ctx.arc(px(x), py(y), 1.7, 0, Math.PI * 2); ctx.fill(); });
-    const item = document.createElement("i");
-    item.style.setProperty("--legend-color", color);
-    item.textContent = user.name;
-    legend.append(item);
-  });
-  const chartTitle = canvas.closest(".chart-card")?.querySelector(".chart-title");
-  if (chartTitle) {
-    chartTitle.querySelector(".rx-constellation-legend")?.remove();
-    chartTitle.append(legend);
-  }
+  ctx.fillStyle = `${color}88`;
+  user.points.forEach(([x, y]) => { ctx.beginPath(); ctx.arc(px(x), py(y), 1.5, 0, Math.PI * 2); ctx.fill(); });
   ctx.fillStyle = "#66736e";
   ctx.font = "10px ui-monospace, monospace";
-  ctx.fillText("I", width - pad + 8, py(0) - 6);
-  ctx.fillText("Q", px(0) + 7, pad - 8);
+  ctx.fillText("I", width - pad + 6, py(0) - 5);
+  ctx.fillText("Q", px(0) + 5, pad - 7);
 }
 
 async function decodeRx(event) {
@@ -657,7 +752,9 @@ async function decodeRx(event) {
       detector: $("rx-detector").value,
       device: $("rx-device").value,
     };
-    if (useDefaultCapture && Number.isFinite(Number(state.rxDefaults.max_delay_spread_s))) {
+    const delaySpread = $("rx-max-delay-spread").value.trim();
+    if (delaySpread) payload.max_delay_spread_s = Number(delaySpread);
+    else if (useDefaultCapture && Number.isFinite(Number(state.rxDefaults.max_delay_spread_s))) {
       payload.max_delay_spread_s = Number(state.rxDefaults.max_delay_spread_s);
     }
     if (!useDefaultCapture) payload.input_base64 = await fileToBase64(file);
@@ -665,6 +762,11 @@ async function decodeRx(event) {
     const damping = $("rx-detector-damping").value.trim();
     if (parameter) payload.detector_parameter = Number(parameter);
     if (damping) payload.detector_damping = Number(damping);
+    const scrambling = $("rx-scrambling").files[0];
+    if (scrambling) {
+      payload.scrambling_name = scrambling.name;
+      payload.scrambling_base64 = await fileToBase64(scrambling);
+    }
     const result = await api("/api/rx/decode", { method: "POST", body: JSON.stringify(payload) });
     renderRxResult(result);
   } catch (error) {
@@ -760,6 +862,9 @@ $("bler-workflow-tab").addEventListener("click", () => switchWorkflow("bler"));
 $("rx-workflow-tab").addEventListener("click", () => switchWorkflow("rx"));
 $("rx-form").addEventListener("submit", decodeRx);
 $("rx-config-select").addEventListener("change", (event) => loadRxConfig(event.target.value).catch((error) => showAlert(error.message)));
+$("rx-config-editor").addEventListener("input", (event) => {
+  applyReceiverProfile(event.target.value);
+});
 $("rx-clear-config").addEventListener("click", () => { $("rx-config-editor").value = ""; $("rx-config-editor").focus(); });
 $("rx-use-default").addEventListener("change", (event) => setRxInputMode(event.target.checked));
 $("rx-file").addEventListener("change", (event) => {
@@ -784,14 +889,30 @@ $("rx-file").addEventListener("change", (event) => {
   }
   $("rx-submit-hint").textContent = "已选择输入文件，可以开始解码";
 });
+$("rx-scrambling").addEventListener("change", (event) => {
+  const file = event.target.files[0];
+  $("rx-scrambling-name").textContent = file ? file.name : "加扰序列 H5（可选）";
+  $("rx-scrambling-meta").textContent = file
+    ? `${formatFileSize(file.size)} · 将覆盖按 RNTI 推导的扰码`
+    : "抓包使用非 RNTI 扰码时上传，否则按 RNTI 推导";
+});
 $("rx-detector").addEventListener("change", (event) => {
   const method = event.target.value;
-  const labels = { "k-best": "K 候选数（可选）", ep: "迭代次数（可选）", "mmse-pic": "迭代次数（可选）" };
+  const labels = {
+    "k-best": "K 候选数（可选）",
+    ep: "迭代次数（可选）",
+    "mmse-pic": "迭代次数（可选）",
+    "soft-mmse-pic": "LDPC 外反馈次数（可选）",
+  };
   const parameter = $("rx-detector-parameter");
   parameter.disabled = !Object.hasOwn(labels, method);
   $("rx-parameter-label").textContent = labels[method] || "该检测器使用默认参数";
-  const supportsDamping = method === "ep" || method === "mmse-pic";
+  const supportsDamping = method === "ep" || method === "mmse-pic" || method === "soft-mmse-pic";
   $("rx-detector-damping").disabled = !supportsDamping;
+  if (event.isTrusted && method === "soft-mmse-pic") {
+    parameter.value = "1";
+    $("rx-detector-damping").value = "0.25";
+  }
 });
 $("rx-detector").dispatchEvent(new Event("change"));
 $("profile-select").addEventListener("change", async (event) => {

@@ -33,7 +33,9 @@ def main() -> None:
     parser.add_argument("--channel-estimator", choices=("dmrs", "perfect"), default=None)
     parser.add_argument("--input-domain", choices=("time", "frequency"), default=None)
     parser.add_argument(
-        "--detector", choices=("lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic"), default=None
+        "--detector",
+        choices=("lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic"),
+        default=None,
     )
     parser.add_argument("--detector-parameter", type=int, default=None)
     parser.add_argument("--detector-damping", type=float, default=None)
@@ -80,15 +82,21 @@ def main() -> None:
     if noise_variance is None:
         noise_variance = float(receiver_profile.get("noise_variance", 0.0))
     channel_estimator = args.channel_estimator or receiver_profile.get("channel_estimator", "dmrs")
-    detector = args.detector or receiver_profile.get("detector", "lmmse")
+    profile_detector = receiver_profile.get("detector", "lmmse")
+    detector = args.detector or profile_detector
+    detector_overridden = args.detector is not None and args.detector != profile_detector
     detector_parameter = (
         args.detector_parameter
         if args.detector_parameter is not None
+        else None
+        if detector_overridden and detector == "soft-mmse-pic"
         else receiver_profile.get("detector_parameter")
     )
     detector_damping = (
         args.detector_damping
         if args.detector_damping is not None
+        else 0.25
+        if detector_overridden and detector == "soft-mmse-pic"
         else float(receiver_profile.get("detector_damping", 0.25))
     )
     max_delay_spread_s = (

@@ -36,7 +36,7 @@ nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /tmp/pusch_rx_grid.npz --
 
 DMRS 的 LS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围：当前为 18 MHz 采样率下的 `-6..60`，共 67 taps。这是接收机的时延范围先验，不读取本帧的真实信道系数。单个 DMRS 符号的估计扩展到整个 slot，适用于当前零速静态 CDL profile；高 Doppler 或多 DMRS 配置需扩展时频插值并用抓包参考验证。
 
-检测器可选 `lmmse`、`lmmse-sic`、`k-best`、`mmse-pic` 和 `ep`，参数通过 `detector`、`detector_parameter` 或 BLER 配置中的 `detector_parameters` 配置，接收 CLI 也提供 `--detector` 和 `--detector-parameter`。`k-best` 和 `ep` 均先做频域 LMMSE 预均衡并 IDFT；每个时域采样点建立四流空间模型，频率变化与等化噪声合并为残余 ISI 协方差。K-best 在该模型上搜索有限星座路径。EP 则为四个 QAM 用户维护复高斯近似因子，以 cavity 分布对离散星座做矩匹配，并对因子参数阻尼迭代，最后由后验均值和方差形成软 LLR。`mmse-pic` 从时域 LLR 计算软星座期望，DFT 回频域后并行消除其他 UE，并更新 LLR。迭代次数通过 `detector_parameters` 设置；软迭代阻尼可用 `detector_damping` / `--detector-damping` 配置。`lmmse-sic` 按估计信道功率从强到弱处理 UE：仅在该 UE CRC 通过时重编码、重构其 DFT-s-OFDM 资源网格并消除干扰。单次接收 JSON sidecar 会记录 SIC 检测顺序和每个 UE 消除前的 CRC 状态。BLER 配置中的 `detectors` 会按相同 seed、CDL、SNR 和 payload 顺序比较检测器；例如 `{ "k-best" = 16, "mmse-pic" = 4, "ep" = 10 }`。
+检测器可选 `lmmse`、`lmmse-sic`、`k-best`、`mmse-pic`、`soft-mmse-pic` 和 `ep`。`detector_parameter` 对 `mmse-pic` 表示 QAM-PIC 轮数，对 `soft-mmse-pic` 表示 LDPC 外反馈轮数；BLER 支持用 `detector_parameters` 分别配置，CLI 也提供 `--detector`、`--detector-parameter` 和 `--detector-damping`。`k-best` 和 `ep` 均先做频域 LMMSE 预均衡并 IDFT；每个时域采样点建立四流空间模型，频率变化与等化噪声合并为残余 ISI 协方差。K-best 在该模型上搜索有限星座路径。EP 则为四个 QAM 用户维护复高斯近似因子，以 cavity 分布对离散星座做矩匹配，并对因子参数阻尼迭代，最后由后验均值和方差形成软 LLR。`mmse-pic` 从时域 LLR 计算软星座期望，DFT 回频域后并行消除其他 UE，并更新 LLR；它不调用 LDPC 译码器做检测反馈。`soft-mmse-pic` 在相同初始 LMMSE 检测后运行 LDPC BP，以码块位序的 posterior-minus-channel 外信息反馈；取消时将当前检测器 LLR 与已阻尼的 LDPC 外信息组合为其他 UE 的软符号概率，对目标 UE 使用天线噪声加权单流 LMMSE，并由最终检测器 LLR 经原 TBDecoder 给出 TB/CB CRC。其默认外反馈轮数为 1、阻尼为 0.25，独立于旧 `mmse-pic` 的 4 轮默认值；默认 BLER 与抓包 profile 不切换。`lmmse-sic` 按估计信道功率从强到弱处理 UE：仅在该 UE CRC 通过时重编码、重构其 DFT-s-OFDM 资源网格并消除干扰。单次接收 JSON sidecar 会记录 SIC 检测顺序和每个 UE 消除前的 CRC 状态。BLER 配置中的 `detectors` 会按相同 seed、CDL、SNR 和 payload 顺序比较检测器；例如 `{ "k-best" = 16, "mmse-pic" = 4, "soft-mmse-pic" = 1, "ep" = 10 }`。
 
 EP 与 K-best 共用零时延等效空间信道近似；滤波后剩余的频率选择性记入高斯协方差，而非在 EP 图中显式建模所有跨采样相关性。该近似、软 LLR 校准及收敛行为仍需通过 MATLAB 参考向量和长 SNR 曲线验证。
 
@@ -120,6 +120,22 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 复现性说明：`simulate_bler` 每次以 `sionna.phy.config.seed` 重置 Sionna 的全局生成器，CDL 实现按调用顺序从该流取随机数。因此只有整个扫描配置完全一致（相同 batch 分组和相同停止条件）时结果才逐点相同；只改 `max_frames_per_snr` 或 `target_block_errors` 会改变前序 SNR 点的信道抽样次数，从而让后续点换用不同的信道实现。例：早前 `max_frames_per_snr = 100` 的短时运行在 35 dB 首个 26 帧内有 59 个误块，而本次 1,000 帧共 56 个误块，说明两组并非逐帧配对，跨运行比较只能按趋势看待。
 
+### 抓包调优参数不能直接迁移到仿真（配对 A/B）
+
+`[bler]` 现在支持 `l_min` 与 `max_delay_spread_s`，即接收端 DMRS 有限抽头拟合窗口，与 RX profile 的同名旋钮对应；`max_delay_spread_s` 省略时沿用 CDL 信道配置的值。加这两个键的目的是让扫描能够**逐项复现**某个抓包 profile 的接收设置，而不是默认就套用它。
+
+实测结果说明不能默认套用。在 `pusch_4ue.toml`（MCS 20）+ `cdl_38_901_4x4.toml` 上做配对 A/B：固定 `seed = 20260924`、SNR `[25,30,35,40]`、batch 20、每点 1,000 帧（4,000 TB），关闭 `target_block_errors` 早停与 `stop_at_zero_bler`，使各变体消耗完全相同的载荷/信道/噪声随机流；同一配置重复跑两次的 `bit_errors` 逐 bit 相同，证明配对成立。
+
+| 变体 | MMSE-PIC 迭代/阻尼 | 接收窗 | 25 dB | 30 dB | 35 dB | 40 dB |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| A 原仿真基线 | 4 / 0.25 | 跟随信道（3 µs） | 0.5725 | 0.0877 | 0.0035 | 0.0003 |
+| A' 重复跑（校验） | 4 / 0.25 | 跟随信道（3 µs） | 0.5725 | 0.0877 | 0.0035 | 0.0003 |
+| B 对齐 `rx_pusch_4ue.toml` | 8 / 0.5 | 6 µs | 0.6690 | 0.2567 | 0.0963 | 0.0127 |
+| C 仅迭代+阻尼 | 8 / 0.5 | 跟随信道（3 µs） | 0.5560 | 0.2500 | 0.0700 | 0.0043 |
+| D 仅窗口 | 4 / 0.25 | 6 µs | 0.6787 | 0.1455 | 0.0050 | 0.0010 |
+
+**结论是退化而不是提升**：B 相对 A 的 BLER 在 30 dB 差 2.9 倍、35 dB 差 27.5 倍、40 dB 差 51 倍，BER 在 35 dB 由 2.68e-05 升到 2.31e-03。分解后主因是 8 次迭代加阻尼 0.5（C 单独即使 35 dB 差 20 倍），6 µs 接收窗次之（D 单独 35 dB 只差 1.43 倍）。抓包 profile 的取值是对单帧抓包的补偿，并非对算法普适，因此 `configs/bler_4ue_cdl.toml` 与 `configs/bler_4ue_cdl_gpu.toml` **保持各自的仿真基线数值**（4 次迭代、阻尼 0.25、窗口跟随信道），只保留新旋钮。详见 `docs/receiver_optimization.md` §3.2。
+
 接收端可独立加载时域 IQ 或频域资源网格 NPZ：`iq` 使用 `[batch,rx_antenna,sample]` 轴，`grid` 使用接收机频域网格轴；`perfect` 模式另需真实 `channel_taps` 或 `channel_frequency_response`，`dmrs` 模式从输入中的 PUSCH DMRS 估计 CSI。输入扩展名为 `.h5`/`.hdf5` 时会自动作为 MATLAB H5 接收夹具读取，也可用 `--input-format matlab-h5` 指定。当前 MATLAB 接口读取 `FreqData/IQdataPdu_real` 与 `FreqData/IQdataPdu_imag`，原始轴为 `[ofdm_symbol,rx_antenna,active_subcarrier]`，并会附加 batch 和 stream 轴供接收机处理。若 H5 中有 `data_*` 和 `pilot_*`，JSON sidecar 还会记录分离数组形状、天线平均功率和峰值幅度，便于抓包分析。
 
 抓包分析中 `bit_errors` 只是与参考链路载荷的比对值，不能单独作为译码正确的判据：参考链路自身可能CRC 失败。sidecar 的 `reference_comparison` 因此同时记录 `crc_status`、`crc_verified_users` 和说明，CLI 也会在出现“CRC 通过但与参考不一致”的用户时显式提示。BLER 仿真不涉及该问题，因为发送与接收使用同一套比特。
@@ -179,7 +195,16 @@ nr-pusch-rx --rx-config configs/rx_pusch_4ue.toml --input tests/fixtures/matlab_
 
 ### 网页外部接收分析
 
-启动本地网页后，“接收分析”默认选用仓库内的 `configs/rx_pusch_4ue.toml` 和 `tests/fixtures/matlab_h5/RxTestVector.h5`，并从 RX TOML 的 `[receiver]` 读取噪声方差和检测器默认值。也可上传 `.h5`/`.hdf5` 或 `.npz` 文件，选择其他 RX TOML 配置，或粘贴完整 TOML 覆盖，再设置输入域、LMMSE/LMMSE-SIC/K-best/EP/MMSE-PIC 检测器及其参数。页面显示输入网格摘要、按 UE 着色的软 QAM 星座点和逐 UE CRC；下载的 JSON 清单记录 H5 参考比特比较结果。页面也提供 bits/CRC NPZ 下载。H5 当前按 MATLAB `FreqData/IQdataPdu` 频域格式读取；NPZ 时域数组为 `iq`，频域数组为 `grid`。单文件上传上限为 12 MiB，数据由本地 Web 服务处理。
+启动本地网页后，“接收分析”默认选用仓库内的 `configs/rx_pusch_4ue.toml` 和 `tests/fixtures/matlab_h5/RxTestVector.h5`。也可上传 `.h5`/`.hdf5` 或 `.npz` 文件，选择其他 RX TOML 配置，或粘贴完整 TOML 覆盖，再设置输入域、检测器及其参数。**选中 RX TOML 时，网页会解析其 `[receiver]` 表并回填表单**（`detector`、`detector_parameter`、`detector_damping`、`noise_variance`、`max_delay_spread_s`），与 `nr-pusch-rx` 的取值优先级一致：请求 > profile `[receiver]` > 内置兜底。因此在网页上选择 `rx_pusch_4ue_mcs27.toml` 就能复现该抓包的 3/4，而不需要手动填写每个旋钮。勾选“使用内置默认采集”会同时切换到与内置夹具匹配的 profile。
+
+结果区按 UE 分开展示：
+
+- **逐 UE 星座图**：每个 UE 一张独立画布、独立坐标幅度（否则强用户会把弱用户压平），显示检测器软输出的 QAM 点。
+- **逐 UE CRC 状态**：TB CRC 徽标加上一行码块格子，每格是一个码块，鼠标悬停显示码块序号与判定；徽标给出 `通过数/总数`。
+
+抓包若使用非 RNTI 扰码（MATLAB 参考向量即如此），需同时上传对应的加扰序列 H5（如 `scrambSeqCase123427.h5`），网页会把它传给 `nr-pusch-rx --scrambling`。**这一步会直接影响码块 CRC**：扰码按位保持整段 TB 的码字，因此 TB CRC 不变，但码块会被跨块打散，CB CRC 会失真——例如 `RxTestVectorCase123427.h5` 不传扰码时 ue2 从 6/6 掉到 1/6。
+
+下载的 JSON 清单记录 H5 参考比特比较结果。页面也提供 bits/CRC NPZ 下载。H5 当前按 MATLAB `FreqData/IQdataPdu` 频域格式读取；NPZ 时域数组为 `iq`，频域数组为 `grid`。单文件上传上限为 12 MiB，数据由本地 Web 服务处理。
 
 ```bash
 nr-pusch-web --host 127.0.0.1 --port 8765 --config-dir configs --runs-dir runs/web

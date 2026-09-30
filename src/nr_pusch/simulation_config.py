@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 from pathlib import Path
 import tomllib
 from typing import Any
@@ -26,8 +27,15 @@ class BlerSettings:
     channel_domain: str = "frequency"
     detector_batch_sizes: dict[str, int] = field(default_factory=dict)
     stop_at_zero_bler: bool = False
+    # Receiver-side DMRS tap window. These mirror the RX profile so a sweep can
+    # reproduce the tuned capture configuration; max_delay_spread_s falls back
+    # to the CDL channel value when left unset.
+    l_min: int = -6
+    max_delay_spread_s: float | None = None
 
-    _SUPPORTED_DETECTORS = frozenset({"lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic"})
+    _SUPPORTED_DETECTORS = frozenset(
+        {"lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic"}
+    )
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "BlerSettings":
@@ -86,6 +94,14 @@ class BlerSettings:
             raise ValueError("channel_domain 仅支持 frequency 或 time")
         if not isinstance(self.stop_at_zero_bler, bool):
             raise ValueError("stop_at_zero_bler 必须为布尔值")
+        if isinstance(self.l_min, bool) or not isinstance(self.l_min, int):
+            raise ValueError("l_min 必须是整数抽头偏移")
+        if self.max_delay_spread_s is not None:
+            if (
+                not math.isfinite(self.max_delay_spread_s)
+                or self.max_delay_spread_s <= 0
+            ):
+                raise ValueError("max_delay_spread_s 必须是正数")
 
     def batch_size_for_detector(self, detector: str | None = None) -> int:
         """Return the configured batch size for a detector, with base-size fallback."""

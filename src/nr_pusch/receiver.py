@@ -15,6 +15,7 @@ from sionna.phy.mapping import (
 )
 from sionna.phy.channel import time_lag_discrete_time_channel
 from sionna.phy.fec.scrambling import Descrambler, Scrambler
+from sionna.phy.fec.ldpc import LDPC5GDecoder
 from sionna.phy.mimo import KBestDetector as FlatKBestDetector
 from sionna.phy.mimo import StreamManagement, lmmse_matrix, whiten_channel
 from sionna.phy.nr import PUSCHReceiver, PUSCHTransmitter, TBDecoder
@@ -73,6 +74,65 @@ def _use_explicit_tx_scrambling(
         binary=True,
         device=transmitter.device,
     )
+
+class _LdpcSoftFeedback(torch.nn.Module):
+    """Return rate-matched LDPC posterior-minus-channel extrinsic LLRs."""
+
+    def __init__(self, tb_decoder: TBDecoder, num_iterations: int, device: str | None):
+        super().__init__()
+        self._encoder = tb_decoder._tb_encoder
+        self._descrambler = tb_decoder._descrambler
+        self._output_perm_inv = tb_decoder._output_perm_inv
+        self._output_perm = torch.argsort(self._output_perm_inv)
+        self._decoder = LDPC5GDecoder(
+            encoder=self._encoder.ldpc_encoder,
+            num_iter=num_iterations,
+            hard_out=False,
+            return_infobits=False,
+            device=device,
+        )
+        self._cw_length = int(self._encoder.n)
+        self._num_cbs = int(self._encoder.num_cbs)
+        self._ldpc_n = int(self._encoder.ldpc_encoder.n)
+        self._num_fillers = self._ldpc_n * self._num_cbs - int(
+            self._encoder.cw_lengths_sum
+        )
+
+    def forward(self, llr: torch.Tensor) -> torch.Tensor:
+        """Map scrambled rate-matched LLRs [batch,user,n] to same-order extrinsic."""
+        if llr.ndim != 3 or llr.shape[-1] != self._cw_length:
+            raise ValueError(
+                f"LDPC feedback expects [batch,user,{self._cw_length}] LLRs"
+            )
+        llr = llr.float().clamp(-20.0, 20.0)
+        llr_cb_order = self._descrambler(llr) if self._descrambler is not None else llr
+        if self._num_fillers:
+            llr_cb_order = torch.cat(
+                (
+                    llr_cb_order,
+                    torch.zeros(
+                        *llr_cb_order.shape[:-1],
+                        self._num_fillers,
+                        dtype=llr_cb_order.dtype,
+                        device=llr_cb_order.device,
+                    ),
+                ),
+                dim=-1,
+            )
+        llr_cb_order = torch.index_select(
+            llr_cb_order, -1, self._output_perm_inv.to(llr.device)
+        )
+        llr_cb = llr_cb_order.reshape(
+            *llr.shape[:2], self._num_cbs, self._ldpc_n
+        )
+        posterior = self._decoder(llr_cb)
+        extrinsic_cb = posterior - llr_cb.clamp(-20.0, 20.0)
+        extrinsic = extrinsic_cb.reshape(*llr.shape[:2], -1)
+        extrinsic = torch.index_select(extrinsic, -1, self._output_perm.to(llr.device))
+        extrinsic = extrinsic[..., : self._cw_length]
+        extrinsic = self._descrambler(extrinsic) if self._descrambler is not None else extrinsic
+        return extrinsic.clamp(-20.0, 20.0)
+
 
 
 class DftSOfdmMimoDetector(torch.nn.Module):
@@ -562,6 +622,138 @@ class DftSOfdmMmsePicDetector(DftSOfdmMimoDetector):
         return llr
 
 
+class DftSOfdmSoftMmsePicDetector(DftSOfdmMimoDetector):
+    """Soft PIC with rate-matched LDPC extrinsic feedback between iterations."""
+
+    def __init__(
+        self,
+        transmitter: PUSCHTransmitter,
+        stream_management: StreamManagement,
+        tb_decoder: TBDecoder,
+        *,
+        num_feedback_iterations: int = 1,
+        damping: float = 0.25,
+        num_decoder_iterations: int = 20,
+        device: str | None = None,
+    ) -> None:
+        super().__init__(transmitter, stream_management, method="lmmse")
+        if (
+            isinstance(num_feedback_iterations, bool)
+            or not isinstance(num_feedback_iterations, int)
+            or num_feedback_iterations < 1
+        ):
+            raise ValueError("soft-mmse-pic 外反馈次数必须为正整数")
+        if not 0.0 < damping <= 1.0:
+            raise ValueError("soft-mmse-pic damping 必须位于 (0, 1]")
+        self.num_feedback_iterations = num_feedback_iterations
+        self.damping = damping
+        self._feedback = _LdpcSoftFeedback(
+            tb_decoder, num_decoder_iterations, device
+        )
+        bps = int(torch.as_tensor(self._num_bits_per_symbol).reshape(-1)[0])
+        self._llrs_to_logits = LLRs2SymbolLogits(bps, device=transmitter.device)
+        self._symbol_moments = SymbolLogits2Moments(
+            constellation=self._constellation, device=transmitter.device
+        )
+
+    def forward(
+        self,
+        y: torch.Tensor,
+        h_hat: torch.Tensor,
+        err_var: torch.Tensor,
+        no: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, num_rx, num_rx_ant, _, fft_size = y.shape
+        if num_rx != 1 or fft_size != self._fft_size:
+            raise ValueError("soft-mmse-pic 仅支持单接收端口和当前资源网格尺寸")
+        users = h_hat.shape[3]
+        bps = int(torch.as_tensor(self._num_bits_per_symbol).reshape(-1)[0])
+        data_symbols = self._data_symbol_indices
+        llr = super().forward(y, h_hat, err_var, no)
+
+        y_eff = self._detector._removed_nulled_scs(y)
+        y_data = y_eff[:, 0].index_select(2, data_symbols).permute(0, 2, 3, 1)
+        h_data = torch.broadcast_to(h_hat, h_hat.shape)[:, 0, :, :, 0]
+        h_data = h_data.index_select(3, data_symbols).permute(0, 3, 4, 1, 2)
+        err_data = torch.broadcast_to(err_var, h_hat.shape)[:, 0, :, :, 0]
+        err_data = err_data.index_select(3, data_symbols).permute(0, 3, 4, 1, 2)
+        no = torch.as_tensor(no, dtype=y.real.dtype, device=y.device)
+        if no.ndim == 3 and no.shape[1] == 1:
+            no = no.squeeze(1)
+        no = torch.broadcast_to(no, (batch, num_rx_ant))
+        thermal_noise = no[:, None, None, :].expand(
+            batch, self._num_spread_symbols, fft_size, num_rx_ant
+        )
+        prior = torch.zeros_like(llr.reshape(batch, users, -1))
+
+        for _ in range(self.num_feedback_iterations):
+            extrinsic = self._feedback(llr.squeeze(2))
+            prior = (
+                (1.0 - self.damping) * prior + self.damping * extrinsic
+            ).clamp(-20.0, 20.0)
+            cancellation_llr = (llr.squeeze(2) + prior).clamp(-20.0, 20.0)
+            symbol_logits = self._llrs_to_logits(
+                cancellation_llr.reshape(
+                    batch, users, 1, self._num_data_symbols, bps
+                )
+            )
+            soft_mean, soft_variance = self._symbol_moments(symbol_logits)
+            soft_mean = soft_mean.reshape(
+                batch, users, self._num_spread_symbols, fft_size
+            )
+            soft_variance = soft_variance.reshape(
+                batch, users, self._num_spread_symbols, fft_size
+            ).clamp_min(0.0)
+            soft_frequency = torch.fft.fft(soft_mean, dim=-1, norm="ortho")
+            variance_frequency = soft_variance.mean(dim=-1).permute(0, 2, 1)
+            variance_frequency = variance_frequency.unsqueeze(2).expand(
+                batch, self._num_spread_symbols, fft_size, users
+            )
+            h_soft = h_data * soft_frequency.permute(0, 2, 3, 1).unsqueeze(-2)
+            y_cancelled = (
+                y_data.unsqueeze(-1) - h_soft.sum(dim=-1, keepdim=True) + h_soft
+            )
+            second_moment = (soft_mean.abs().square() + soft_variance)
+            second_moment = second_moment.mean(dim=-1).permute(0, 2, 1)
+            csi_noise = (
+                err_data * second_moment.unsqueeze(2).unsqueeze(3)
+            ).sum(dim=-1)
+            residual_interference = (
+                h_data.abs().square() * variance_frequency.unsqueeze(-2)
+            )
+            other_variance = (
+                residual_interference.sum(dim=-1, keepdim=True)
+                - residual_interference
+            ).clamp_min(0.0)
+            residual_noise = (
+                thermal_noise.unsqueeze(-1)
+                + csi_noise.unsqueeze(-1)
+                + other_variance
+            ).clamp_min(_MIN_NOISE_VARIANCE)
+
+            weighted_channel = h_data.abs().square() / residual_noise
+            gain = weighted_channel.sum(dim=-2).clamp_min(1e-9)
+            estimate_fd = (
+                h_data.conj() * y_cancelled / residual_noise
+            ).sum(dim=-2) / gain
+            variance_fd = 1.0 / gain
+            estimate_td = torch.fft.ifft(
+                estimate_fd.permute(0, 3, 1, 2), dim=-1, norm="ortho"
+            )
+            variance_td = variance_fd.permute(0, 3, 1, 2).mean(
+                dim=-1, keepdim=True
+            ).expand_as(estimate_td.real)
+            llr = self._demapper(
+                estimate_td.reshape(batch, users, 1, self._num_data_symbols),
+                variance_td.reshape(batch, users, 1, self._num_data_symbols),
+            )
+            if not torch.isfinite(llr).all().item():
+                raise RuntimeError("soft-mmse-pic produced non-finite detector LLRs")
+
+        self.last_llr = llr
+        return llr
+
+
 class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
     """Decode users strongest-first and cancel CRC-verified reconstructions."""
 
@@ -931,7 +1123,30 @@ class NrPuschRx:
         self._fft_size = tx.resource_grid.fft_size
         _, l_max = time_lag_discrete_time_channel(self.sample_rate_hz, max_delay_spread_s)
         stream_management = StreamManagement(np.ones((1, len(settings.users)), dtype=bool), 1)
-        if detector == "lmmse-sic":
+        tb_decoder = TBDecoder(
+            tx._tb_encoder,
+            num_bp_iter=num_decoder_iterations,
+            device=device,
+        )
+        if scrambling_sequences is not None:
+            _use_explicit_scrambling(
+                tb_decoder,
+                scrambling_sequences.to(device=device),
+                len(settings.users),
+                int(tx._tb_encoder.n),
+            )
+        self._cb_crc_status: list[torch.Tensor] = []
+        if detector == "soft-mmse-pic":
+            detector_block = DftSOfdmSoftMmsePicDetector(
+                tx,
+                stream_management,
+                tb_decoder,
+                num_feedback_iterations=1 if detector_parameter is None else detector_parameter,
+                damping=detector_damping,
+                num_decoder_iterations=num_decoder_iterations,
+                device=device,
+            )
+        elif detector == "lmmse-sic":
             detector_block = DftSOfdmLmmseSicDetector(
                 tx,
                 stream_management,
@@ -983,22 +1198,9 @@ class NrPuschRx:
             )
         else:
             estimator = "perfect"
-        tb_decoder = TBDecoder(
-            tx._tb_encoder,
-            num_bp_iter=num_decoder_iterations,
-            device=device,
-        )
-        self._cb_crc_status: list[torch.Tensor] = []
         if track_cb_crc and tb_decoder._cb_crc_decoder is not None:
             tb_decoder._cb_crc_decoder = _CbCrcProbe(
                 tb_decoder._cb_crc_decoder, self._cb_crc_status
-            )
-        if scrambling_sequences is not None:
-            _use_explicit_scrambling(
-                tb_decoder,
-                scrambling_sequences.to(device=device),
-                len(settings.users),
-                int(tx._tb_encoder.n),
             )
         self._receiver = PUSCHReceiver(
             tx,
@@ -1018,6 +1220,8 @@ class NrPuschRx:
             self.detector_parameter = 64
         elif detector == "mmse-pic" and detector_parameter is None:
             self.detector_parameter = 4
+        elif detector == "soft-mmse-pic" and detector_parameter is None:
+            self.detector_parameter = 1
         elif detector == "ep" and detector_parameter is None:
             self.detector_parameter = 10
         self.detector_damping = detector_damping
@@ -1156,7 +1360,11 @@ class NrPuschRx:
             "input_domain": self.input_domain,
             "detector": self.detector,
             "detector_parameter": self.detector_parameter,
-            "detector_damping": self.detector_damping if self.detector in {"mmse-pic", "ep"} else None,
+            "detector_damping": self.detector_damping if self.detector in {"mmse-pic", "soft-mmse-pic", "ep"} else None,
+            "detector_feedback_iterations": (
+                self._receiver._mimo_detector.num_feedback_iterations
+                if self.detector == "soft-mmse-pic" else None
+            ),
             "detector_note": (
                 "Strongest-first LMMSE-SIC; cancel only after the user's TB CRC passes."
                 if self.detector == "lmmse-sic"
@@ -1164,6 +1372,8 @@ class NrPuschRx:
                 if self.detector == "k-best"
                 else "Frequency-domain LMMSE equalization followed by inverse DFT spreading."
                 if self.detector == "lmmse"
+                else "LDPC extrinsic-feedback soft-MMSE-PIC with frequency-domain cancellation."
+                if self.detector == "soft-mmse-pic"
                 else "Iterative time-domain soft-symbol PIC with frequency-domain cancellation."
                 if self.detector == "mmse-pic"
                 else "Frequency LMMSE pre-equalization, IDFT despreading, then damped time-domain spatial EP with Gaussian residual-ISI covariance."

@@ -9,13 +9,22 @@ num_decoder_iterations = 20
 # dmrs uses the configured single-slot OCC pilot arrangement; perfect provides an ideal-CSI bound.
 channel_estimator = "dmrs"
 # Compare each detector under the same seed, CDL profile, SNR grid, and payload sequence.
-detectors = ["lmmse", "lmmse-sic", "k-best", "mmse-pic", "ep"]
+detectors = ["lmmse", "lmmse-sic", "k-best", "mmse-pic", "ep", "soft-mmse-pic"]
 # SIC decodes the strongest UE first and only cancels a CRC-passing TB.
 detector = "lmmse-sic"
-# Per-detector parameters: K-best list size, MMSE-PIC iterations, and EP iterations.
-detector_parameters = { "k-best" = 16, "mmse-pic" = 4, "ep" = 10 }
+# Per-detector parameters: K-best list size, MMSE-PIC QAM iterations,
+# EP iterations, and soft-MMSE-PIC LDPC feedback rounds.
+# These are simulation-tuned, NOT the capture profile's values. A paired sweep
+# (docs/receiver_optimization.md 3.2) showed that copying the tuned capture
+# settings into this sweep raises MMSE-PIC BLER by 2.9x at 30 dB, 27.5x at
+# 35 dB and 51x at 40 dB, so the capture tuning does not transfer to CDL.
+detector_parameters = { "k-best" = 16, "mmse-pic" = 4, "ep" = 10, "soft-mmse-pic" = 1 }
 # Damping for iterative soft-symbol updates; smaller values improve stability.
 detector_damping = 0.25
+# Receiver-side DMRS tap window, exposed so a sweep can reproduce a given
+# capture profile. Omitting max_delay_spread_s falls back to the CDL channel
+# value; both are left at the simulation-tuned baseline on purpose.
+l_min = -6
 # cpu, cuda, cuda:0, or auto. Explicit CUDA fails clearly when unavailable.
 device = "cpu"
 # frequency applies CDL per OFDM resource element and supports larger batches;

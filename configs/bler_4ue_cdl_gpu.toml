@@ -3,8 +3,9 @@
 snr_db = [20.0, 25.0, 30.0, 35, 40, 45, 50]
 batch_size = 20
 # Prior local runs completed LMMSE and LMMSE-SIC at 20, then K-best hit CUDA OOM.
-# K-best, MMSE-PIC, and EP use conservative initial values; tune them individually.
-detector_batch_sizes = { lmmse = 26, "lmmse-sic" = 26, "k-best" = 10, "mmse-pic" = 26, ep = 26 }
+# K-best, MMSE-PIC, and EP use conservative initial values; soft-MMSE-PIC
+# uses the batch size measured in the paired CDL sweep.
+detector_batch_sizes = { lmmse = 20, "lmmse-sic" = 20,  "mmse-pic" = 20,  "soft-mmse-pic" = 8 }
 max_frames_per_snr = 1000
 target_block_errors = 100
 seed = 20260924
@@ -17,13 +18,22 @@ num_decoder_iterations = 20
 channel_estimator = "dmrs"
 # Compare detectors with the same initial seed, CDL profile, and SNR grid.
 # Different batch grouping does not guarantee identical per-frame payloads.
-detectors = ["lmmse", "lmmse-sic", "k-best", "mmse-pic", "ep"]
-# SIC decodes the strongest UE first and only cancels a CRC-passing TB.
+detectors = ["lmmse", "lmmse-sic", "mmse-pic",  "soft-mmse-pic"]
+#default SIC decodes the strongest UE first and only cancels a CRC-passing TB.
 detector = "lmmse-sic"
-# Per-detector parameters: K-best list size, MMSE-PIC iterations, and EP iterations.
-detector_parameters = { "k-best" = 16, "mmse-pic" = 4, "ep" = 10 }
+# Per-detector parameters: K-best list size, MMSE-PIC QAM iterations,
+# EP iterations, and soft-MMSE-PIC LDPC feedback rounds.
+# These are simulation-tuned, NOT the capture profile's values. A paired sweep
+# (docs/receiver_optimization.md 3.2) showed that copying the tuned capture
+# settings into this sweep raises MMSE-PIC BLER by 2.9x at 30 dB, 27.5x at
+# 35 dB and 51x at 40 dB, so the capture tuning does not transfer to CDL.
+detector_parameters = { "mmse-pic" = 4, "soft-mmse-pic" = 4 }
 # Damping for iterative soft-symbol updates; smaller values improve stability.
 detector_damping = 0.25
+# Receiver-side DMRS tap window, exposed so a sweep can reproduce a given
+# capture profile. Omitting max_delay_spread_s falls back to the CDL channel
+# value; both are left at the simulation-tuned baseline on purpose.
+l_min = -6
 # cpu, cuda, cuda:0, or auto. Explicit CUDA fails clearly when unavailable.
 device = "cuda:0"
 # frequency applies CDL per OFDM resource element and supports larger batches;

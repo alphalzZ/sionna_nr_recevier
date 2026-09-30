@@ -139,13 +139,18 @@
                 <span class="file-icon" aria-hidden="true">↑</span>
                 <span><strong id="rx-file-name">选择 .h5、.hdf5 或 .npz 文件</strong><small id="rx-file-meta">本地处理 · 单文件上限 12 MiB</small></span>
               </label>
+              <label class="file-picker rx-scrambling-picker" for="rx-scrambling">
+                <input id="rx-scrambling" type="file" accept=".h5,.hdf5">
+                <span class="file-icon" aria-hidden="true">#</span>
+                <span><strong id="rx-scrambling-name">加扰序列 H5（可选）</strong><small id="rx-scrambling-meta">抓包使用非 RNTI 扰码时上传，否则按 RNTI 推导</small></span>
+              </label>
 
               <div class="field-row">
                 <label><span>RX 配置（可选）</span><select id="rx-config-select"><option value="">正在加载…</option></select></label>
                 <label><span>输入域</span><select id="rx-input-domain"><option value="time">时域</option><option value="frequency">频域</option></select></label>
               </div>
               <div class="field-row">
-                <label><span>检测器</span><select id="rx-detector"><option value="lmmse">LMMSE</option><option value="lmmse-sic">LMMSE-SIC</option><option value="k-best">K-Best</option><option value="ep">EP</option><option value="mmse-pic">MMSE-PIC</option></select></label>
+                <label><span>检测器</span><select id="rx-detector"><option value="lmmse">LMMSE</option><option value="lmmse-sic">LMMSE-SIC</option><option value="k-best">K-Best</option><option value="ep">EP</option><option value="mmse-pic">MMSE-PIC</option><option value="soft-mmse-pic">Soft-MMSE-PIC（LDPC 外反馈）</option></select></label>
                 <label><span>设备</span><select id="rx-device"><option value="cpu">CPU</option><option value="cuda">CUDA</option></select></label>
               </div>
               <div class="field-row">
@@ -154,6 +159,7 @@
               </div>
               <div class="field-row detector-options">
                 <label><span>阻尼系数（可选）</span><input id="rx-detector-damping" type="number" min="0" max="1" step="any" placeholder="0–1"></label>
+                <label title="决定 DMRS 有限抽头拟合窗口的宽度，高码率抓包通常需要更小的值"><span>最大时延扩展（秒）</span><input id="rx-max-delay-spread" type="number" min="0" step="any" placeholder="留空使用配置值"></label>
               </div>
             </div>
 
@@ -187,8 +193,8 @@
           </div>
           <div class="rx-result-grid">
             <div class="chart-card">
-              <div class="chart-title"><div><h3>接收星座图</h3><p id="rx-constellation-count">检测器软输出的 QAM 符号估计</p></div></div>
-              <div class="constellation-wrap"><canvas id="rx-constellation" role="img" aria-label="接收 IQ 星座散点图"></canvas></div>
+              <div class="chart-title"><div><h3>逐 UE 星座图</h3><p id="rx-constellation-count">检测器软输出的 QAM 符号估计</p></div></div>
+              <div class="constellation-grid" id="rx-constellation-grid"></div>
             </div>
             <div class="metadata-card">
               <div class="table-title"><h3>输入分析</h3></div>
@@ -197,7 +203,7 @@
           </div>
           <div class="table-card rx-crc-card">
             <div class="table-title"><h3>逐 UE CRC 状态</h3><span id="rx-crc-count"></span></div>
-            <div class="table-scroll"><table><thead><tr><th>UE</th><th>CRC 状态</th></tr></thead><tbody id="rx-crc-body"></tbody></table></div>
+            <div class="table-scroll"><table><thead><tr><th>UE</th><th>TB CRC</th><th>码块 CRC（每格为一个码块）</th></tr></thead><tbody id="rx-crc-body"></tbody></table></div>
           </div>
         </div>
       </section>

@@ -84,7 +84,12 @@ def simulate_bler(
     rx = NrPuschRx(
         tx_settings,
         channel_estimator=simulation_settings.channel_estimator,
-        max_delay_spread_s=channel_settings.channel.max_delay_spread_s,
+        l_min=simulation_settings.l_min,
+        max_delay_spread_s=(
+            simulation_settings.max_delay_spread_s
+            if simulation_settings.max_delay_spread_s is not None
+            else channel_settings.channel.max_delay_spread_s
+        ),
         num_decoder_iterations=simulation_settings.num_decoder_iterations,
         detector=simulation_settings.detector,
         detector_parameter=simulation_settings.detector_parameters.get(
@@ -251,8 +256,9 @@ def save_bler_results(
         "detector_validity_note": (
             "DFT-s-OFDM k-best first applies frequency-domain LMMSE, then uses a per-sample zero-lag "
             "effective spatial channel with residual frequency variation in the covariance. DFT-s-OFDM "
-            "MMSE-PIC uses soft time-domain moments for iterative frequency-domain cancellation. The "
-            "DFT-s-OFDM EP detector applies damped Gaussian-site moment matching to the same per-sample "
+            "MMSE-PIC uses soft time-domain moments for iterative frequency-domain cancellation without "
+            "LDPC feedback; soft-mmse-pic feeds rate-matched LDPC extrinsic LLRs back into soft PIC. "
+            "The DFT-s-OFDM EP detector applies damped Gaussian-site moment matching to the same per-sample "
             "spatial model; residual frequency variation is approximated as Gaussian covariance."
         ),
     }
