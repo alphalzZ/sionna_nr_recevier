@@ -50,6 +50,9 @@ nr-pusch-estimator-validation --tx-config configs/pusch_4ue.toml --channel-confi
 
 常规 `nr-pusch-bler` 的 `[bler]` 可设置 `channel_estimator = "dmrs-lmmse"` 和 `dmrs_tap_power_prior_path`；相对路径以该 TOML 所在目录为基准。`nr-pusch-rx` 的 `[receiver]` 同样读取 `dmrs_tap_power_prior_path`，并要求 `--channel-config` 提供 prior 对应的 CDL TOML，以对 TX、CDL、抽头窗、FFT 和采样率做精确兼容检查。prior 缺失或不兼容会报错，不会回退到 LS。
 
+BLER 配置可用 `[bler].channel_estimators` 选择多个估计器；仿真按 `channel_estimators × detectors × snr_db` 遍历组合。未设置时沿用单个 `channel_estimator`。网页 SIM 配置 `configs/bler_estimator_matrix.toml` 组合 `dmrs`、`dmrs-lmmse`、`perfect` 与 `soft-mmse-pic`，扫描 25–50 dB 六个 SNR，共 18 个结果点，每点最多 2,000 帧（GPU profile）。运行前需按上面的验证命令生成 `/tmp/channel_estimation_validation.prior.npz`；输出路径不同时更新 `dmrs_tap_power_prior_path`。
+
+
 检测器可选 `lmmse`、`lmmse-sic`、`k-best`、`mmse-pic`、`soft-mmse-pic` 和 `ep`。`detector_parameter` 对 `mmse-pic` 表示 QAM-PIC 轮数，对 `soft-mmse-pic` 表示 LDPC 外反馈轮数；BLER 支持用 `detector_parameters` 分别配置，CLI 也提供 `--detector`、`--detector-parameter` 和 `--detector-damping`。`k-best` 和 `ep` 均先做频域 LMMSE 预均衡并 IDFT；每个时域采样点建立四流空间模型，频率变化与等化噪声合并为残余 ISI 协方差。K-best 在该模型上搜索有限星座路径。EP 则为四个 QAM 用户维护复高斯近似因子，以 cavity 分布对离散星座做矩匹配，并对因子参数阻尼迭代，最后由后验均值和方差形成软 LLR。`mmse-pic` 从时域 LLR 计算软星座期望，DFT 回频域后并行消除其他 UE，并更新 LLR；它不调用 LDPC 译码器做检测反馈。`soft-mmse-pic` 在相同初始 LMMSE 检测后运行 LDPC BP，以码块位序的 posterior-minus-channel 外信息反馈；取消时将当前检测器 LLR 与已阻尼的 LDPC 外信息组合为其他 UE 的软符号概率，对目标 UE 使用天线噪声加权单流 LMMSE，并由最终检测器 LLR 经原 TBDecoder 给出 TB/CB CRC。其默认外反馈轮数为 1、阻尼为 0.25，独立于旧 `mmse-pic` 的 4 轮默认值；默认 BLER 与抓包 profile 不切换。`lmmse-sic` 按估计信道功率从强到弱处理 UE：仅在该 UE CRC 通过时重编码、重构其 DFT-s-OFDM 资源网格并消除干扰。单次接收 JSON sidecar 会记录 SIC 检测顺序和每个 UE 消除前的 CRC 状态。BLER 配置中的 `detectors` 会按相同 seed、CDL、SNR 和 payload 顺序比较检测器；例如 `{ "k-best" = 16, "mmse-pic" = 4, "soft-mmse-pic" = 1, "ep" = 10 }`。
 
 EP 与 K-best 共用零时延等效空间信道近似；滤波后剩余的频率选择性记入高斯协方差，而非在 EP 图中显式建模所有跨采样相关性。该近似、软 LLR 校准及收敛行为仍需通过 MATLAB 参考向量和长 SNR 曲线验证。

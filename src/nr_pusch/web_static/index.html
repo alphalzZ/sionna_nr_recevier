@@ -29,7 +29,7 @@
       <div>
         <p class="eyebrow">5G NR · BLER SIMULATION</p>
         <h1>从参数到曲线，<br><em>一次完成。</em></h1>
-        <p class="hero-copy">配置 PUSCH、信道与扫频策略，启动仿真并实时查看不同检测器的误块率表现。</p>
+        <p class="hero-copy">配置 PUSCH、信道与扫频策略，比较不同信道估计器和 MIMO 检测器组合的误块率表现。</p>
       </div>
       <div class="hero-actions">
         <button class="button button-primary" id="run-button" type="button">
@@ -97,7 +97,7 @@
         </div>
         <div class="table-card">
           <div class="table-title"><h3>测量明细</h3><span id="table-count"></span></div>
-          <div class="table-scroll"><table><thead><tr><th>检测器</th><th>SNR (dB)</th><th>BLER</th><th>BER</th><th>CRC 失败率</th><th>帧数</th><th>传输块</th><th>误块</th><th>耗时</th></tr></thead><tbody id="metrics-body"></tbody></table></div>
+          <div class="table-scroll"><table><thead><tr><th>信道估计器 / MIMO 检测器</th><th>SNR (dB)</th><th>BLER</th><th>BER</th><th>CRC 失败率</th><th>帧数</th><th>传输块</th><th>误块</th><th>耗时</th></tr></thead><tbody id="metrics-body"></tbody></table></div>
         </div>
       </div>
     </section>

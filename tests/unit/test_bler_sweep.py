@@ -57,19 +57,18 @@ def _settings_files():
 
 
 @contextmanager
-def _fake_link(zero_bler_points: set[tuple[str, float]]):
-    """Replace the Sionna-heavy link with a scripted per-detector outcome.
+def _fake_link(
+    zero_bler_points: set[tuple[str, float] | tuple[str, str, float]],
+):
+    """Script clean outcomes by detector or by estimator-detector pair."""
 
-    Points in ``zero_bler_points`` decode without any error; every other point
-    fails CRC for all transport blocks.
-    """
     state: dict[str, float | None] = {"snr_db": None}
 
     class FakeTransmitter:
         sample_rate_hz = 18_000_000
 
         def __init__(self, settings, device=None):
-            self._tx_freq = SimpleNamespace(resource_grid=SimpleNamespace())
+            self._tx_freq = SimpleNamespace(resource_grid=SimpleNamespace(fft_size=512))
 
         def generate(self, batch_size: int, seed: int):
             return SimpleNamespace(
@@ -89,10 +88,14 @@ def _fake_link(zero_bler_points: set[tuple[str, float]]):
         sample_rate_hz = 18_000_000
 
         def __init__(self, settings, **kwargs):
+            self.channel_estimator = kwargs["channel_estimator"]
             self.detector = kwargs["detector"]
 
         def receive_frequency_grid(self, grid, noise_variance, channel_frequency_response=None):
-            clean = (self.detector, state["snr_db"]) in zero_bler_points
+            clean = (
+                (self.channel_estimator, self.detector, state["snr_db"]) in zero_bler_points
+                or (self.detector, state["snr_db"]) in zero_bler_points
+            )
             crc_status = torch.ones(grid.batch_size, USERS, dtype=torch.bool)
             bits = torch.zeros(grid.batch_size, USERS, BITS_PER_USER)
             if not clean:
@@ -180,6 +183,53 @@ class StopAtZeroBlerTest(unittest.TestCase):
             [("lmmse", 30.0, 20.0)],
         )
 
+    def test_estimator_detector_matrix_sweeps_every_pair_independently(self):
+        settings = _settings(
+            snr_db=(10.0, 20.0),
+            channel_estimators=("dmrs", "dmrs-lmmse", "perfect"),
+            dmrs_tap_power_prior_path="test-prior.npz",
+            detectors=("lmmse", "soft-mmse-pic"),
+            stop_at_zero_bler=True,
+        )
+        clean_point = ("perfect", "soft-mmse-pic", 10.0)
+        with _settings_files() as (tx_settings, channel_settings):
+            with (
+                _fake_link({clean_point}),
+                mock.patch.object(bler_module, "dmrs_prior_compatibility", return_value={}),
+                mock.patch.object(
+                    bler_module, "load_dmrs_tap_power_prior", return_value=(torch.ones(1), {})
+                ),
+            ):
+                sweep = bler_module.simulate_detector_comparison(
+                    tx_settings, channel_settings, settings
+                )
+        expected = [
+            (estimator, detector, snr_db)
+            for estimator in settings.channel_estimators_for_sweep
+            for detector in settings.detectors
+            for snr_db in settings.snr_db
+            if (estimator, detector) != ("perfect", "soft-mmse-pic") or snr_db == 10.0
+        ]
+        self.assertEqual(
+            [(point.channel_estimator, point.detector, point.snr_db) for point in sweep.points],
+            expected,
+        )
+        self.assertEqual(
+            [
+                (point.channel_estimator, point.detector, point.snr_db, point.trigger_snr_db)
+                for point in sweep.skipped
+            ],
+            [("perfect", "soft-mmse-pic", 20.0, 10.0)],
+        )
+        first_snr_errors = {
+            (point.channel_estimator, point.detector): point.block_errors
+            for point in sweep.points
+            if point.snr_db == 10.0
+        }
+        self.assertEqual(first_snr_errors[("perfect", "soft-mmse-pic")], 0)
+        self.assertEqual(first_snr_errors[("dmrs", "lmmse")], 8)
+
+
 
 class BlerResultExportTest(unittest.TestCase):
     def _sweep(self) -> BlerSweep:
@@ -189,13 +239,14 @@ class BlerResultExportTest(unittest.TestCase):
                     detector="lmmse", device="cpu", snr_db=10.0, frames=2,
                     transport_blocks=8, block_errors=8, crc_failures=8,
                     bit_errors=32, bits=32, bler=1.0, crc_fail_rate=1.0,
-                    ber=1.0, runtime_s=0.5,
+                    ber=1.0, runtime_s=0.5, channel_estimator="dmrs-lmmse",
                 ),
             ),
             skipped=(
                 SkippedPoint(
                     detector="lmmse", device="cpu", snr_db=20.0,
                     trigger_snr_db=10.0, reason="bler_at_zero",
+                    channel_estimator="dmrs-lmmse",
                 ),
             ),
         )
@@ -212,12 +263,15 @@ class BlerResultExportTest(unittest.TestCase):
         with csv_path.open(newline="", encoding="utf-8") as stream:
             rows = list(csv.DictReader(stream))
         self.assertEqual([row["snr_db"] for row in rows], ["10.0"])
+        self.assertEqual(rows[0]["channel_estimator"], "dmrs-lmmse")
         self.assertEqual(list(rows[0]), list(bler_module.BlerPoint.__dataclass_fields__))
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual([entry["snr_db"] for entry in manifest["skipped_points"]], [20.0])
         self.assertEqual(manifest["skipped_points"][0]["trigger_snr_db"], 10.0)
         self.assertEqual(manifest["skipped_points"][0]["reason"], "bler_at_zero")
         self.assertIn("stop_at_zero_bler", manifest["skip_policy"])
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["results"][0]["channel_estimator"], "dmrs-lmmse")
         self.assertFalse(manifest["simulation_settings"]["stop_at_zero_bler"])
 
 
@@ -255,8 +309,11 @@ class BlerCliProgressTest(unittest.TestCase):
         with _fake_link({("lmmse", 20.0)}), mock.patch.object(sys, "argv", argv):
             bler_cli.main()
         records = [json.loads(line) for line in progress.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual([(record["snr_db"], record["skipped"]) for record in records],
-                         [(10.0, False), (20.0, False), (30.0, True)])
+        self.assertEqual(
+            [(record["snr_db"], record["skipped"]) for record in records],
+            [(10.0, False), (20.0, False), (30.0, True)],
+        )
+        self.assertEqual(records[0]["channel_estimator"], "dmrs")
         self.assertEqual(records[2]["trigger_snr_db"], 20.0)
         self.assertNotIn("bler", records[2])
         with (directory / "results.csv").open(newline="", encoding="utf-8") as stream:

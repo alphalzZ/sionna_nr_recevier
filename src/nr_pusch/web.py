@@ -185,7 +185,11 @@ class SimulationWebApp:
                 "finished_at": None,
                 "error": None,
                 "config_names": names,
-                "total_points": len(simulation_settings.detectors) * len(simulation_settings.snr_db),
+                "total_points": (
+                    len(simulation_settings.channel_estimators_for_sweep)
+                    * len(simulation_settings.detectors)
+                    * len(simulation_settings.snr_db)
+                ),
             }
             with self._lock:
                 self._jobs[job_id] = job

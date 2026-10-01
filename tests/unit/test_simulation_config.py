@@ -19,6 +19,16 @@ class BlerSettingsTest(unittest.TestCase):
         self.assertIsNone(settings.detector_parameter)
         self.assertEqual(settings.detector_parameters, {"k-best": 16, "mmse-pic": 4, "ep": 10, "soft-mmse-pic": 1})
 
+    def test_estimator_matrix_profile_selects_requested_estimators_and_detector(self):
+        settings = BlerSettings.from_toml(ROOT / "configs" / "bler_estimator_matrix.toml")
+        self.assertEqual(
+            settings.channel_estimators_for_sweep,
+            ("dmrs", "dmrs-lmmse", "perfect"),
+        )
+        self.assertEqual(settings.detectors, ("soft-mmse-pic",))
+        self.assertEqual(settings.dmrs_tap_power_prior_path, "/tmp/channel_estimation_validation.prior.npz")
+
+
     def test_soft_mmse_pic_runs_with_each_profile_batch_size(self):
         for name, batch_size, feedback_rounds in (
             ("bler_4ue_cdl.toml", 2, 1),
@@ -118,6 +128,13 @@ class BlerSettingsTest(unittest.TestCase):
             settings.dmrs_tap_power_prior_path,
             str((Path(directory) / "artifacts" / "prior.npz").resolve()),
         )
+
+    def test_estimator_matrix_requires_prior_when_dmrs_lmmse_is_selected(self):
+        settings = BlerSettings.from_toml(ROOT / "configs" / "bler_estimator_matrix.toml")
+        without_prior = dataclasses.replace(settings, dmrs_tap_power_prior_path=None)
+        with self.assertRaisesRegex(ValueError, "dmrs_tap_power_prior_path"):
+            without_prior.validate()
+
 
     def test_rejects_invalid_receiver_window(self):
         common = dict(

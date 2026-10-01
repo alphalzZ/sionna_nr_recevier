@@ -34,6 +34,10 @@ class BlerSettings:
     max_delay_spread_s: float | None = None
     estimate_delay: bool = False
     dmrs_tap_power_prior_path: str | None = None
+    channel_estimators: tuple[str, ...] | None = None
+
+    _SUPPORTED_CHANNEL_ESTIMATORS = frozenset({"perfect", "dmrs", "dmrs-lmmse"})
+
 
     _SUPPORTED_DETECTORS = frozenset(
         {"lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic"}
@@ -52,6 +56,9 @@ class BlerSettings:
         values.setdefault("detector_batch_sizes", {})
         values.setdefault("detector_damping", 0.25)
         values["detectors"] = tuple(values.get("detectors", (values["detector"],)))
+        if "channel_estimators" in values:
+            values["channel_estimators"] = tuple(values["channel_estimators"])
+
         values.setdefault("device", "cpu")
         values.setdefault("stop_at_zero_bler", False)
         values.setdefault("channel_domain", "frequency")
@@ -67,6 +74,13 @@ class BlerSettings:
         settings.validate()
         return settings
 
+    @property
+    def channel_estimators_for_sweep(self) -> tuple[str, ...]:
+        """Return estimator arms, falling back to the legacy scalar setting."""
+        if self.channel_estimators is None:
+            return (self.channel_estimator,)
+        return self.channel_estimators
+
     def validate(self) -> None:
         if not self.snr_db:
             raise ValueError("snr_db 至少需要一个扫描点")
@@ -78,13 +92,26 @@ class BlerSettings:
             raise ValueError("batch_size 和 max_frames_per_snr 必须大于 0")
         if self.target_block_errors < 1 or self.num_decoder_iterations < 1:
             raise ValueError("target_block_errors 和 num_decoder_iterations 必须大于 0")
-        if self.channel_estimator not in {"perfect", "dmrs", "dmrs-lmmse"}:
+        if self.channel_estimator not in self._SUPPORTED_CHANNEL_ESTIMATORS:
             raise ValueError("channel_estimator 仅支持 perfect、dmrs 或 dmrs-lmmse")
-        if self.channel_estimator == "dmrs-lmmse":
+        estimators = self.channel_estimators_for_sweep
+        if (
+            not isinstance(estimators, tuple)
+            or not estimators
+            or any(
+                not isinstance(name, str) or name not in self._SUPPORTED_CHANNEL_ESTIMATORS
+                for name in estimators
+            )
+            or len(set(estimators)) != len(estimators)
+        ):
+            raise ValueError(
+                "channel_estimators 必须是非空且不重复的 perfect、dmrs、dmrs-lmmse 列表"
+            )
+        if "dmrs-lmmse" in estimators:
             if not isinstance(self.dmrs_tap_power_prior_path, str) or not self.dmrs_tap_power_prior_path:
                 raise ValueError("dmrs-lmmse 必须配置 dmrs_tap_power_prior_path")
         elif self.dmrs_tap_power_prior_path is not None:
-            raise ValueError("dmrs_tap_power_prior_path 仅能用于 dmrs-lmmse")
+            raise ValueError("dmrs_tap_power_prior_path 仅能用于包含 dmrs-lmmse 的仿真")
         allowed = self._SUPPORTED_DETECTORS
         if self.detector not in allowed or not self.detectors or any(x not in allowed for x in self.detectors):
             raise ValueError(f"detector(s) 必须属于 {sorted(allowed)}")

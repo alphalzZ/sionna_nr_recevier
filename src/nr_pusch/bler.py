@@ -43,6 +43,7 @@ class BlerPoint:
     crc_fail_rate: float
     ber: float
     runtime_s: float
+    channel_estimator: str
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class SkippedPoint:
     snr_db: float
     trigger_snr_db: float
     reason: str
+    channel_estimator: str
 
 
 @dataclass(frozen=True)
@@ -262,6 +264,7 @@ def simulate_bler(
                 crc_fail_rate=crc_failures / transport_blocks,
                 ber=bit_errors / bits,
                 runtime_s=time.perf_counter() - started,
+                channel_estimator=simulation_settings.channel_estimator,
             )
         )
         if on_point is not None:
@@ -274,6 +277,7 @@ def simulate_bler(
                     snr_db=float(remaining_snr_db),
                     trigger_snr_db=float(snr_db),
                     reason="bler_at_zero",
+                    channel_estimator=simulation_settings.channel_estimator,
                 )
                 skipped.append(skipped_point)
                 if on_skip is not None:
@@ -291,17 +295,29 @@ def simulate_detector_comparison(
     on_point: Callable[[BlerPoint], None] | None = None,
     on_skip: Callable[[SkippedPoint], None] | None = None,
 ) -> BlerSweep:
-    """Run each configured detector from the same seed and channel profile."""
+    """Run each configured estimator-detector pair from the same seed and profile."""
     points: list[BlerPoint] = []
     skipped: list[SkippedPoint] = []
-    for detector in simulation_settings.detectors:
-        run_settings = replace(simulation_settings, detector=detector, detectors=(detector,))
-        sweep = simulate_bler(
-            tx_settings, channel_settings, run_settings,
-            device=device, on_point=on_point, on_skip=on_skip,
-        )
-        points.extend(sweep.points)
-        skipped.extend(sweep.skipped)
+    for channel_estimator in simulation_settings.channel_estimators_for_sweep:
+        for detector in simulation_settings.detectors:
+            run_settings = replace(
+                simulation_settings,
+                channel_estimator=channel_estimator,
+                channel_estimators=(channel_estimator,),
+                dmrs_tap_power_prior_path=(
+                    simulation_settings.dmrs_tap_power_prior_path
+                    if channel_estimator == "dmrs-lmmse"
+                    else None
+                ),
+                detector=detector,
+                detectors=(detector,),
+            )
+            sweep = simulate_bler(
+                tx_settings, channel_settings, run_settings,
+                device=device, on_point=on_point, on_skip=on_skip,
+            )
+            points.extend(sweep.points)
+            skipped.extend(sweep.skipped)
     return BlerSweep(points=tuple(points), skipped=tuple(skipped))
 
 
@@ -324,15 +340,15 @@ def save_bler_results(
         writer.writerows(asdict(point) for point in sweep.points)
     manifest_path = output.with_suffix(".json")
     manifest: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "transmit_settings": tx_settings.to_dict(),
         "channel_settings": channel_settings.to_dict(),
         "simulation_settings": simulation_settings.to_dict(),
         "results": [asdict(point) for point in sweep.points],
         "skipped_points": [asdict(point) for point in sweep.skipped],
         "skip_policy": (
-            "stop_at_zero_bler=true ends a detector sweep at the first SNR point with zero block "
-            "errors; the remaining higher SNRs are listed in skipped_points and are not simulated"
+            "stop_at_zero_bler=true ends each estimator/detector pair at its first SNR point with "
+            "zero block errors; the remaining higher SNRs are listed in skipped_points and are not simulated"
         ),
         "bler_definition": "TB block error if CRC fails or any decoded payload bit differs",
         "channel_domain": simulation_settings.channel_domain,

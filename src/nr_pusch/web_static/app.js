@@ -29,7 +29,7 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const editor = $("config-editor");
 const statusLabels = { queued: "排队中", running: "运行中", completed: "已完成", failed: "失败", cancelled: "已取消" };
-const detectorColors = ["#315fdf", "#e97832", "#8b55d9", "#3b9b6c", "#d4a719", "#d34e70"];
+const seriesColors = ["#315fdf", "#e97832", "#8b55d9", "#3b9b6c", "#d4a719", "#d34e70"];
 
 function switchWorkflow(name) {
   const rxActive = name === "rx";
@@ -670,7 +670,7 @@ function drawConstellation(constellation) {
     return;
   }
   prepared.forEach((user, index) => {
-    const color = detectorColors[index % detectorColors.length];
+    const color = seriesColors[index % seriesColors.length];
     const cell = document.createElement("figure");
     cell.className = "constellation-cell";
     const caption = document.createElement("figcaption");
@@ -780,6 +780,10 @@ async function decodeRx(event) {
   }
 }
 
+function comboLabel(point) {
+  return `${point.channel_estimator || "—"} / ${point.detector || "—"}`;
+}
+
 function renderResults(allPoints) {
   const skippedCount = allPoints.filter((point) => point && point.skipped).length;
   const points = allPoints.filter((point) => point && !point.skipped);
@@ -787,14 +791,18 @@ function renderResults(allPoints) {
   $("results-empty").classList.toggle("hidden", hasPoints);
   $("results-content").classList.toggle("hidden", !hasPoints);
   $("result-subtitle").textContent = hasPoints
-    ? `${new Set(points.map((point) => point.detector)).size} 个检测器 · ${points.length} 个测量点${skippedCount ? ` · 跳过 ${skippedCount} 个点` : ""}`
+    ? `${new Set(points.map(comboLabel)).size} 个估计器/检测器组合 · ${points.length} 个测量点${skippedCount ? ` · 跳过 ${skippedCount} 个点` : ""}`
     : "完成仿真后将在此显示结果";
   if (!hasPoints) return;
   const body = $("metrics-body");
   body.replaceChildren();
-  [...points].sort((a, b) => String(a.detector).localeCompare(String(b.detector)) || Number(a.snr_db) - Number(b.snr_db)).forEach((point) => {
+  [...points].sort((a, b) =>
+    String(a.channel_estimator).localeCompare(String(b.channel_estimator))
+    || String(a.detector).localeCompare(String(b.detector))
+    || Number(a.snr_db) - Number(b.snr_db)
+  ).forEach((point) => {
     const row = document.createElement("tr");
-    const values = [point.detector ?? "—", formatMetric(point.snr_db, 2), formatMetric(point.bler), formatMetric(point.ber), formatMetric(point.crc_fail_rate), point.frames ?? "—", point.transport_blocks ?? "—", point.block_errors ?? "—", Number.isFinite(Number(point.runtime_s)) ? `${formatMetric(point.runtime_s, 2)} s` : "—"];
+    const values = [comboLabel(point), formatMetric(point.snr_db, 2), formatMetric(point.bler), formatMetric(point.ber), formatMetric(point.crc_fail_rate), point.frames ?? "—", point.transport_blocks ?? "—", point.block_errors ?? "—", Number.isFinite(Number(point.runtime_s)) ? `${formatMetric(point.runtime_s, 2)} s` : "—"];
     values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); });
     body.append(row);
   });
@@ -845,10 +853,10 @@ function drawChart(points) {
   ctx.fillStyle = "#52605a"; ctx.font = "11px sans-serif"; ctx.fillText("SNR (dB)", pad.left + plotW / 2, height - 16);
   ctx.save(); ctx.translate(15, pad.top + plotH / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = "center"; ctx.fillText("BLER", 0, 0); ctx.restore();
   const groups = new Map();
-  valid.forEach((point) => { const key = String(point.detector ?? "未知检测器"); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(point); });
+  valid.forEach((point) => { const key = comboLabel(point); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(point); });
   const legend = $("chart-legend"); legend.replaceChildren();
   [...groups.entries()].forEach(([name, values], index) => {
-    const color = detectorColors[index % detectorColors.length];
+    const color = seriesColors[index % seriesColors.length];
     values.sort((a, b) => Number(a.snr_db) - Number(b.snr_db));
     ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2.2; ctx.beginPath();
     values.forEach((point, i) => { const px = x(Number(point.snr_db)), py = y(plotBler(point)); if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); }); ctx.stroke();

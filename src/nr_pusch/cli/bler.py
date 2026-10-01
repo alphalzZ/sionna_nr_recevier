@@ -56,19 +56,20 @@ def main() -> None:
         channel_settings=channel_settings,
         simulation_settings=simulation_settings,
     )
-    print("Detector  Device  SNR [dB]  BLER      CRC fail  BER       TB errors / TBs  Runtime [s]")
+    print("Estimator       Detector        Device  SNR [dB]  BLER      CRC fail  BER       TB errors / TBs  Runtime [s]")
     for point in sweep.points:
         print(
-            f"{point.detector:9s} {point.device:6s} {point.snr_db:8.2f}  {point.bler:8.4g}  "
-            f"{point.crc_fail_rate:8.4g}  {point.ber:8.4g}  "
-            f"{point.block_errors}/{point.transport_blocks}  {point.runtime_s:.2f}"
+            f"{point.channel_estimator:13s} {point.detector:14s} {point.device:6s} "
+            f"{point.snr_db:8.2f}  {point.bler:8.4g}  {point.crc_fail_rate:8.4g}  "
+            f"{point.ber:8.4g}  {point.block_errors}/{point.transport_blocks}  {point.runtime_s:.2f}"
         )
     if sweep.skipped:
         print("Skipped SNR points (BLER reached 0):")
         for point in sweep.skipped:
             print(
-                f"{point.detector:9s} {point.device:6s} {point.snr_db:8.2f}  "
-                f"skipped after BLER 0 at {point.trigger_snr_db:.2f} dB ({point.reason})"
+                f"{point.channel_estimator:13s} {point.detector:14s} {point.device:6s} "
+                f"{point.snr_db:8.2f}  skipped after BLER 0 at {point.trigger_snr_db:.2f} dB "
+                f"({point.reason})"
             )
     print(f"CSV: {csv_path}")
     print(f"Manifest: {manifest_path}")
