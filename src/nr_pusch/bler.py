@@ -12,13 +12,18 @@ from typing import Any, Callable
 
 import sionna.phy
 import torch
+from sionna.phy.channel import time_lag_discrete_time_channel
 
 from .channel import NrPuschCdlChannel
 from .channel_config import ChannelSettings
 from .config import TxSettings
 from .device import use_device
+from .dmrs_prior import (
+    dmrs_prior_compatibility,
+    load_dmrs_tap_power_prior,
+)
 from .noise import add_awgn, add_awgn_resource_grid
-from .receiver import NrPuschRx
+from .receiver import NrPuschRx, _build_dmrs_frequency_basis
 from .simulation_config import BlerSettings
 from .transmitter import NrPuschTx
 
@@ -58,6 +63,64 @@ class BlerSweep:
     points: tuple[BlerPoint, ...]
     skipped: tuple[SkippedPoint, ...]
 
+def estimate_dmrs_tap_power_prior(
+    tx_settings: TxSettings,
+    channel_settings: ChannelSettings,
+    *,
+    l_min: int,
+    max_delay_spread_s: float,
+    num_realizations: int,
+    seed: int,
+    device: str | None,
+) -> torch.Tensor:
+    """Estimate diagonal tap powers from independent CDL channel realizations."""
+    if num_realizations < 1:
+        raise ValueError("num_realizations 必须为正整数")
+    if max_delay_spread_s <= 0:
+        raise ValueError("max_delay_spread_s 必须大于 0")
+    device = use_device(device)
+    sionna.phy.config.seed = seed
+    torch.manual_seed(seed)
+    transmitter = NrPuschTx(tx_settings, device=device)
+    resource_grid = transmitter._tx_freq.resource_grid
+    sample_rate_hz = transmitter.sample_rate_hz
+    _, l_max = time_lag_discrete_time_channel(sample_rate_hz, max_delay_spread_s)
+    basis = _build_dmrs_frequency_basis(
+        resource_grid.fft_size, l_min, int(l_max), device=torch.device(device)
+    )
+    channel = NrPuschCdlChannel(channel_settings, device=device)
+    power_sum = torch.zeros(basis.shape[-1], dtype=torch.float64, device=device)
+    count = 0
+    batch_size = min(8, num_realizations)
+    for start in range(0, num_realizations, batch_size):
+        current_batch = min(batch_size, num_realizations - start)
+        empty_grid = torch.zeros(
+            (
+                current_batch,
+                4,
+                1,
+                resource_grid.num_ofdm_symbols,
+                resource_grid.fft_size,
+            ),
+            dtype=torch.complex64,
+            device=device,
+        )
+        response = channel.apply_frequency(empty_grid, resource_grid).channel_frequency_response
+        # The configured validation channel is static over a slot. Use one
+        # response per UE/RX/realization to avoid counting OFDM symbols as
+        # additional independent channel draws.
+        response = response[:, 0, :, :, 0, 0, :]
+        response_matrix = response.reshape(-1, resource_grid.fft_size).T.contiguous()
+        taps = torch.linalg.lstsq(basis, response_matrix).solution
+        power_sum += taps.abs().square().to(torch.float64).sum(dim=1)
+        count += taps.shape[1]
+    tap_power = (power_sum / count).to(torch.float32)
+    floor = tap_power.max() * 1e-8
+    tap_power = tap_power.clamp_min(floor)
+    if not torch.isfinite(tap_power).all().item() or not torch.all(tap_power > 0).item():
+        raise RuntimeError("CDL tap-power calibration produced an invalid prior")
+    return tap_power
+
 
 def simulate_bler(
     tx_settings: TxSettings,
@@ -81,21 +144,41 @@ def simulate_bler(
 
     transmitter = NrPuschTx(tx_settings, device=device)
     channel = NrPuschCdlChannel(channel_settings, device=device)
+    max_delay_spread_s = (
+        simulation_settings.max_delay_spread_s
+        if simulation_settings.max_delay_spread_s is not None
+        else channel_settings.channel.max_delay_spread_s
+    )
+    dmrs_tap_power_prior = None
+    if simulation_settings.channel_estimator == "dmrs-lmmse":
+        if simulation_settings.dmrs_tap_power_prior_path is None:
+            raise ValueError("dmrs-lmmse 配置必须设置 dmrs_tap_power_prior_path")
+        compatibility = dmrs_prior_compatibility(
+            tx_settings,
+            channel_settings,
+            l_min=simulation_settings.l_min,
+            max_delay_spread_s=max_delay_spread_s,
+            fft_size=transmitter._tx_freq.resource_grid.fft_size,
+            sample_rate_hz=transmitter.sample_rate_hz,
+        )
+        dmrs_tap_power_prior, _ = load_dmrs_tap_power_prior(
+            simulation_settings.dmrs_tap_power_prior_path,
+            expected_compatibility=compatibility,
+            device=device,
+        )
     rx = NrPuschRx(
         tx_settings,
         channel_estimator=simulation_settings.channel_estimator,
+        dmrs_tap_power_prior=dmrs_tap_power_prior,
         l_min=simulation_settings.l_min,
-        max_delay_spread_s=(
-            simulation_settings.max_delay_spread_s
-            if simulation_settings.max_delay_spread_s is not None
-            else channel_settings.channel.max_delay_spread_s
-        ),
+        max_delay_spread_s=max_delay_spread_s,
         num_decoder_iterations=simulation_settings.num_decoder_iterations,
         detector=simulation_settings.detector,
         detector_parameter=simulation_settings.detector_parameters.get(
             simulation_settings.detector, simulation_settings.detector_parameter
         ),
         detector_damping=simulation_settings.detector_damping,
+        estimate_delay=simulation_settings.estimate_delay,
         input_domain=("frequency" if simulation_settings.channel_domain == "frequency" else "time"),
         device=device,
     )

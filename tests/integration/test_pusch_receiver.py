@@ -55,6 +55,7 @@ class PuschReceiverTest(unittest.TestCase):
             settings,
             channel_estimator="dmrs",
             max_delay_spread_s=channel_settings.channel.max_delay_spread_s,
+            estimate_delay=True,
             input_domain="frequency",
             device="cpu",
         )
@@ -65,10 +66,15 @@ class PuschReceiverTest(unittest.TestCase):
             demodulated_grid, noisy.noise_variance
         )
         torch.testing.assert_close(time_h, grid_h, rtol=0, atol=0)
+
         torch.testing.assert_close(time_err, grid_err, rtol=0, atol=0)
         grid_result = grid_rx.receive_frequency_grid(demodulated_grid, noisy.noise_variance)
         torch.testing.assert_close(grid_result.bits, dmrs_result.bits, rtol=0, atol=0)
         self.assertTrue(torch.equal(grid_result.crc_status, dmrs_result.crc_status))
+        self.assertEqual(
+            set(grid_result.metadata["estimated_bulk_delay_samples_by_user"]),
+            {user.name for user in settings.users},
+        )
 
         sic_rx = NrPuschRx(
             settings,
@@ -123,5 +129,8 @@ class PuschReceiverTest(unittest.TestCase):
         torch.testing.assert_close(soft_pic_result.bits, tx_result.bits, rtol=0, atol=0)
         self.assertEqual(soft_pic_result.metadata["detector_feedback_iterations"], 1)
         self.assertEqual(soft_pic_result.metadata["detector_damping"], 0.25)
+
+
+
 if __name__ == "__main__":
     unittest.main()

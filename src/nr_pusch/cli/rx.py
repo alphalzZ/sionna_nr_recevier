@@ -10,9 +10,12 @@ import tomllib
 import numpy as np
 import torch
 
+from nr_pusch.channel_config import ChannelSettings
 from nr_pusch.config import TxSettings
+from nr_pusch.dmrs_prior import dmrs_prior_compatibility, load_dmrs_tap_power_prior
 from nr_pusch.iq import read_matlab_rx_reference, read_matlab_scrambling_sequences
 from nr_pusch.receiver import NrPuschRx
+from nr_pusch.transmitter import NrPuschTx
 
 
 def main() -> None:
@@ -28,10 +31,18 @@ def main() -> None:
         "--input-format", choices=("auto", "npz", "matlab-h5"), default="auto",
         help="Input file format; auto detects HDF5 by extension",
     )
+    parser.add_argument(
+        "--input-domain", choices=("time", "frequency"), default=None,
+        help="NPZ sample domain; defaults to the RX TOML profile",
+    )
     parser.add_argument("--output", required=True, help="Output NPZ with decoded bits and CRC status")
     parser.add_argument("--noise-variance", type=float, default=None, help="AWGN variance; defaults to [receiver] in RX TOML")
-    parser.add_argument("--channel-estimator", choices=("dmrs", "perfect"), default=None)
-    parser.add_argument("--input-domain", choices=("time", "frequency"), default=None)
+    parser.add_argument("--channel-estimator", choices=("dmrs", "dmrs-lmmse", "perfect"), default=None)
+    parser.add_argument(
+        "--channel-config",
+        default=None,
+        help="CDL TOML matching the tap-power prior; required for dmrs-lmmse",
+    )
     parser.add_argument(
         "--detector",
         choices=("lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic"),
@@ -53,10 +64,6 @@ def main() -> None:
     parser.add_argument(
         "--scrambling", default=None,
         help="MATLAB HDF5 file with per-UE scrambling sequences (ue<k>_scrambSeq) for non-RNTI c_init",
-    )
-    parser.add_argument(
-        "--spatial-denoise", action="store_true", default=None,
-        help="Apply dominant-spatial-signature projection to the DMRS channel estimate",
     )
     parser.add_argument(
         "--cb-crc", action="store_true", default=None,
@@ -168,9 +175,6 @@ def main() -> None:
         except (OSError, ValueError) as exc:
             parser.error(f"无法读取 NPZ 接收数据: {exc}")
 
-    spatial_denoise = args.spatial_denoise
-    if spatial_denoise is None:
-        spatial_denoise = bool(receiver_profile.get("spatial_denoise", False))
     track_cb_crc = args.cb_crc
     if track_cb_crc is None:
         track_cb_crc = bool(receiver_profile.get("cb_crc", False))
@@ -185,9 +189,46 @@ def main() -> None:
             parser.error(f"无法读取加扰序列: {exc}")
         scrambling_sequences = torch.from_numpy(sequences)
     settings = TxSettings.from_toml(args.rx_config)
+    dmrs_tap_power_prior = None
+    prior_path_value = receiver_profile.get("dmrs_tap_power_prior_path")
+    if channel_estimator != "dmrs-lmmse" and prior_path_value is not None:
+        parser.error("dmrs_tap_power_prior_path 仅能用于 dmrs-lmmse")
+    if channel_estimator == "dmrs-lmmse":
+        if not isinstance(prior_path_value, str) or not prior_path_value:
+            parser.error("dmrs-lmmse 要求 [receiver] dmrs_tap_power_prior_path")
+        prior_path = Path(prior_path_value)
+        if not prior_path.is_absolute():
+            prior_path = Path(args.rx_config).resolve().parent / prior_path
+        channel_config_value = args.channel_config or receiver_profile.get(
+            "dmrs_tap_power_prior_channel_config_path"
+        )
+        if not isinstance(channel_config_value, str) or not channel_config_value:
+            parser.error("dmrs-lmmse 严格兼容性检查要求 --channel-config")
+        channel_config_path = Path(channel_config_value)
+        if not channel_config_path.is_absolute():
+            channel_config_path = Path(args.rx_config).resolve().parent / channel_config_path
+        try:
+            channel_settings = ChannelSettings.from_toml(channel_config_path)
+            tx_preview = NrPuschTx(settings, device=args.device)
+            compatibility = dmrs_prior_compatibility(
+                settings,
+                channel_settings,
+                l_min=l_min,
+                max_delay_spread_s=max_delay_spread_s,
+                fft_size=tx_preview._tx_freq.resource_grid.fft_size,
+                sample_rate_hz=tx_preview.sample_rate_hz,
+            )
+            dmrs_tap_power_prior, _ = load_dmrs_tap_power_prior(
+                prior_path,
+                expected_compatibility=compatibility,
+                device=args.device,
+            )
+        except (OSError, ValueError, KeyError) as exc:
+            parser.error(f"无法加载匹配的 DMRS tap-power prior: {exc}")
     receiver = NrPuschRx(
         settings,
         channel_estimator=channel_estimator,
+        dmrs_tap_power_prior=dmrs_tap_power_prior,
         detector=detector,
         detector_parameter=detector_parameter,
         detector_damping=detector_damping,
@@ -196,7 +237,6 @@ def main() -> None:
         l_min=l_min,
         device=args.device,
         scrambling_sequences=scrambling_sequences,
-        spatial_denoise=spatial_denoise,
         estimate_delay=estimate_delay,
         track_cb_crc=track_cb_crc,
     )

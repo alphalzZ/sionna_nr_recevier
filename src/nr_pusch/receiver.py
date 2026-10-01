@@ -858,6 +858,25 @@ class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
         return llr_final
 
 
+def _build_dmrs_frequency_basis(
+    num_subcarriers: int,
+    l_min: int,
+    l_max: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the centered-FFT frequency response basis for discrete taps."""
+    centered_bins = (
+        torch.arange(num_subcarriers, dtype=torch.float32, device=device)
+        - num_subcarriers // 2
+    )
+    lags = torch.arange(l_min, l_max + 1, dtype=torch.float32, device=device)
+    return torch.exp(
+        (-2j * torch.pi / num_subcarriers) * centered_bins[:, None] * lags[None, :]
+    )
+
+
+
 class DftSOfdmDmrsEstimator(torch.nn.Module):
     """Fit frequency-domain OCC DMRS to a finite-tap channel basis.
 
@@ -874,13 +893,12 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
         resource_grid,
         l_min: int,
         l_max: int,
-        spatial_denoise: bool = False,
         estimate_delay: bool = False,
+        tap_power_prior: torch.Tensor | None = None,
     ):
         super().__init__()
-        self._spatial_denoise = spatial_denoise
-        self._spatial_keep_dc = False
         self._estimate_delay = estimate_delay
+        self.last_channel_estimate: torch.Tensor | None = None
         self.last_offsets: torch.Tensor | None = None
         # [user, num_subcarriers] template from the actual DFT-s-OFDM mapper.
         if pilot_grid.ndim != 2 or pilot_grid.shape[0] != 4:
@@ -889,6 +907,14 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
         self._num_subcarriers = pilot_grid.shape[-1]
         self._num_ofdm_symbols = resource_grid.num_ofdm_symbols
         self._num_taps = l_max - l_min + 1
+        if tap_power_prior is not None:
+            tap_power_prior = torch.as_tensor(tap_power_prior, device=pilot_grid.device)
+            if tap_power_prior.is_complex() or tuple(tap_power_prior.shape) != (self._num_taps,):
+                raise ValueError("DMRS tap-power prior 必须是长度等于候选 taps 的实向量")
+            tap_power_prior = tap_power_prior.to(dtype=pilot_grid.real.dtype)
+            if not torch.isfinite(tap_power_prior).all().item() or not torch.all(tap_power_prior > 0).item():
+                raise ValueError("DMRS tap-power prior 必须全部为正有限值")
+        self.register_buffer("_tap_power_prior", tap_power_prior)
         mask = resource_grid.pilot_pattern.mask[0, 0]
         dmrs_symbols = torch.where(mask.sum(dim=-1) > 0)[0]
         if dmrs_symbols.numel() != 1:
@@ -905,14 +931,15 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
             raise ValueError("当前 DMRS 估计要求四个用户组成两组共享 comb 的正交端口")
 
         self._pairs: list[tuple[int, int, str, str, str]] = []
-        target_bins = torch.arange(self._num_subcarriers, dtype=torch.float32, device=pilot_grid.device)
-        centered_bins = target_bins - self._num_subcarriers // 2
-        lags = torch.arange(l_min, l_max + 1, dtype=torch.float32, device=pilot_grid.device)
-        frequency_basis = torch.exp(
-            (-2j * torch.pi / self._num_subcarriers) * centered_bins[:, None] * lags[None, :]
+        frequency_basis = _build_dmrs_frequency_basis(
+            self._num_subcarriers, l_min, l_max, device=pilot_grid.device
         )
         self.register_buffer("_frequency_basis", frequency_basis)
-        self.register_buffer("_frequency_bins", centered_bins)
+        self.register_buffer(
+            "_frequency_bins",
+            torch.arange(self._num_subcarriers, dtype=torch.float32, device=pilot_grid.device)
+            - self._num_subcarriers // 2,
+        )
         for support_tuple, users in support_groups.items():
             support = torch.tensor(support_tuple, dtype=torch.long, device=pilot_grid.device)
             if support.numel() < 2 * self._num_taps:
@@ -944,28 +971,79 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
             self.register_buffer(covariance_name, covariance)
             self._pairs.append((base, partner, design_name, support_name, covariance_name))
 
-    @staticmethod
-    def _spatial_signature(
-        h_freq: torch.Tensor, noise_variance: torch.Tensor, keep_dc: bool
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rank-1 spatial projection of the per-subcarrier LS estimate.
 
-        ``h_freq`` is ``[batch, rx_antenna, subcarrier]``. The dominant
-        eigenvector of the wideband spatial covariance gives the user's beam;
-        projecting every subcarrier onto it and rebuilding the estimate keeps
-        only that spatial component, so per-antenna noise on the orthogonal
-        directions is dropped. Returns the projected estimate and the residual
-        power per antenna, which replaces the tap-fit error variance.
-        """
-        centered = h_freq - h_freq.mean(dim=-1, keepdim=True) if not keep_dc else h_freq
-        noise_diagonal = torch.diag_embed(noise_variance.to(h_freq.dtype))
-        covariance = centered @ centered.transpose(-1, -2).conj() + noise_diagonal
-        _, eigenvectors = torch.linalg.eigh(covariance)
-        signature = eigenvectors[..., -1:]                       # [batch, rx, 1]
-        projection = (signature.conj().transpose(-1, -2) @ h_freq).squeeze(1)
-        enhanced = projection.unsqueeze(1) * signature
-        residual = (h_freq - enhanced).abs().square().mean(dim=-1)
-        return enhanced, residual
+    def _fit_pair(
+        self, design: torch.Tensor, rhs: torch.Tensor, no: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Fit two OCC users and return taps plus optional posterior covariance."""
+        batch, num_rx_ant = no.shape[0], no.shape[-1]
+        num_coefficients = 2 * self._num_taps
+        if self._tap_power_prior is None:
+            taps = torch.linalg.lstsq(design, rhs).solution
+            return (
+                taps.reshape(num_coefficients, batch, num_rx_ant).permute(1, 2, 0),
+                None,
+            )
+
+        # A R Aᴴ has a large null space when the pilot count exceeds the
+        # candidate tap count. At high SNR its regularizing σ²I eigenvalues
+        # approach float32 precision, so solve the posterior in complex128.
+        work_dtype = torch.complex128 if design.dtype == torch.complex64 else design.dtype
+        work_design = design.to(dtype=work_dtype)
+        work_rhs = rhs.to(dtype=work_dtype)
+        sigma2 = no[:, 0, :].reshape(-1).to(dtype=work_design.real.dtype)
+        if not torch.isfinite(sigma2).all().item() or torch.any(sigma2 < 0).item():
+            raise ValueError("DMRS LMMSE noise variance 必须为非负有限值")
+        tap_power = torch.cat((self._tap_power_prior, self._tap_power_prior)).to(
+            dtype=work_design.real.dtype, device=design.device
+        )
+        tap_power_complex = tap_power.to(dtype=work_dtype)
+        a_r = work_design * tap_power_complex[None, :]
+        a_r_ah = a_r @ work_design.mH
+        identity = torch.eye(
+            design.shape[0], dtype=work_dtype, device=design.device
+        )
+        taps_flat = torch.zeros(
+            (num_coefficients, batch * num_rx_ant),
+            dtype=work_dtype,
+            device=design.device,
+        )
+        posterior_flat = torch.zeros(
+            (batch * num_rx_ant, num_coefficients, num_coefficients),
+            dtype=work_dtype,
+            device=design.device,
+        )
+        zero_indices = torch.where(sigma2 == 0)[0]
+        if zero_indices.numel():
+            taps_flat[:, zero_indices] = torch.linalg.lstsq(
+                work_design, work_rhs.index_select(1, zero_indices)
+            ).solution
+        noisy_indices = torch.where(sigma2 > 0)[0]
+        if noisy_indices.numel():
+            sigma2_noisy = sigma2.index_select(0, noisy_indices)
+            system = a_r_ah.unsqueeze(0) + sigma2_noisy[:, None, None] * identity
+            rhs_noisy = (
+                work_rhs.index_select(1, noisy_indices).transpose(0, 1).unsqueeze(-1)
+            )
+            solved_rhs = torch.linalg.solve(system, rhs_noisy)
+            a_r_h = a_r.mH
+            taps_flat[:, noisy_indices] = torch.matmul(
+                a_r_h.unsqueeze(0), solved_rhs
+            ).squeeze(-1).transpose(0, 1)
+            solved_a_r = torch.linalg.solve(
+                system, a_r.unsqueeze(0).expand(noisy_indices.numel(), -1, -1)
+            )
+            posterior = torch.diag(tap_power_complex).unsqueeze(0) - torch.matmul(
+                a_r_h.unsqueeze(0), solved_a_r
+            )
+            posterior_flat[noisy_indices] = posterior
+        return (
+            taps_flat.reshape(num_coefficients, batch, num_rx_ant)
+            .permute(1, 2, 0)
+            .to(dtype=design.dtype),
+            posterior_flat.reshape(batch, num_rx_ant, num_coefficients, num_coefficients)
+            .to(dtype=design.dtype),
+        )
 
     @staticmethod
     def _estimate_offsets(h_freq: torch.Tensor) -> torch.Tensor:
@@ -1005,6 +1083,12 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
             no = no.unsqueeze(1)
         no = torch.broadcast_to(no, (batch, num_rx, num_rx_ant))
         err_var = torch.zeros_like(h_hat.real)
+        self.last_offsets = None
+        offsets = (
+            torch.empty((batch, 4, num_rx_ant), dtype=y.real.dtype, device=y.device)
+            if self._estimate_delay
+            else None
+        )
         y_pilot = y[:, 0, :, self._dmrs_symbol, :]
         for base, partner, design_name, support_name, covariance_name in self._pairs:
             design = getattr(self, design_name).to(y.device)
@@ -1012,36 +1096,38 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
             covariance = getattr(self, covariance_name).to(y.device)
             observations = y_pilot.index_select(-1, support)
             rhs = observations.permute(2, 0, 1).reshape(support.numel(), -1)
-            taps = torch.linalg.lstsq(design, rhs).solution
-            taps = taps.reshape(2 * self._num_taps, batch, num_rx_ant).permute(1, 2, 0)
+            taps, posterior = self._fit_pair(design, rhs, no)
             for user, tap_slice in (
                 (base, slice(0, self._num_taps)),
                 (partner, slice(self._num_taps, 2 * self._num_taps)),
             ):
                 user_taps = taps[..., tap_slice]
                 h_freq = user_taps @ self._frequency_basis.to(y.device).T
-                if self._estimate_delay:
-                    self.last_offsets = self._estimate_offsets(h_freq)
-                if self._spatial_denoise:
-                    h_freq, residual = self._spatial_signature(
-                        h_freq, no[:, 0], keep_dc=self._spatial_keep_dc
-                    )
+                if offsets is not None:
+                    offsets[:, user] = self._estimate_offsets(h_freq)
+                frequency_basis = self._frequency_basis.to(y.device)
+                if posterior is None:
+                    covariance_user = covariance[tap_slice, tap_slice]
+                    frequency_error = torch.einsum(
+                        "nl,lm,nm->n", frequency_basis, covariance_user,
+                        frequency_basis.conj()
+                    ).real.clamp_min(0.0)
+                    estimation_error = no[:, 0, :, None] * frequency_error[None, None, :]
+                else:
+                    covariance_user = posterior[:, :, tap_slice, tap_slice]
+                    estimation_error = torch.einsum(
+                        "nl,balm,nm->ban", frequency_basis, covariance_user,
+                        frequency_basis.conj()
+                    ).real.clamp_min(0.0)
                 h_hat[:, 0, :, user, 0, :, :] = h_freq.unsqueeze(-2).expand(
                     -1, -1, self._num_ofdm_symbols, -1
                 )
-                cov_user = covariance[tap_slice, tap_slice]
-                basis = self._frequency_basis.to(y.device)
-                frequency_error = torch.einsum(
-                    "nl,lm,nm->n", basis, cov_user, basis.conj()
-                ).real.clamp_min(0.0)
-                if self._spatial_denoise:
-                    err_var[:, 0, :, user, 0, :, :] = residual[:, :, None, None].expand(
-                        -1, -1, self._num_ofdm_symbols, -1
-                    )
-                else:
-                    err_var[:, 0, :, user, 0, :, :] = (
-                        no[:, 0, :, None] * frequency_error[None, None, :]
-                    ).unsqueeze(-2).expand(-1, -1, self._num_ofdm_symbols, -1)
+                estimation_error = estimation_error.unsqueeze(-2).expand(
+                    -1, -1, self._num_ofdm_symbols, -1
+                )
+                err_var[:, 0, :, user, 0, :, :] = estimation_error
+        self.last_channel_estimate = h_hat.detach()
+        self.last_offsets = offsets
         return h_hat, err_var
 
 
@@ -1071,8 +1157,8 @@ class NrPuschRx:
     """Decode time-domain captures or simulated samples for four PUSCH users.
 
     ``channel_estimator="dmrs"`` estimates the initial static-slot profile
-    from its orthogonal transform-precoded DMRS. ``"perfect"`` consumes the
-    simulated CDL taps as a reference/upper-bound mode.
+    with OCC least squares. ``"dmrs-lmmse"`` applies a CDL tap-power prior;
+    ``"perfect"`` consumes simulated CDL CSI as an upper bound.
     """
 
     def __init__(
@@ -1080,10 +1166,10 @@ class NrPuschRx:
         settings: TxSettings,
         *,
         channel_estimator: str = "dmrs",
+        dmrs_tap_power_prior: torch.Tensor | None = None,
         l_min: int = -6,
         max_delay_spread_s: float = 3e-6,
         num_decoder_iterations: int = 20,
-        spatial_denoise: bool = False,
         estimate_delay: bool = False,
         track_cb_crc: bool = False,
         detector: str = "lmmse",
@@ -1096,8 +1182,12 @@ class NrPuschRx:
         settings.validate()
         if settings.pusch.waveform != "dft_s_ofdm":
             raise NotImplementedError("当前接收机仅支持仓库配置的 DFT-s-OFDM PUSCH")
-        if channel_estimator not in {"perfect", "dmrs"}:
-            raise ValueError("channel_estimator 仅支持 perfect 或 dmrs")
+        if channel_estimator not in {"perfect", "dmrs", "dmrs-lmmse"}:
+            raise ValueError("channel_estimator 仅支持 perfect、dmrs 或 dmrs-lmmse")
+        if channel_estimator == "dmrs-lmmse" and dmrs_tap_power_prior is None:
+            raise ValueError("dmrs-lmmse 模式必须提供 dmrs_tap_power_prior")
+        if channel_estimator != "dmrs-lmmse" and dmrs_tap_power_prior is not None:
+            raise ValueError("dmrs_tap_power_prior 仅能用于 dmrs-lmmse 模式")
         if input_domain not in {"time", "frequency"}:
             raise ValueError("input_domain 仅支持 time 或 frequency")
         if num_decoder_iterations < 1:
@@ -1177,7 +1267,7 @@ class NrPuschRx:
             detector_block = DftSOfdmMimoDetector(
                 tx, stream_management, detector, detector_parameter
             )
-        if channel_estimator == "dmrs":
+        if channel_estimator in {"dmrs", "dmrs-lmmse"}:
             template_tx = NrPuschTx(settings, device=device)
             zero_bits = torch.zeros(
                 (1, len(settings.users), int(template_tx.transport_block_size)),
@@ -1193,8 +1283,8 @@ class NrPuschRx:
                 tx.resource_grid,
                 l_min=l_min,
                 l_max=l_max,
-                spatial_denoise=spatial_denoise,
                 estimate_delay=estimate_delay,
+                tap_power_prior=dmrs_tap_power_prior,
             )
         else:
             estimator = "perfect"
@@ -1225,7 +1315,6 @@ class NrPuschRx:
         elif detector == "ep" and detector_parameter is None:
             self.detector_parameter = 10
         self.detector_damping = detector_damping
-        self.spatial_denoise = spatial_denoise
         self.estimate_delay = estimate_delay
         self._estimator = estimator
         self.track_cb_crc = track_cb_crc
@@ -1341,10 +1430,16 @@ class NrPuschRx:
             ]
             self._cb_crc_status.clear()
         delay_metadata = {}
-        if self.channel_estimator == "dmrs" and getattr(self._estimator, "last_offsets", None) is not None:
-            delay_metadata["estimated_bulk_delay_samples"] = (
-                self._estimator.last_offsets[0].detach().cpu().tolist()
-            )
+        if (
+            self.channel_estimator in {"dmrs", "dmrs-lmmse"}
+            and getattr(self._estimator, "last_offsets", None) is not None
+        ):
+            offsets = self._estimator.last_offsets[0].detach().cpu().tolist()
+            delay_metadata["estimated_bulk_delay_samples"] = offsets[-1]
+            delay_metadata["estimated_bulk_delay_samples_by_user"] = {
+                user.name: offsets[index]
+                for index, user in enumerate(self.settings.users)
+            }
         sic_metadata = {}
         if self.detector == "lmmse-sic":
             sic_detector = self._receiver._mimo_detector
@@ -1381,8 +1476,13 @@ class NrPuschRx:
             "decoder": "Sionna NR TBDecoder",
             "cb_crc_status": cb_crc_status,
             "delay_estimation": self.estimate_delay,
-            "spatial_signature_denoise": self.spatial_denoise,
-            "channel_estimator": "perfect CDL CSI" if self.channel_estimator == "perfect" else "DFT-s-OFDM frequency DMRS OCC LS tap fit",
+            "channel_estimator": (
+                "perfect CDL CSI"
+                if self.channel_estimator == "perfect"
+                else "DFT-s-OFDM frequency DMRS OCC tap-domain LMMSE"
+                if self.channel_estimator == "dmrs-lmmse"
+                else "DFT-s-OFDM frequency DMRS OCC LS tap fit"
+            ),
             "crc_status_axes": ["batch", "user"],
             "bits_axes": ["batch", "user", "transport_block_bit"],
             "constellation_axes": ["batch", "user", "qam_symbol"],

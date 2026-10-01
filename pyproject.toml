@@ -18,6 +18,7 @@ nr-pusch-tx = "nr_pusch.cli.tx:main"
 nr-pusch-channel = "nr_pusch.cli.channel:main"
 nr-pusch-bler = "nr_pusch.cli.bler:main"
 nr-pusch-rx = "nr_pusch.cli.rx:main"
+nr-pusch-estimator-validation = "nr_pusch.cli.estimator_validation:main"
 nr-pusch-web = "nr_pusch.cli.web:main"
 
 [tool.setuptools.packages.find]

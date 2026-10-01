@@ -32,9 +32,23 @@ nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /tmp/pusch_rx_grid.npz --
 
 ## 多用户接收和 BLER
 
-`NrPuschRx` 使用 Sionna PUSCH TB 解码器、4×4 MIMO 检测，以及 DFT-s-OFDM 每数据符号的逆 DFT。时域 IQ 先由 Sionna OFDM 解调为资源网格；直接加载的频域网格跳过这一步。两种输入随后共用同一个频域 DMRS 估计器：利用发送端实际映射的低 PAPR DMRS 和 OCC 端口序列，对每对共享 comb 的用户做联合 LS 拟合，输出各子载波频响和估计误差方差。其流程遵循 [Sionna OFDM MIMO 信道估计与检测教程](https://nvlabs.github.io/sionna/phy/tutorials/notebooks/OFDM_MIMO_Detection.html) 的资源网格导频估计与检测接口；Sionna 原生 PUSCH 导频序列与本仓库的 DFT-s-OFDM 序列不同，因此此处保留自定义的 OCC 处理。`perfect` 模式直接使用仿真 CDL CSI，仅用于上界对照。
+`NrPuschRx` 使用 Sionna PUSCH TB 解码器、4×4 MIMO 检测，以及 DFT-s-OFDM 每数据符号的逆 DFT。时域 IQ 先由 Sionna OFDM 解调为资源网格；直接加载的频域网格跳过这一步。两种输入共用频域 DMRS 估计接口：默认 `channel_estimator="dmrs"` 用发送端实际映射的低 PAPR DMRS 和 OCC 端口序列，对每对共享 comb 的用户做联合 LS 拟合，输出各子载波频响和估计误差方差；显式 `dmrs-lmmse` 模式在相同设计矩阵上使用 CDL tap-power prior 和后验协方差。Sionna 原生 PUSCH 导频序列与本仓库的 DFT-s-OFDM 序列不同，因此保留自定义 OCC 处理。`perfect` 模式直接使用仿真 CDL CSI，仅用于上界对照。
 
 DMRS 的 LS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围：当前为 18 MHz 采样率下的 `-6..60`，共 67 taps。这是接收机的时延范围先验，不读取本帧的真实信道系数。单个 DMRS 符号的估计扩展到整个 slot，适用于当前零速静态 CDL profile；高 Doppler 或多 DMRS 配置需扩展时频插值并用抓包参考验证。
+
+### CDL tap-power LMMSE 验证
+
+`dmrs-lmmse` 是显式 opt-in；现有 `dmrs` 默认、活动 TX/CDL profile 和 DMRS 资源均不变。prior 仅由独立训练 seed 下的 CDL realization 拟合，不使用开发/holdout 信道、payload 或 CRC。主验证固定单符号 DMRS 与 `soft-mmse-pic` 检测器，每帧只生成一次 payload、CDL realization 和 AWGN，再配对运行 LS、LMMSE 和 perfect-CSI 三臂；增加 DMRS 符号不能满足优化验收。
+
+短时连通性验证（`--frames-per-snr` 只覆盖 development/holdout，60 dB 安全检查仍使用配置中的 64 帧）：
+
+```bash
+nr-pusch-estimator-validation --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38_901_4x4.toml --validation-config configs/channel_estimation_validation.toml --output /tmp/channel_estimation_smoke.json --device cpu --prior-realizations 8 --frames-per-snr 2
+```
+
+预注册的正式运行去掉两个 smoke 覆盖参数；`configs/channel_estimation_validation.toml` 固定训练 256 个独立 realization、development 512 帧/SNR、holdout 3,000 帧/SNR、25/30 dB 和 60 dB/64 帧。JSON、paired frame NPZ、tap prior NPZ 写到同 basename 的 `/tmp/channel_estimation_validation.*`。仅当 holdout 的 25/30 dB 两点 BLER 都至少相对降低 10%、paired frame-cluster bootstrap 的 97.5% 单侧差值上界都小于 0、data-RE CSI NMSE 两点都下降，且 60 dB TB errors 不高于基线时，才报告通过；`perfect` 只作同帧上界。失败时保留当前默认且不宣称优化。
+
+常规 `nr-pusch-bler` 的 `[bler]` 可设置 `channel_estimator = "dmrs-lmmse"` 和 `dmrs_tap_power_prior_path`；相对路径以该 TOML 所在目录为基准。`nr-pusch-rx` 的 `[receiver]` 同样读取 `dmrs_tap_power_prior_path`，并要求 `--channel-config` 提供 prior 对应的 CDL TOML，以对 TX、CDL、抽头窗、FFT 和采样率做精确兼容检查。prior 缺失或不兼容会报错，不会回退到 LS。
 
 检测器可选 `lmmse`、`lmmse-sic`、`k-best`、`mmse-pic`、`soft-mmse-pic` 和 `ep`。`detector_parameter` 对 `mmse-pic` 表示 QAM-PIC 轮数，对 `soft-mmse-pic` 表示 LDPC 外反馈轮数；BLER 支持用 `detector_parameters` 分别配置，CLI 也提供 `--detector`、`--detector-parameter` 和 `--detector-damping`。`k-best` 和 `ep` 均先做频域 LMMSE 预均衡并 IDFT；每个时域采样点建立四流空间模型，频率变化与等化噪声合并为残余 ISI 协方差。K-best 在该模型上搜索有限星座路径。EP 则为四个 QAM 用户维护复高斯近似因子，以 cavity 分布对离散星座做矩匹配，并对因子参数阻尼迭代，最后由后验均值和方差形成软 LLR。`mmse-pic` 从时域 LLR 计算软星座期望，DFT 回频域后并行消除其他 UE，并更新 LLR；它不调用 LDPC 译码器做检测反馈。`soft-mmse-pic` 在相同初始 LMMSE 检测后运行 LDPC BP，以码块位序的 posterior-minus-channel 外信息反馈；取消时将当前检测器 LLR 与已阻尼的 LDPC 外信息组合为其他 UE 的软符号概率，对目标 UE 使用天线噪声加权单流 LMMSE，并由最终检测器 LLR 经原 TBDecoder 给出 TB/CB CRC。其默认外反馈轮数为 1、阻尼为 0.25，独立于旧 `mmse-pic` 的 4 轮默认值；默认 BLER 与抓包 profile 不切换。`lmmse-sic` 按估计信道功率从强到弱处理 UE：仅在该 UE CRC 通过时重编码、重构其 DFT-s-OFDM 资源网格并消除干扰。单次接收 JSON sidecar 会记录 SIC 检测顺序和每个 UE 消除前的 CRC 状态。BLER 配置中的 `detectors` 会按相同 seed、CDL、SNR 和 payload 顺序比较检测器；例如 `{ "k-best" = 16, "mmse-pic" = 4, "soft-mmse-pic" = 1, "ep" = 10 }`。
 
@@ -140,7 +154,7 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 抓包分析中 `bit_errors` 只是与参考链路载荷的比对值，不能单独作为译码正确的判据：参考链路自身可能CRC 失败。sidecar 的 `reference_comparison` 因此同时记录 `crc_status`、`crc_verified_users` 和说明，CLI 也会在出现“CRC 通过但与参考不一致”的用户时显式提示。BLER 仿真不涉及该问题，因为发送与接收使用同一套比特。
 
-接收端还有两个与 MATLAB 参考链路对齐的可选处理，默认关闭，实测效果如下（判据只用 CRC）：`--estimate-delay` 按“FFT 峰值 + 抛物线插值”估计每根天线的整体时延（单位：采样），只写入 JSON sidecar 的 `estimated_bulk_delay_samples`，不改动 CSI，因此结果与基线完全一致（4/4、4/4、3/4）；把该时延作为相位斜坡补回 CSI 会使两个正常抓包从 4/4 掉到 1/4，说明当前整数抽头栅格已经足以承载该信道，正确的补偿需要按天线做分数时延重拟合而不是后置旋转。`--spatial-denoise` 实现“宽带空间协方差 → 主特征向量空间签名 → 逐子载波投影重构”，实测把两个正常抓包从 4/4 降到 3/4，对 `RxTestVectorCase78914` 无效（3/4 不变），因为该抓包每用户在 4 根天线上的信道并非秩一。两级 CPE 相位补偿（盲四阶矩 + 判决引导）按参考实现接入后同样使 4/4 降到 3/4，且在 `RxTestVector.h5` 上出现非有限值，故未保留。
+接收端的 `--estimate-delay` 是诊断选项：用“FFT 峰值 + 抛物线插值”估计每个 UE、每根接收天线的整体时延（采样），仅写入 JSON sidecar 的 `estimated_bulk_delay_samples_by_user` 和兼容字段 `estimated_bulk_delay_samples`，不修正 CSI。单独开启时译码结果应与基线一致；把估计时延事后作为相位斜坡补回 CSI 会使正常抓包退化，正确补偿需要按天线进行分数时延重拟合。空间签名投影实验没有带来收益且会导致低信噪比译码退化，因此对应的实现、CLI 选项和专用测试已清理。两级 CPE 相位补偿（盲四阶矩 + 判决引导）按参考实现接入后也使 4/4 降到 3/4，且在 `RxTestVector.h5` 上出现非有限值，故未保留。
 
 MATLAB 抓包还可能使用与 RNTI 无关的 `c_init` 加扰，此时标准解扰器必然解不出 TB。`nr-pusch-rx --scrambling <h5>` 读取每用户 `ue<k>_scrambSeq`（长度须等于 TB 编码后的 46,800 bit）并替换 TB 解码器的解扰器；sidecar 的 `scrambling_source` 记录所用来源，profile 本身不携带序列。译码判据只取本机 CRC：抓包 H5 里的 `ue*_tx_bits` 来自参考链路，参考链路自身 CRC 失败时该载荷不可信。
 

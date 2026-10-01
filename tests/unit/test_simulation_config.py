@@ -92,6 +92,33 @@ class BlerSettingsTest(unittest.TestCase):
         self.assertEqual(settings.l_min, -44)
         self.assertEqual(settings.max_delay_spread_s, 2e-6)
 
+    def test_dmrs_lmmse_requires_and_resolves_prior_path(self):
+        common = [
+            "[bler]",
+            "snr_db = [25.0]",
+            "batch_size = 1",
+            "max_frames_per_snr = 1",
+            "target_block_errors = 1",
+            "seed = 1",
+            "num_decoder_iterations = 1",
+            'channel_estimator = "dmrs-lmmse"',
+            'detector = "soft-mmse-pic"',
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "validation.toml"
+            config_path.write_text("\n".join(common), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "dmrs_tap_power_prior_path"):
+                BlerSettings.from_toml(config_path)
+            config_path.write_text(
+                "\n".join(common + ['dmrs_tap_power_prior_path = "artifacts/prior.npz"']),
+                encoding="utf-8",
+            )
+            settings = BlerSettings.from_toml(config_path)
+        self.assertEqual(
+            settings.dmrs_tap_power_prior_path,
+            str((Path(directory) / "artifacts" / "prior.npz").resolve()),
+        )
+
     def test_rejects_invalid_receiver_window(self):
         common = dict(
             snr_db=(10.0,), batch_size=1, max_frames_per_snr=1, target_block_errors=1,

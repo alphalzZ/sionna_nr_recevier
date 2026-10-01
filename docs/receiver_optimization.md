@@ -5,6 +5,7 @@
 ## 1. 结论与适用边界
 
 - 当前已保留的改进是**调整高码率抓包的 DMRS 有限抽头拟合窗口**，不是一个已完成的自适应波束检测器：窗口从默认下界 `l_min=-6` 移至 `-44`，`max_delay_spread_s=2e-6`，保持 MMSE-PIC、8 次迭代、阻尼 0.5、接收噪声方差 0.0003。该抓包由 **2/4 提升到 3/4 TB CRC**；ue2 的码块从 0/6 提升到 6/6，ue3 仍为 0/6。**4/4 尚未实现**。
+- 2026-10-01 完成当前 CDL-A/4 UE/MCS 20 的预注册 tap-power LMMSE 配对 holdout：25/30 dB BLER 分别降低 12.52%/11.89%，两点配对 97.5% 单侧上界均小于 0，data-RE CSI NMSE 也下降；60 dB 未回归。**仅保留为显式 `dmrs-lmmse` opt-in**，现有 `dmrs` 默认与 H5 抓包 profile 不变；测量细节见 §3.5。
 - 2026-09-29 一轮结构化诊断（约 150 组配置）未能把 ue3 推过 2/6 CB，并已排除 SNR、CSI 偏差、DMRS 端口映射、扰码、检测器选择、PIC/LDPC 轮数、`err_var` 标定、CP 截断与逐符号跟踪等方向；ue3 的 `|h|²`、`err_var/|h|²` 和导频拟合残差都是四 UE 中最优的，单流 QAM 距离也与能解码的 ue2 同档，却 0/6 CB。结论与测量见 §3.1，**下一轮应先核对数据本身而非继续调参**。
 - 低码率抓包统一沿用 `rx_pusch_4ue.toml`，没有把高码率抓包专用的窗口强加给其他抓包：`RxTestVector.h5` 为 4/4，`Case11121314` 为 4/4，`Case78914` 为 3/4（ue0 未通过）。
 - 本接收机目前假定 4 UE、每 UE 1 层、4 根接收天线、一个 DMRS OFDM 符号、两组各两个 UE 的共享 comb/OCC、配置对应的完整 DFT-s-OFDM 数据符号。只有这些几何条件通过代码检查；不代表支持任意 NR PUSCH 配置。
@@ -52,7 +53,7 @@ $$
 
 `l_max` 使用 Sionna 的 `time_lag_discrete_time_channel(sample_rate_hz,max_delay_spread_s)` 确定；在本抓包 18 MHz 下，2 µs 对应 `l_max=42`，所以高码率 profile 的拟合窗口是 **[-44,42]，共 87 个抽头/UE**。默认 `l_min=-6`、3 µs 则是 [-6,60]。改变 `l_min` 不等于事后给现有 CSI 乘一条相位斜坡：它直接改变了**联合拟合的列空间**，会改变两个共享 comb 用户的分离、插值偏差和噪声传播。这是此次 ue2 恢复的可重复配置变化；无法仅凭 CRC 将原因唯一归结为某一条物理路径。
 
-可选的 `--estimate-delay` 是输出诊断：从频响 FFT 峰值和抛物线插值计算接收天线的 bulk offset，**不修正 CSI**。当前实现按用户循环时会覆盖 `last_offsets`，sidecar 最终只记录**最后处理的用户**在各天线上的估计，不是完整的四用户时延表。可选 `--spatial-denoise` 把每用户跨天线频响投影到宽带空间协方差的主特征向量，等价于强加近似秩一空间签名；这两个开关默认都关闭。
+可选的 `estimate_delay` 是输出诊断：从频响 FFT 峰值和抛物线插值计算每个 UE、每根接收天线的 bulk offset，**不修正 CSI**，因此单独开启不应改变译码输出。sidecar 同时保留兼容字段 `estimated_bulk_delay_samples`（最后一个 UE）和完整的 `estimated_bulk_delay_samples_by_user`。
 
 ### 2.3 频域 LMMSE、逆扩频和 MMSE-PIC
 
@@ -120,7 +121,7 @@ Sionna `TBDecoder` 对 MIMO detector 的 46,800 bit/UE LLR 解扰、逆交织/�
 | 波束分组与 CRC 门控抵消（未保留） | 测试每 UE 主接收天线分配、0/1 与 2/3 波束对、按已通过 CRC 的 TB 重编码并拟合有限抽头泄漏后抵消。试验性 beam-SIC 在调优 profile 下仅 **2/4**，比 MMSE-PIC 的 3/4 差；有版本把已抵消用户的 CSI 列直接置零，产生非有限 LLR。 | 已删除实验检测器；不能靠置零列“屏蔽”流而继续使用要求非奇异有效噪声的等化/解映射。以后应实现真正的活动流子系统并保留 CRC 验证。 |
 | 已验证用户的波形重构 / 数据辅助 LS（未保留） | 通过 CRC 的 UE 可以用同一扰码重编码；尝试以部分后续数据 OFDM 符号的 RE 做多用户有限抽头重拟合，再与初始 CSI 混合，或重做检测。观察到训练残差可下降，**没有得到 ue3 的 TB CRC**，较强混合还使其他 UE 失效。 | 拟合残差下降不是译码改善的充分条件；低置信 UE 的判决不可作为无误导频，且必须做未参与拟合的 RE/符号验证。 |
 | 早期符号跟踪 / 单用户抵消（未保留） | ue3 的混合窗口版本只剩首个 CB 失败；尝试前几个 OFDM 符号的判决引导幅相调整、符号 LLR 重加权，以及重构并抵消 ue0–2 后对 ue3 用不同 RX 天线组合做单流匹配滤波/解映射。 | 实验均未使 ue3 TB CRC 通过；不能据此断言物理上没有早期符号失真，仅说明这些模型和参数没有修好。 |
-| 延迟补偿、空间秩一去噪、CPE（未保留或默认关） | `--estimate-delay` 只输出峰值诊断不改 CSI；直接把估计 offset 作为相位斜坡补偿曾使低码率正常抓包从 4/4 降到 1/4。`--spatial-denoise` 的秩一投影使两个原 4/4 抓包降为 3/4。盲四阶矩/判决引导 CPE 原型也曾使 4/4 降为 3/4，并出现非有限值。 | 不要仅凭某一接收天线主径就假定每 UE 4 天线信道严格秩一；相位补偿需与拟合窗/分数时延模型一致。CPE 原型未合入。 |
+| 延迟补偿、空间投影、CPE（未保留） | `--estimate-delay` 只输出峰值诊断不改 CSI；直接把估计 offset 作为相位斜坡补偿曾使低码率正常抓包从 4/4 降到 1/4。历史秩一空间投影使两个原 4/4 抓包降为 3/4；对应实现现已删除。盲四阶矩/判决引导 CPE 原型也曾使 4/4 降为 3/4，并出现非有限值。 | 不要仅凭某一接收天线主径就假定每 UE 4 天线信道严格秩一；相位补偿需与拟合窗/分数时延模型一致。CPE 原型未合入。 |
 | LDPC / CRC 辅助探索（未保留） | 在混合 CSI 的 ue3 CB0 上尝试不同 LDPC 校验节点更新（boxplus、minsum 等）、flooding/layered、10–160 轮，CB0 仍未通过；对低置信 bit 的小规模 CRC 列表翻转，无候选通过最终 TB CRC。 | 先提高 CB0 检测软信息可信度；提高 LDPC 轮数、仅调整 LLR 尺度或凭 CB CRC 匹配并不能保证 TB 正确。 |
 | 每 comb 对独立窗口（未保留） | 一次实现 per-pair `l_min`/`l_max` 扫描：固定 pair(0,1) 为 `[-44,42]`，对 pair(2,3) 扫 58 组（`l_min∈[-90,-6]`、`l_max∈[12,52]`）。最好仍是 **3/4**，ue3 最高仅 2/6 CB；`noise_variance` 扫 1e-5…6e-2 时 3e-4 为唯一最优点。 | 窗口这一自由度已用尽：无法靠选窗把 ue3 推过 2/6 CB。实验性 per-pair 旋钮已删除。 |
 | 每 UE 窗口会破坏 OCC 分离（已证伪） | 实现并验证了 per-UE `l_min`/`l_max` 管线（顺带修掉 `self._num_ofdm_symbols` 漏写的回归）。控制实验（四 UE 全同窗）精确复现基线 3/4 与 2/4，说明管线正确；但**同一 comb 对内两 UE 用不同窗口**（如 ue2 `[-10,22]`、ue3 `[-44,42]`）会让四个 UE 一起掉到 **0/4**，而 ±1…±8 抽头的小扰动行为正常。 | OCC 的 `±1` 覆盖在延迟域等价于 ±150 bin 平移，只有两 UE 共享同一抽头窗时两块设计列才正交。**这否定了 §5 第 2 条「每 UE 独立支持窗」的提法**：选择粒度最多到 comb 对。该管线已删除。 |
@@ -183,6 +184,47 @@ Sionna `TBDecoder` 对 MIMO detector 的 46,800 bit/UE LLR 解扰、逆交织/�
 
 `configs/bler_4ue_cdl.toml` 与 `configs/bler_4ue_cdl_gpu.toml` 的多检测器扫描现包含 `soft-mmse-pic`：CPU 使用 1 轮 LDPC 外反馈、batch 2；GPU 配置使用 4 轮、batch 8；两者阻尼均为 0.25。默认检测器仍为 `lmmse-sic`，旧 `mmse-pic` 保持 4 轮；全量扫描仍按各自配置的 SNR、帧数和停止条件运行，与上表的配对条件不完全相同。
 
+### 3.4 空间签名/投影实验记录（实现已移除）
+
+以下是历史测量；对应的 estimator API、CLI 选项、实验 runner、空间投影配置与专用测试已清理，当前仓库不再提供空间投影功能。完整假设与独立 holdout 记录见 [`space_proj.md` §9](../space_proj.md#9-独立空间投影验证与结论)。
+
+- 20–30 dB、每点 8 帧的初筛中，基线 block errors 为 32/32、22/32、5/32；低秩投影和秩一弱投影均退化，秩 4（等价于不投影）接近基线。
+- 25 dB 扩展到 128 TB 后，基线 88/128 TB 错误；全带秩一、10-RB 与 25-RB 分组均为 128/128 错误。分组没有挽回性能。
+- 独立 learned-basis holdout 中，25 dB 基线与候选均为 6,077/16,000 TB 错误，30 dB 均为 367/16,000；候选接受率为 0%，因此实际输出与基线完全相同。
+- 60 dB 安全检查中，带回退保护的各配置均为 0/64 错误；这只表明该样本没有回归，不是投影收益。未加保护的低秩投影则明显破坏高 SNR 解码。
+
+结论：测得的 BLER/BER 没有改善；低秩投影在部分条件下显著退化，保护后的 learned-basis 方案则完全回退。保留实验结论，不保留无收益的空间投影代码和测试。
+
+### 3.5 CDL-A tap-power LMMSE（预注册配对 holdout，2026-10-01）
+
+本轮评估的是仿真信道估计，不是 §3 的 H5 抓包调参。TX/CDL 固定为 `configs/pusch_4ue.toml` + `configs/cdl_38_901_4x4.toml`（CDL-A、4 UE/4 RX、MCS 20）；单符号 DMRS、端口、OCC、接收窗 `l_min=-6` / `max_delay_spread_s=3e-6` 均未改变。baseline、candidate、perfect-CSI 上界共用每帧 payload、CDL realization 和 AWGN，只切换 CSI estimator；检测统一为 `soft-mmse-pic` 1 轮、阻尼 0.25、20 次 BP。
+
+candidate 使用联合 OCC 设计矩阵 $A$ 与对角抽头先验 $R=\operatorname{diag}(p)\oplus\operatorname{diag}(p)$：
+
+$$
+\widehat{\mathbf h}=RA^H(ARA^H+\sigma^2I)^{-1}\mathbf y,\qquad
+C_{\rm post}=R-RA^H(ARA^H+\sigma^2I)^{-1}AR.
+$$
+
+频域 `err_var` 由 $C_{\rm post}$ 投影到现有 DMRS 基底得到；零噪声退回满秩 LS。先验由独立 seed `21260924` 的 256 个 CDL realization 拟合，每 tap 设 `max(p)*1e-8` 正下限；训练不读取 development/holdout channel、payload 或 CRC。开发集 512 帧/SNR（seed `20260924`），holdout 3,000 帧/SNR（seed `22260924`，25/30 dB），另以 60 dB、64 帧检查高 SNR；BLER 差值按整帧重采样，bootstrap seed `20261001`、10,000 次。
+
+| SNR | DMRS BLER | LMMSE BLER | 相对降低 | candidate−baseline BLER 的 97.5% 单侧上界 | data-RE CSI NMSE（DMRS → LMMSE） |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 25 dB | 0.36933 (4432/12000) | 0.32308 (3877/12000) | 12.52% | −0.04200 | 0.00201394 → 0.00151686 |
+| 30 dB | 0.02383 (286/12000) | 0.02100 (252/12000) | 11.89% | −0.001833 | 0.00063889 → 0.00056701 |
+
+预注册门槛全部通过；60 dB 两臂均为 0/256 TB error。结果只支持该静态 CDL-A 配置上的显式 opt-in，不证明对其他 CDL 或捕获 IQ 泛化，也不替代 perfect CSI 上界。标准 BLER/RX 使用 candidate 时必须加载元数据与当前 TX/CDL/FFT/采样率匹配的 prior；缺失或不兼容时报错，不回退到 LS。现有默认及 profile 保持不变。
+
+正式运行（无 smoke 覆盖）：
+
+```bash
+nr-pusch-estimator-validation --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38_901_4x4.toml --validation-config configs/channel_estimation_validation.toml --output /tmp/channel_estimation_validation.json --device cuda:0
+```
+
+JSON 同时记录 aggregate/per-UE BLER、CRC failure、BER、data-RE NMSE、运行时间和 perfect-CSI gap。
+
+RTX 3060 Laptop GPU（6 GiB）全量运行耗时约 74 分 56 秒。汇总、逐帧结果和训练 prior 分别保存于 `/tmp/channel_estimation_validation.json`、`/tmp/channel_estimation_validation.frames.npz`、`/tmp/channel_estimation_validation.prior.npz`。连通性 smoke 使用独立输出和缩小帧数，不计入 holdout 结论。
+
 ## 4. 可复现验证与输出读取
 
 以下在仓库根目录、仓库虚拟环境中执行，输出放 `/tmp`，不修改供应的 H5 文件：
@@ -202,7 +244,9 @@ PYTHONPATH=src /home/le-lei/workspace/test/.venv/bin/python -m unittest \
 
 期望高码率 CLI 打印 `CRC pass: 3/4`，ue0/ue1/ue2 各 6/6 CB、ue3 0/6。`/tmp/case123427_decode.json` 中 `receiver.cb_crc_status` 保存每 UE 6 个布尔值，`reference_comparison.crc_status` 保存本机 TB CRC；`reference_comparison.bit_errors` 只比较抓包中**不可靠的参考链路载荷**。接收机还检查 soft LLR 有限性：非有限 LLR 应报错，不能将其解释为 CRC 通过。对 profile 外抓包调整 `--l-min`、`--max-delay-spread-s`、`--noise-variance` 前应记录这些覆盖值，否则结果不可复现。
 
-回归基线：`tests/integration/test_matlab_rx_capture.py` 检查原始抓包全 4 UE 解码、高码率 profile 至少 ue0–ue2 CRC 通过、SIC 内部使用显式扰码进行 CRC 门控；新增的 `soft-mmse-pic` 有 LDPC 外信息位序/纠错单测、4×4 CDL payload/CRC 回环和 paired BLER 检查。最近一次完整发现 47 项测试中 46 项通过；唯一失败是 `test_matlab_payload_and_frequency_grid_match_transmitter` 对当前用户 `configs/pusch_4ue.toml` DMRS 端口置换的旧比较，未改动该配置或供应夹具。
+回归基线：`tests/integration/test_matlab_rx_capture.py` 检查原始抓包全 4 UE 解码、高码率 profile 至少 ue0–ue2 CRC 通过、SIC 内部使用显式扰码进行 CRC 门控；`soft-mmse-pic` 有 LDPC 外信息位序/纠错单测、4×4 CDL payload/CRC 回环和 paired BLER 检查。历史上一轮加入 learned spatial projection 与配对 bootstrap 用例时，suite 共运行 64 项、63 项通过；唯一失败是 `test_matlab_payload_and_frequency_grid_match_transmitter`，因现有 `configs/pusch_4ue.toml` DMRS 端口映射与供应 MATLAB fixture 置换不一致。空间投影代码及其专用测试现已移除；上述数量仅为历史记录。未改动该用户配置或 fixture。
+
+2026-10-01 本次完整 suite 运行 57 项，56 项通过；唯一失败仍为 `integration.test_pusch_transmitter.PuschTransmitterTest.test_matlab_payload_and_frequency_grid_match_transmitter`，供应 MATLAB fixture 与发射端频域网格有 1,200/33,600 项不匹配。与本估计器变更无关。
 
 ## 5. 下一轮优化设计与实验纪律
 

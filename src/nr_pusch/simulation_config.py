@@ -32,6 +32,8 @@ class BlerSettings:
     # to the CDL channel value when left unset.
     l_min: int = -6
     max_delay_spread_s: float | None = None
+    estimate_delay: bool = False
+    dmrs_tap_power_prior_path: str | None = None
 
     _SUPPORTED_DETECTORS = frozenset(
         {"lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic"}
@@ -39,7 +41,8 @@ class BlerSettings:
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "BlerSettings":
-        with Path(path).open("rb") as f:
+        config_path = Path(path).resolve()
+        with config_path.open("rb") as f:
             raw = tomllib.load(f)
         values = dict(raw["bler"])
         values["snr_db"] = tuple(float(x) for x in values["snr_db"])
@@ -52,6 +55,14 @@ class BlerSettings:
         values.setdefault("device", "cpu")
         values.setdefault("stop_at_zero_bler", False)
         values.setdefault("channel_domain", "frequency")
+        prior_path = values.get("dmrs_tap_power_prior_path")
+        if prior_path is not None:
+            prior_path = Path(prior_path)
+            values["dmrs_tap_power_prior_path"] = str(
+                prior_path.resolve()
+                if prior_path.is_absolute()
+                else (config_path.parent / prior_path).resolve()
+            )
         settings = cls(**values)
         settings.validate()
         return settings
@@ -67,8 +78,13 @@ class BlerSettings:
             raise ValueError("batch_size 和 max_frames_per_snr 必须大于 0")
         if self.target_block_errors < 1 or self.num_decoder_iterations < 1:
             raise ValueError("target_block_errors 和 num_decoder_iterations 必须大于 0")
-        if self.channel_estimator not in {"perfect", "dmrs"}:
-            raise ValueError("channel_estimator 仅支持 perfect 或 dmrs")
+        if self.channel_estimator not in {"perfect", "dmrs", "dmrs-lmmse"}:
+            raise ValueError("channel_estimator 仅支持 perfect、dmrs 或 dmrs-lmmse")
+        if self.channel_estimator == "dmrs-lmmse":
+            if not isinstance(self.dmrs_tap_power_prior_path, str) or not self.dmrs_tap_power_prior_path:
+                raise ValueError("dmrs-lmmse 必须配置 dmrs_tap_power_prior_path")
+        elif self.dmrs_tap_power_prior_path is not None:
+            raise ValueError("dmrs_tap_power_prior_path 仅能用于 dmrs-lmmse")
         allowed = self._SUPPORTED_DETECTORS
         if self.detector not in allowed or not self.detectors or any(x not in allowed for x in self.detectors):
             raise ValueError(f"detector(s) 必须属于 {sorted(allowed)}")
@@ -102,6 +118,8 @@ class BlerSettings:
                 or self.max_delay_spread_s <= 0
             ):
                 raise ValueError("max_delay_spread_s 必须是正数")
+        if not isinstance(self.estimate_delay, bool):
+            raise ValueError("estimate_delay 必须是布尔值")
 
     def batch_size_for_detector(self, detector: str | None = None) -> int:
         """Return the configured batch size for a detector, with base-size fallback."""
