@@ -6,12 +6,15 @@ import torch
 from sionna.phy.channel import time_lag_discrete_time_channel
 import sionna.phy
 
+from nr_pusch.bler import estimate_dmrs_tap_power_prior
 from nr_pusch.channel import NrPuschCdlChannel
 from nr_pusch.channel_config import ChannelSettings
 from nr_pusch.config import TxSettings, UserSettings
 from nr_pusch.noise import add_awgn, add_awgn_resource_grid
 from nr_pusch.receiver import NrPuschRx
 from nr_pusch.transmitter import NrPuschTx
+
+
 
 
 ROOT = Path(__file__).parents[2]
@@ -27,15 +30,19 @@ class MimoReceiverTest(unittest.TestCase):
             (2, 4, "dft_s_ofdm", "non-codebook"),
             (1, 3, "dft_s_ofdm", "codebook"),
             (1, 3, "cp_ofdm", "codebook"),
+            (2, 4, "cp_ofdm", "non-codebook"),
         ):
             with self.subTest(users=users, layers=layers, waveform=waveform):
                 ports = 4 if layers >= 3 else layers
                 settings = replace(
                     base,
-                    pusch=replace(base.pusch, waveform=waveform, num_layers=layers,
-                                  num_antenna_ports=ports, precoding=precoding,
-                                  dmrs_length=2 if users * layers > 4 else 1,
-                                  n_size_bwp=12, mcs_index=8),
+                    pusch=replace(
+                        base.pusch, waveform=waveform, num_layers=layers,
+                        num_antenna_ports=ports, precoding=precoding,
+                        dmrs_length=2 if users * layers > 4 else 1,
+                        n_size_bwp=12, mcs_index=8,
+                        dmrs_beta=2**0.5 if waveform == "cp_ofdm" else base.pusch.dmrs_beta,
+                    ),
                     users=tuple(UserSettings(f"ue{i}", i + 1,
                                              tuple(range(i * layers, (i + 1) * layers)))
                                 for i in range(users)),
@@ -190,6 +197,149 @@ class MimoReceiverTest(unittest.TestCase):
                         channel_frequency_response=channel.channel_frequency_response[:, :, :2],
                     )
 
+
+    def test_cp_ofdm_all_detectors_and_estimators_restore_two_layer_transport_blocks(self):
+        settings = TxSettings.from_toml(ROOT / "configs" / "pusch_cp_2ue_2layer.toml")
+        with self.assertRaisesRegex(ValueError, "detector_parameter"):
+            NrPuschRx(
+                settings, detector="ep", detector_parameter=0, device="cpu"
+            )
+        channel_settings = ChannelSettings.from_toml(
+            ROOT / "configs" / "cdl_38_901_2tx_4rx.toml"
+        )
+        channel_settings.validate_transmitter(settings)
+        tap_prior = estimate_dmrs_tap_power_prior(
+            settings,
+            channel_settings,
+            l_min=-2,
+            max_delay_spread_s=0.3e-6,
+            num_realizations=8,
+            seed=4,
+            device="cpu",
+        )
+        sionna.phy.config.seed = 4
+        tx = NrPuschTx(settings, device="cpu")
+        sent = tx.generate(seed=4)
+        channel = NrPuschCdlChannel(channel_settings, device="cpu").apply_frequency(
+            sent.frequency_grid, tx._tx_freq.resource_grid
+        )
+        noisy = add_awgn_resource_grid(channel.grid, 75, seed=4)
+        data_symbols = tx._tx_freq.resource_grid.pilot_pattern.num_data_symbols
+
+        for estimator in ("perfect", "dmrs", "dmrs-lmmse"):
+            for detector, parameter in (
+                ("lmmse", None),
+                ("lmmse-sic", None),
+                ("k-best", 8),
+                ("ep", 10),
+                ("mmse-pic", 4),
+                ("soft-mmse-pic", 1),
+            ):
+                with self.subTest(estimator=estimator, detector=detector):
+                    rx = NrPuschRx(
+                        settings,
+                        channel_estimator=estimator,
+                        dmrs_tap_power_prior=tap_prior if estimator == "dmrs-lmmse" else None,
+                        l_min=-2,
+                        max_delay_spread_s=0.3e-6,
+                        detector=detector,
+                        detector_parameter=parameter,
+                        detector_damping=0.25,
+                        input_domain="frequency",
+                        device="cpu",
+                    )
+                    decoded = rx.receive_frequency_grid(
+                        noisy.grid,
+                        noisy.noise_variance,
+                        channel_frequency_response=(
+                            channel.channel_frequency_response
+                            if estimator == "perfect" else None
+                        ),
+                    )
+                    self.assertTrue(torch.all(decoded.crc_status).item())
+                    torch.testing.assert_close(decoded.bits, sent.bits, rtol=0, atol=0)
+                    self.assertEqual(
+                        tuple(decoded.constellation.shape),
+                        (1, 2, 2, data_symbols),
+                    )
+                    llr = rx._receiver._mimo_detector.last_llr
+                    self.assertTrue(torch.isfinite(llr).all().item())
+                    self.assertNotIn("IDFT", decoded.metadata["detector_note"])
+        kbest = NrPuschRx(
+            settings,
+            channel_estimator="perfect",
+            detector="k-best",
+            detector_parameter=8,
+            input_domain="frequency",
+            device="cpu",
+        )
+        with self.assertRaisesRegex(ValueError, "接收天线数不少于总流数"):
+            kbest.receive_frequency_grid(
+                noisy.grid[:, :, :3],
+                noisy.noise_variance[:, :, :3],
+                channel_frequency_response=channel.channel_frequency_response[:, :, :3],
+            )
+
+
+    def test_cp_type2_dmrs_native_ls_and_tap_lmmse_decode_data_sharing_pilot_symbol(self):
+        base = TxSettings.from_toml(ROOT / "configs" / "pusch_cp_2ue_2layer.toml")
+        settings = replace(
+            base,
+            pusch=replace(
+                base.pusch,
+                dmrs_config_type=2,
+                dmrs_num_cdm_groups_without_data=1,
+                dmrs_beta=1.0,
+                num_layers=1,
+                num_antenna_ports=1,
+                n_size_bwp=12,
+                mcs_index=8,
+            ),
+            users=(UserSettings("ue0", 1, (0,)),),
+        )
+        channel_base = ChannelSettings.from_toml(
+            ROOT / "configs" / "cdl_38_901_2tx_4rx.toml"
+        )
+        channel_settings = replace(
+            channel_base,
+            antennas=replace(channel_base.antennas, tx_num_cols=1),
+        )
+        prior = estimate_dmrs_tap_power_prior(
+            settings,
+            channel_settings,
+            l_min=-2,
+            max_delay_spread_s=0.3e-6,
+            num_realizations=8,
+            seed=4,
+            device="cpu",
+        )
+        sionna.phy.config.seed = 4
+        tx = NrPuschTx(settings, device="cpu")
+        sent = tx.generate(seed=4)
+        dmrs_symbol = tx.configs[0].dmrs_symbol_indices[0]
+        pilot_mask = tx._tx_freq.pilot_pattern.mask[0, 0, dmrs_symbol]
+        self.assertTrue(torch.any(pilot_mask))
+        self.assertTrue(torch.any(~pilot_mask))
+        channel = NrPuschCdlChannel(channel_settings, device="cpu").apply_frequency(
+            sent.frequency_grid, tx._tx_freq.resource_grid
+        )
+        noisy = add_awgn_resource_grid(channel.grid, 65, seed=4)
+
+        for estimator in ("dmrs", "dmrs-lmmse"):
+            with self.subTest(estimator=estimator):
+                rx = NrPuschRx(
+                    settings,
+                    channel_estimator=estimator,
+                    dmrs_tap_power_prior=prior if estimator == "dmrs-lmmse" else None,
+                    l_min=-2,
+                    max_delay_spread_s=0.3e-6,
+                    input_domain="frequency",
+                    device="cpu",
+                )
+                decoded = rx.receive_frequency_grid(noisy.grid, noisy.noise_variance)
+                self.assertTrue(torch.all(decoded.crc_status).item())
+                torch.testing.assert_close(decoded.bits, sent.bits, rtol=0, atol=0)
+                self.assertEqual(decoded.metadata["waveform"], "cp_ofdm")
 
 if __name__ == "__main__":
     unittest.main()

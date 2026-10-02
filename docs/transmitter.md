@@ -14,8 +14,15 @@ The exported NPZ keeps `iq` as `[batch,user,tx_antenna,sample]`,
 precoding; it is *not* the layer axis. The JSON manifest records all three axis
 definitions, users, layers per UE, physical antennas per UE, and total streams.
 
-CP-OFDM uses Sionna's native pilot, layer mapping, and precoder. For
-DFT-s-OFDM the adapter applies unitary DFT per data-bearing layer, maps
+CP-OFDM uses Sionna's native pilot, layer mapping, and precoder.
+
+The configured CP-OFDM `dmrs_beta` must match Sionna's native value for the
+selected DMRS configuration (within `1e-6`); `TxSettings` reads that value from
+the native config and rejects mismatches. CP-OFDM type-1 and type-2 pilot
+mapping remain native Sionna behavior; type-2 symbols may contain both pilot
+and data REs.
+
+For DFT-s-OFDM, the adapter applies unitary DFT per data-bearing layer, maps
 type-1 low-PAPR DMRS, and uses native DMRS symbol positions, time OCC,
 and codebook precoding. The MATLAB TX reference uses comb-first port order
 (ports 0/2 on the even comb); the supplied MATLAB RX captures use native

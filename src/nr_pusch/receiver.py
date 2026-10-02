@@ -17,11 +17,14 @@ from sionna.phy.channel import time_lag_discrete_time_channel
 from sionna.phy.fec.scrambling import Descrambler, Scrambler
 from sionna.phy.fec.ldpc import LDPC5GDecoder
 from sionna.phy.mimo import KBestDetector as FlatKBestDetector
-from sionna.phy.mimo import StreamManagement, lmmse_matrix, whiten_channel
+from sionna.phy.mimo import List2LLRSimple, StreamManagement, lmmse_matrix, whiten_channel
 from sionna.phy.nr import LayerDemapper, PUSCHReceiver, PUSCHTransmitter, TBDecoder
 from sionna.phy.ofdm import (
+    EPDetector,
+    KBestDetector,
     LMMSEEqualizer,
     LinearDetector,
+    MMSEPICDetector,
 )
 
 from .config import TxSettings
@@ -237,6 +240,9 @@ class DftSOfdmMimoDetector(torch.nn.Module):
         x_hat = x_hat.reshape(batch, num_tx, num_streams, self._num_data_symbols)
         no_eff = no_eff.reshape_as(x_hat.real)
         llr = self._demapper(x_hat, no_eff)
+        if not self._spread:
+            # Saturate numerical infinities from near-zero post-equalization variance.
+            llr = llr.clamp(-20.0, 20.0)
         self.last_llr = llr
         return llr
 
@@ -776,6 +782,155 @@ class DftSOfdmSoftMmsePicDetector(DftSOfdmMimoDetector):
         return llr
 
 
+class _EagerList2LLRSimple(List2LLRSimple):
+    """Sionna List2LLRSimple with an eager equivalent for CPU-only runtimes."""
+
+    @staticmethod
+    def _fused_equal_any(path_inds: torch.Tensor, symbols: torch.Tensor) -> torch.Tensor:
+        return (path_inds == symbols).any(dim=-2)
+
+
+class CpOfdmMimoDetector(torch.nn.Module):
+    """Run native OFDM per-resource-element detection for CP-OFDM PUSCH."""
+
+    def __init__(
+        self,
+        transmitter: PUSCHTransmitter,
+        stream_management: StreamManagement,
+        detector: str,
+        parameter: int | None,
+        damping: float,
+        *,
+        tb_decoder: TBDecoder | None = None,
+        num_decoder_iterations: int = 20,
+        device: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.method = detector
+        self.damping = damping
+        self._linear = DftSOfdmMimoDetector(
+            transmitter, stream_management, method="lmmse", spread=False
+        )
+        self._constellation = self._linear._constellation
+        self._num_bits_per_symbol = int(
+            torch.as_tensor(transmitter._num_bits_per_symbol).reshape(-1)[0]
+        )
+        self._num_streams = (
+            stream_management._num_tx * stream_management._num_streams_per_tx
+        )
+        grid = transmitter.resource_grid
+        self._num_tx = grid.num_tx
+        self._num_layers = grid.num_streams_per_tx
+        self._num_data_symbols = grid.pilot_pattern.num_data_symbols
+        common = {
+            "resource_grid": grid,
+            "stream_management": stream_management,
+            "num_bits_per_symbol": self._num_bits_per_symbol,
+            "device": transmitter.device,
+        }
+        if detector == "k-best":
+            self._detector = KBestDetector(
+                "bit",
+                num_streams=self._num_streams,
+                k=64 if parameter is None else parameter,
+                constellation_type="qam",
+                list2llr=_EagerList2LLRSimple(
+                    self._num_bits_per_symbol, device=transmitter.device
+                ),
+                **common,
+            )
+        elif detector == "ep":
+            self._detector = EPDetector(
+                "bit",
+                l=10 if parameter is None else parameter,
+                beta=1.0 - damping,
+                precision="double",
+                **common,
+            )
+        elif detector in {"mmse-pic", "soft-mmse-pic"}:
+            self._detector = MMSEPICDetector(
+                "bit",
+                "app",
+                grid,
+                stream_management,
+                num_iter=1,
+                constellation_type="qam",
+                num_bits_per_symbol=self._num_bits_per_symbol,
+                device=transmitter.device,
+            )
+            if detector == "soft-mmse-pic":
+                if tb_decoder is None:
+                    raise ValueError("soft-mmse-pic 需要 TBDecoder")
+                self.num_feedback_iterations = 1 if parameter is None else parameter
+                self._feedback = _LdpcSoftFeedback(
+                    tb_decoder, num_decoder_iterations, device
+                )
+                self._layer_demapper = LayerDemapper(
+                    transmitter._layer_mapper,
+                    num_bits_per_symbol=self._num_bits_per_symbol,
+                    device=transmitter.device,
+                )
+        else:
+            raise ValueError(f"不支持的 CP-OFDM MIMO detector: {detector}")
+        self.num_iterations = 4 if parameter is None else parameter
+        self.num_feedback_iterations = getattr(
+            self, "num_feedback_iterations", 0
+        )
+        self.last_llr: torch.Tensor | None = None
+
+    def forward(
+        self,
+        y: torch.Tensor,
+        h_hat: torch.Tensor,
+        err_var: torch.Tensor,
+        no: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.method == "k-best" and y.shape[2] < self._num_streams:
+            raise ValueError("K-best 要求接收天线数不少于总流数")
+        if self.method == "k-best" or self.method == "ep":
+            llr = self._detector(y, h_hat, err_var, no)
+        elif self.method == "mmse-pic":
+            prior = torch.zeros(
+                (
+                    y.shape[0],
+                    self._num_tx,
+                    self._num_layers,
+                    self._num_data_symbols * self._num_bits_per_symbol,
+                ),
+                dtype=y.real.dtype,
+                device=y.device,
+            )
+            posterior = prior
+            for _ in range(self.num_iterations):
+                extrinsic = self._detector(y, h_hat, posterior, err_var, no)
+                posterior = posterior + extrinsic
+                prior = (1.0 - self.damping) * prior + self.damping * posterior
+            llr = posterior
+        else:
+            llr = self._linear(y, h_hat, err_var, no)
+            _, _, layers, _ = llr.shape
+            codeword_llr = self._layer_demapper(llr)
+            prior_codeword = torch.zeros_like(codeword_llr)
+            for _ in range(self.num_feedback_iterations):
+                decoder_extrinsic = self._feedback(self._layer_demapper(llr))
+                prior_codeword = (
+                    (1.0 - self.damping) * prior_codeword
+                    + self.damping * decoder_extrinsic
+                ).clamp(-20.0, 20.0)
+                prior_layers = _codeword_to_layers(
+                    prior_codeword, layers, self._num_bits_per_symbol
+                )
+                detector_extrinsic = self._detector(
+                    y, h_hat, prior_layers, err_var, no
+                )
+                llr = (prior_layers + detector_extrinsic).clamp(-20.0, 20.0)
+                if not torch.isfinite(llr).all().item():
+                    raise RuntimeError(
+                        "soft-mmse-pic produced non-finite detector LLRs"
+                    )
+        self.last_llr = llr
+        return llr
+
 class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
     """Decode users strongest-first and cancel CRC-verified reconstructions."""
 
@@ -788,8 +943,9 @@ class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
         num_decoder_iterations: int,
         device: str | None,
         scrambling_sequences: torch.Tensor | None = None,
+        spread: bool = True,
     ) -> None:
-        super().__init__(transmitter, stream_management, method="lmmse")
+        super().__init__(transmitter, stream_management, method="lmmse", spread=spread)
         self._sic_decoder = TBDecoder(
             transmitter._tb_encoder,
             num_bp_iter=num_decoder_iterations,
@@ -1246,9 +1402,18 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
 class MimoDmrsEstimator(torch.nn.Module):
     """Jointly fit layer channels on each DMRS comb and frontloaded occasion."""
 
-    def __init__(self, pilots: torch.Tensor, resource_grid, length: int,
-                 l_min: int, l_max: int, *, estimate_delay: bool = False,
-                 tap_power_prior: torch.Tensor | None = None):
+    def __init__(
+        self,
+        pilots: torch.Tensor,
+        resource_grid,
+        length: int,
+        l_min: int,
+        l_max: int,
+        *,
+        estimate_delay: bool = False,
+        tap_power_prior: torch.Tensor | None = None,
+        remove_zero_pilot_rows: bool = False,
+    ):
         super().__init__()
         # pilots: [user, layer, DMRS symbol, subcarrier], before codebook mapping.
         self._users, self._layers, num_dmrs, self._subcarriers = pilots.shape
@@ -1289,10 +1454,16 @@ class MimoDmrsEstimator(torch.nn.Module):
                         pilots[user, layer, start + offset, support, None] * basis[support]
                         for user, layer in streams
                     ], dim=-1) for offset in range(length)], dim=0)
+                pilot_rows = None
+                if remove_zero_pilot_rows:
+                    pilot_rows = torch.where(torch.any(design != 0, dim=-1))[0]
+                    design = design.index_select(0, pilot_rows)
                 if torch.linalg.matrix_rank(design).item() < design.shape[-1]:
                     raise ValueError("DMRS 端口 OCC 不足以区分所有层的信道")
                 gram_inverse = torch.linalg.pinv(design.mH @ design)
-                self._groups.append((streams, support, occasion, design, gram_inverse))
+                self._groups.append(
+                    (streams, support, occasion, design, gram_inverse, pilot_rows)
+                )
         self._occasion_symbols = tuple(
             self._dmrs_symbols[i * length] for i in range(num_dmrs // length)
         )
@@ -1310,7 +1481,7 @@ class MimoDmrsEstimator(torch.nn.Module):
                                dtype=y.dtype, device=y.device)
         error = torch.zeros_like(estimate.real)
         basis = self._basis.to(y.device)
-        for streams, support, occasion, design, inverse in self._groups:
+        for streams, support, occasion, design, inverse, pilot_rows in self._groups:
             design = design.to(y.device)
             support = support.to(y.device)
             observations = torch.cat([
@@ -1318,6 +1489,8 @@ class MimoDmrsEstimator(torch.nn.Module):
                 .index_select(-1, support)
                 for offset in range(self._length)
             ], dim=-1).reshape(batch * antennas, -1).T
+            if pilot_rows is not None:
+                observations = observations.index_select(0, pilot_rows.to(y.device))
             if self._prior is None or not torch.any(no > 0):
                 taps = torch.linalg.lstsq(design, observations).solution
                 covariance = inverse.to(y.device)[None] * no.reshape(-1, 1, 1)
@@ -1421,6 +1594,16 @@ class NrPuschRx:
             raise ValueError("max_delay_spread_s 必须大于 0")
         if not 0.0 < detector_damping <= 1.0:
             raise ValueError("detector_damping 必须位于 (0, 1]")
+        if detector not in {
+            "lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic"
+        }:
+            raise ValueError(f"不支持的 MIMO detector: {detector}")
+        if detector_parameter is not None and (
+            isinstance(detector_parameter, bool)
+            or not isinstance(detector_parameter, int)
+            or detector_parameter < 1
+        ):
+            raise ValueError("detector_parameter 必须为正整数")
         self.settings = settings
         device = use_device(device)
         self.device = device
@@ -1453,7 +1636,20 @@ class NrPuschRx:
                 int(tx._tb_encoder.n),
             )
         self._cb_crc_status: list[torch.Tensor] = []
-        if detector == "soft-mmse-pic":
+        if settings.pusch.waveform == "cp_ofdm" and detector in {
+            "k-best", "ep", "mmse-pic", "soft-mmse-pic"
+        }:
+            detector_block = CpOfdmMimoDetector(
+                tx,
+                stream_management,
+                detector,
+                detector_parameter,
+                detector_damping,
+                tb_decoder=tb_decoder,
+                num_decoder_iterations=num_decoder_iterations,
+                device=device,
+            )
+        elif detector == "soft-mmse-pic":
             detector_block = DftSOfdmSoftMmsePicDetector(
                 tx,
                 stream_management,
@@ -1471,6 +1667,7 @@ class NrPuschRx:
                 num_decoder_iterations=num_decoder_iterations,
                 device=device,
                 scrambling_sequences=scrambling_sequences,
+                spread=settings.pusch.waveform == "dft_s_ofdm",
             )
         elif detector == "k-best":
             detector_block = DftSOfdmKBestDetector(
@@ -1509,6 +1706,10 @@ class NrPuschRx:
                 batch_size=1, bits=zero_bits
             ).frequency_grid[0]
             dmrs_symbols = _dmrs_symbol_indices(template_tx._tx_freq)
+            pilot_mask = template_tx._tx_freq.pilot_pattern.mask.index_select(
+                2,
+                torch.as_tensor(dmrs_symbols, device=transmitted_pilots.device),
+            ).bool()
             if (settings.pusch.waveform == "dft_s_ofdm"
                     and settings.pusch.num_layers == 1
                     and settings.pusch.num_antenna_ports == 1
@@ -1538,10 +1739,19 @@ class NrPuschRx:
                     ])
                 else:
                     pilots = transmitted_pilots[:, :, dmrs_symbols, :]
+                pilots = torch.where(pilot_mask, pilots, torch.zeros_like(pilots))
                 estimator = MimoDmrsEstimator(
-                    pilots, tx.resource_grid, settings.pusch.dmrs_length,
-                    l_min, l_max, estimate_delay=estimate_delay,
+                    pilots,
+                    tx.resource_grid,
+                    settings.pusch.dmrs_length,
+                    l_min,
+                    l_max,
+                    estimate_delay=estimate_delay,
                     tap_power_prior=dmrs_tap_power_prior,
+                    remove_zero_pilot_rows=(
+                        settings.pusch.waveform == "cp_ofdm"
+                        and settings.pusch.dmrs_config_type == 2
+                    ),
                 )
         else:
             estimator = "perfect"
@@ -1723,6 +1933,16 @@ class NrPuschRx:
             "detector_note": (
                 "Strongest-first LMMSE-SIC; cancel only after the user's TB CRC passes."
                 if self.detector == "lmmse-sic"
+                else "Native CP-OFDM per-RE Sionna K-best detector."
+                if self.settings.pusch.waveform == "cp_ofdm" and self.detector == "k-best"
+                else "Native CP-OFDM per-RE Sionna EP detector with damped updates."
+                if self.settings.pusch.waveform == "cp_ofdm" and self.detector == "ep"
+                else "Native CP-OFDM per-RE Sionna MMSE-PIC with damped APP feedback."
+                if self.settings.pusch.waveform == "cp_ofdm" and self.detector == "mmse-pic"
+                else "Native CP-OFDM per-RE MMSE-PIC with LDPC extrinsic feedback."
+                if self.settings.pusch.waveform == "cp_ofdm" and self.detector == "soft-mmse-pic"
+                else "Native CP-OFDM per-RE LMMSE equalization."
+                if self.settings.pusch.waveform == "cp_ofdm" and self.detector == "lmmse"
                 else "LMMSE frequency pre-equalization, IDFT despreading, and per-sample spatial K-best."
                 if self.detector == "k-best"
                 else "Frequency-domain LMMSE equalization followed by inverse DFT spreading."
@@ -1739,6 +1959,15 @@ class NrPuschRx:
             "channel_estimator": (
                 "perfect CDL CSI"
                 if self.channel_estimator == "perfect"
+                else "CP-OFDM native Sionna type-2 DMRS LS"
+                if self.settings.pusch.waveform == "cp_ofdm"
+                and self.channel_estimator == "dmrs"
+                and self.settings.pusch.dmrs_config_type == 2
+                else "CP-OFDM frequency DMRS OCC tap-domain LMMSE"
+                if self.settings.pusch.waveform == "cp_ofdm"
+                and self.channel_estimator == "dmrs-lmmse"
+                else "CP-OFDM frequency DMRS OCC LS tap fit"
+                if self.settings.pusch.waveform == "cp_ofdm"
                 else "DFT-s-OFDM frequency DMRS OCC tap-domain LMMSE"
                 if self.channel_estimator == "dmrs-lmmse"
                 else "DFT-s-OFDM frequency DMRS OCC LS tap fit"

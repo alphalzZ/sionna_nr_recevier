@@ -274,6 +274,29 @@ class BlerResultExportTest(unittest.TestCase):
         self.assertEqual(manifest["results"][0]["channel_estimator"], "dmrs-lmmse")
         self.assertFalse(manifest["simulation_settings"]["stop_at_zero_bler"])
 
+    def test_cp_manifest_uses_per_re_detector_validity_note(self):
+        tx_settings = TxSettings.from_toml(
+            ROOT / "configs" / "pusch_cp_2ue_2layer.toml"
+        )
+        channel_settings = ChannelSettings.from_toml(
+            ROOT / "configs" / "cdl_38_901_2tx_4rx.toml"
+        )
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _, manifest_path = save_bler_results(
+            self._sweep(),
+            directory / "cp-bler.csv",
+            tx_settings=tx_settings,
+            channel_settings=channel_settings,
+            simulation_settings=_settings(),
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        note = manifest["detector_validity_note"]
+        self.assertIn("CP-OFDM", note)
+        self.assertIn("per-resource-element", note)
+        self.assertIn("double precision", note)
+        self.assertNotIn("DFT-s-OFDM", note)
+        self.assertNotIn("IDFT", note)
+
 
 class BlerCliProgressTest(unittest.TestCase):
     def test_progress_jsonl_marks_measured_and_skipped_points(self):

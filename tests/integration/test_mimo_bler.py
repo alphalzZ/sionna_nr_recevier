@@ -33,5 +33,36 @@ class MimoBlerTest(unittest.TestCase):
                          (0, 0, 0))
 
 
+    def test_cp_ofdm_smoke_and_multisnr_sweeps_count_both_transport_blocks(self):
+        tx_settings = TxSettings.from_toml(
+            ROOT / "configs" / "pusch_cp_2ue_2layer.toml"
+        )
+        channel = ChannelSettings.from_toml(
+            ROOT / "configs" / "cdl_38_901_2tx_4rx.toml"
+        )
+        smoke = BlerSettings.from_toml(ROOT / "configs" / "bler_cp_smoke.toml")
+        point = simulate_bler(tx_settings, channel, smoke, device="cpu").points[0]
+        self.assertEqual((point.frames, point.transport_blocks), (1, 2))
+        self.assertEqual(
+            (point.block_errors, point.crc_failures, point.bit_errors), (0, 0, 0)
+        )
+
+        multi_snr = BlerSettings.from_toml(ROOT / "configs" / "bler_smoke.toml")
+        multi_snr = replace(
+            multi_snr,
+            snr_db=(65.0, 75.0),
+            max_frames_per_snr=2,
+            target_block_errors=8,
+            seed=4,
+            l_min=-2,
+            max_delay_spread_s=0.3e-6,
+        )
+        sweep = simulate_bler(tx_settings, channel, multi_snr, device="cpu")
+        self.assertEqual(len(sweep.points), 2)
+        for point in sweep.points:
+            with self.subTest(snr_db=point.snr_db):
+                self.assertEqual(point.frames, 2)
+                self.assertEqual(point.transport_blocks, point.frames * 2)
+
 if __name__ == "__main__":
     unittest.main()

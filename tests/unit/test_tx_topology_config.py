@@ -2,6 +2,7 @@ from dataclasses import replace
 from pathlib import Path
 import unittest
 
+from nr_pusch.channel_config import ChannelSettings
 from nr_pusch.config import TxSettings, UserSettings
 
 
@@ -22,7 +23,8 @@ class TxTopologyConfigTest(unittest.TestCase):
                 cfg = replace(
                     self.base,
                     pusch=replace(self.base.pusch, waveform="cp_ofdm", num_layers=layers,
-                                  num_antenna_ports=ports, dmrs_length=length),
+                                  num_antenna_ports=ports, dmrs_length=length,
+                                  dmrs_beta=2**0.5),
                     users=tuple(UserSettings(f"ue{i}", i + 1,
                                              tuple(range(i * layers, (i + 1) * layers)))
                                 for i in range(users)),
@@ -56,15 +58,57 @@ class TxTopologyConfigTest(unittest.TestCase):
     def test_codebook_three_layers_on_four_ports(self):
         cfg = replace(self.base,
                       pusch=replace(self.base.pusch, waveform="cp_ofdm", num_layers=3,
-                                    num_antenna_ports=4, precoding="codebook"),
+                                    num_antenna_ports=4, precoding="codebook",
+                                    dmrs_beta=2**0.5),
                       users=(UserSettings("ue", 1, (0, 1, 2)),))
         self.assertEqual(cfg.to_sionna_configs()[0].precoding_matrix.shape, (4, 3))
+
+
+    def test_cp_dmrs_beta_matches_native_sionna_and_rejects_mismatch(self):
+        settings = TxSettings.from_toml(ROOT / "configs" / "pusch_cp_2ue_2layer.toml")
+        self.assertEqual(settings.pusch.waveform, "cp_ofdm")
+        self.assertEqual(len(settings.users), 2)
+        self.assertEqual([cfg.dmrs.beta for cfg in settings.to_sionna_configs()],
+                         [settings.pusch.dmrs_beta] * 2)
+
+        invalid = replace(
+            settings,
+            pusch=replace(settings.pusch, dmrs_beta=settings.pusch.dmrs_beta + 0.01),
+        )
+        with self.assertRaisesRegex(ValueError, "cp_ofdm 的 dmrs_beta"):
+            invalid.validate()
+
+        type2 = replace(
+            settings,
+            pusch=replace(
+                settings.pusch,
+                dmrs_config_type=2,
+                dmrs_num_cdm_groups_without_data=1,
+                dmrs_beta=1.0,
+                num_layers=1,
+                num_antenna_ports=1,
+                precoding="non-codebook",
+            ),
+            users=(UserSettings("ue0", 1, (0,)),),
+        )
+        self.assertEqual(type2.to_sionna_configs()[0].dmrs.beta, 1.0)
+
+    def test_new_cdl_profile_matches_cp_tx_topology(self):
+        settings = TxSettings.from_toml(ROOT / "configs" / "pusch_cp_2ue_2layer.toml")
+        channel = ChannelSettings.from_toml(ROOT / "configs" / "cdl_38_901_2tx_4rx.toml")
+        channel.validate_transmitter(settings)
+        self.assertEqual(
+            (channel.antennas.tx_num_rows * channel.antennas.tx_num_cols,
+             channel.antennas.rx_num_rows * channel.antennas.rx_num_cols),
+            (2, 4),
+        )
 
     def test_shipped_topology_profiles_keep_unique_native_ports(self):
         for name, users, layers, length in (
             ("pusch_1ue_1tx_4rx.toml", 1, 1, 1),
             ("pusch_1ue_4layer.toml", 1, 4, 1),
             ("pusch_2ue_4layer.toml", 2, 4, 2),
+            ("pusch_cp_2ue_2layer.toml", 2, 2, 1),
         ):
             with self.subTest(name=name):
                 settings = TxSettings.from_toml(ROOT / "configs" / name)

@@ -1,0 +1,38 @@
+# CP-OFDM, two users × two layers, paired with cdl_38_901_2tx_4rx.toml.
+[carrier]
+subcarrier_spacing_khz = 30
+cyclic_prefix = "normal"
+n_cell_id = 0
+n_size_grid = 50
+n_start_grid = 0
+frame_number = 0
+slot_number = 0
+
+[pusch]
+waveform = "cp_ofdm"
+mapping_type = "A"
+symbol_allocation = [0, 14]
+n_size_bwp = 12
+n_start_bwp = 0
+mcs_table = 1
+mcs_index = 8
+num_layers = 2
+num_antenna_ports = 2
+precoding = "non-codebook"
+tpmi = 0
+dmrs_config_type = 1
+dmrs_type_a_position = 2
+dmrs_additional_position = 0
+dmrs_length = 1
+dmrs_num_cdm_groups_without_data = 2
+dmrs_beta = 1.4142135623730951
+
+[[users]]
+name = "ue0"
+n_rnti = 1
+dmrs_ports = [0, 1]
+
+[[users]]
+name = "ue1"
+n_rnti = 2
+dmrs_ports = [2, 3]

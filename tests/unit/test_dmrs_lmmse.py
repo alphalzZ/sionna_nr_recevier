@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -145,6 +146,40 @@ class DmrsTapLmmseTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "不兼容"):
                 load_dmrs_tap_power_prior(
                     prior_path, expected_compatibility=mismatch
+                )
+            cp_settings = replace(
+                self.settings,
+                pusch=replace(
+                    self.settings.pusch,
+                    waveform="cp_ofdm",
+                    dmrs_beta=2**0.5,
+                ),
+            )
+            cp_settings.validate()
+            cp_compatibility = dmrs_prior_compatibility(
+                cp_settings,
+                channel_settings,
+                l_min=self.l_min,
+                max_delay_spread_s=3e-6,
+                fft_size=self.resource_grid.fft_size,
+                sample_rate_hz=self.transmitter.sample_rate_hz,
+            )
+            self.assertEqual(cp_compatibility["tx_pusch"]["waveform"], "cp_ofdm")
+            cp_prior_path = Path(directory) / "cp_prior.npz"
+            save_dmrs_tap_power_prior(
+                cp_prior_path,
+                prior,
+                compatibility=cp_compatibility,
+                training_seed=42,
+                training_realizations=8,
+            )
+            with self.assertRaisesRegex(ValueError, "不兼容"):
+                load_dmrs_tap_power_prior(
+                    prior_path, expected_compatibility=cp_compatibility
+                )
+            with self.assertRaisesRegex(ValueError, "不兼容"):
+                load_dmrs_tap_power_prior(
+                    cp_prior_path, expected_compatibility=compatibility
                 )
 
     def test_lmmse_requires_valid_prior(self):

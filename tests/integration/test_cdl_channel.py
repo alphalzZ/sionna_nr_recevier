@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import unittest
 
@@ -9,7 +10,7 @@ from sionna.phy.ofdm import OFDMDemodulator
 from nr_pusch.channel import NrPuschCdlChannel
 from nr_pusch.channel_config import ChannelSettings
 from nr_pusch.config import TxSettings
-from nr_pusch.noise import add_awgn_resource_grid
+from nr_pusch.noise import add_awgn, add_awgn_resource_grid
 from nr_pusch.receiver import NrPuschRx
 from nr_pusch.transmitter import NrPuschTx
 
@@ -60,6 +61,84 @@ class CdlChannelTest(unittest.TestCase):
         torch.testing.assert_close(
             time_csi, frequency.channel_frequency_response, rtol=1e-4, atol=1e-4
         )
+
+    def test_cp_ofdm_time_and_frequency_channels_decode_with_perfect_and_dmrs_csi(self):
+        tx_settings = TxSettings.from_toml(
+            ROOT / "configs" / "pusch_cp_2ue_2layer.toml"
+        )
+        channel_settings = ChannelSettings.from_toml(
+            ROOT / "configs" / "cdl_38_901_2tx_4rx.toml"
+        )
+        channel_settings = replace(
+            channel_settings,
+            channel=replace(channel_settings.channel, max_delay_spread_s=1e-6),
+        )
+        tx = NrPuschTx(tx_settings, device="cpu")
+        sent = tx.generate(seed=4)
+        rg = tx._tx_freq.resource_grid
+
+        sionna.phy.config.seed = 4
+        torch.manual_seed(4)
+        frequency = NrPuschCdlChannel(channel_settings, device="cpu").apply_frequency(
+            sent.frequency_grid, rg
+        )
+        sionna.phy.config.seed = 4
+        torch.manual_seed(4)
+        time = NrPuschCdlChannel(channel_settings, device="cpu").apply(
+            sent.iq, sent.sample_rate_hz
+        )
+
+        time_taps = time.channel_taps.permute(0, 2, 1, 3, 4, 5).unsqueeze(1)
+        time_csi = time_to_ofdm_channel(
+            time_taps, rg, time.metadata["time_lag_min"]
+        )
+        torch.testing.assert_close(
+            time_csi, frequency.channel_frequency_response, rtol=1e-4, atol=1e-4
+        )
+        time_grid = OFDMDemodulator(
+            rg.fft_size,
+            time.metadata["time_lag_min"],
+            rg.cyclic_prefix_length,
+            device="cpu",
+        )(time.iq.unsqueeze(1))[..., : rg.num_ofdm_symbols, :]
+        relative_error = (
+            (time_grid - frequency.grid).abs().square().mean()
+            / frequency.grid.abs().square().mean()
+        ).sqrt()
+        self.assertLess(relative_error.item(), 0.01)
+
+        time_noisy = add_awgn(time.iq, 65, seed=4)
+        frequency_noisy = add_awgn_resource_grid(frequency.grid, 65, seed=4)
+        for estimator in ("perfect", "dmrs"):
+            for domain in ("time", "frequency"):
+                with self.subTest(estimator=estimator, domain=domain):
+                    receiver = NrPuschRx(
+                        tx_settings,
+                        channel_estimator=estimator,
+                        input_domain=domain,
+                        detector="lmmse",
+                        l_min=time.metadata["time_lag_min"],
+                        max_delay_spread_s=channel_settings.channel.max_delay_spread_s,
+                        device="cpu",
+                    )
+                    if domain == "time":
+                        decoded = receiver.receive(
+                            time_noisy.iq,
+                            time_noisy.noise_variance,
+                            channel_taps=time.channel_taps if estimator == "perfect" else None,
+                        )
+                    else:
+                        decoded = receiver.receive_frequency_grid(
+                            frequency_noisy.grid,
+                            frequency_noisy.noise_variance,
+                            channel_frequency_response=(
+                                frequency.channel_frequency_response
+                                if estimator == "perfect" else None
+                            ),
+                        )
+                    self.assertTrue(torch.all(decoded.crc_status).item())
+                    torch.testing.assert_close(decoded.bits, sent.bits, rtol=0, atol=0)
+
 
     def test_rejects_wrong_transmit_iq_axes(self):
         settings = ChannelSettings.from_toml(ROOT / "configs" / "cdl_38_901_4x4.toml")

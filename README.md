@@ -6,6 +6,12 @@
 
 当前实现以 Sionna 2.0.1 的 `PUSCHTransmitter` 生成 PUSCH 数据资源网格，并支持 CP-OFDM 和 DFT-s-OFDM 波形输出。DFT-s-OFDM 对数据符号应用酉 DFT，并按 type-1 低 PAPR 序列生成 DMRS 后进行 OFDM 调制；`[pusch].dmrs_additional_position` 支持 0、1、2，由 Sionna 资源图决定各 DMRS occasion。由于 Sionna 2.0.1 的组合 PUSCH 发射器不支持 transform precoding，配置中的 DFT 预编码 MCS 会映射到同调制阶数和码率的原生 Sionna MCS，以复用其 TB 编码器。当前活动配置为 DFT-s-OFDM MCS table 1/index 20，目标码率 0.6015625，TB 大小 28,168 bit。
 
+CP-OFDM 沿用 Sionna 原生 PUSCH 资源网格与 DMRS 映射。`dmrs_beta` 必须
+匹配当前 DMRS 组数和长度对应的 Sionna 原生值；配置加载时校验，不会静默
+改变导频功率。`configs/pusch_cp_2ue_2layer.toml` 配
+`configs/cdl_38_901_2tx_4rx.toml`；`configs/bler_cp_smoke.toml` 是单帧、两
+TB 的 CP 接收连通性配置。
+
 ### MIMO TOML 拓扑
 
 `[pusch]` 的 `num_layers`（每 UE，1–4）、`num_antenna_ports`（1/2/4）、
@@ -31,6 +37,16 @@ nr-pusch-rx --tx-config configs/pusch_2ue_4layer.toml --input /tmp/pusch_8stream
 八流 DMRS/LMMSE 单点连通性检查：
 `nr-pusch-bler --tx-config configs/pusch_2ue_4layer.toml --channel-config configs/cdl_38_901_4tx_8rx.toml --simulation-config configs/bler_8stream_smoke.toml --output /tmp/pusch_8stream_bler.csv --device cpu`。
 该配置只发一帧，不用于评估统计 BLER。
+
+CP-OFDM TX→信道→RX 连通性示例（采样率从 TX manifest 读取）：
+
+```bash
+nr-pusch-tx --config configs/pusch_cp_2ue_2layer.toml --output /tmp/cp_tx.npz --seed 4 --device cpu
+SAMPLE_RATE_HZ=$(/home/le-lei/workspace/test/.venv/bin/python -c 'import json; print(json.load(open("/tmp/cp_tx.json"))["result"]["sample_rate_hz"])')
+nr-pusch-channel --config configs/cdl_38_901_2tx_4rx.toml --tx-config configs/pusch_cp_2ue_2layer.toml --domain frequency --input /tmp/cp_tx.npz --sample-rate-hz "$SAMPLE_RATE_HZ" --output /tmp/cp_rx_grid.npz --device cpu
+nr-pusch-rx --rx-config configs/pusch_cp_2ue_2layer.toml --input /tmp/cp_rx_grid.npz --input-domain frequency --channel-estimator dmrs --detector lmmse --noise-variance 0.0001 --output /tmp/cp_decode.npz --device cpu
+nr-pusch-bler --tx-config configs/pusch_cp_2ue_2layer.toml --channel-config configs/cdl_38_901_2tx_4rx.toml --simulation-config configs/bler_cp_smoke.toml --output /tmp/cp_bler.csv --device cpu
+```
 
 
 NPZ 的物理发射天线轴与层轴不混用。RX 星座与 LLR 保留
@@ -65,6 +81,11 @@ nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /tmp/pusch_rx_grid.npz --
 
 `NrPuschRx` 以 Sionna PUSCH TB 解码器合并每 UE 多层码字。时域 IQ 经 OFDM 解调，频域网格直接检测；DFT-s-OFDM 数据先均衡、按层逆 DFT。`perfect` 接收物理 TX 天线 CSI，codebook 时应用原生预编码矩阵；`dmrs` 从每层导频的 comb/OCC 联合估计有效层信道，`dmrs-lmmse` 加入 CDL tap-power prior。保留原 4 UE 单层捕获的 MATLAB 对照估计路径。信道估计输出 `[batch,1,rx_antenna,user,layer,symbol,subcarrier]`，最终 TB/CRC 按 UE。
 
+CP-OFDM 使用原生逐 RE 信道估计和检测路径，不做 DFT 解扩/IDFT；支持
+`lmmse`、`lmmse-sic`、`k-best`、`ep`、`mmse-pic` 和 `soft-mmse-pic`。
+EP 使用 double precision；K-best 要求接收天线数不少于总流数。Type-2
+DMRS 与数据共用 OFDM 符号时，估计只使用原生 pilot mask 中的 RE。
+
 DMRS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围：当前为 18 MHz 采样率下的 `-6..60`，共 67 taps，这是时延范围先验，不读取本帧真实信道系数。多个 DMRS occasion 各自拟合 CSI，再按 OFDM 符号位置对相邻估计做复数线性插值；首个/末个 occasion 之外保持最近估计。`err_var` 按插值权重平方传播，假设各 occasion 的估计噪声独立，不包含信道时变造成的插值模型误差；高 Doppler 场景仍需独立验证。
 
 ### CDL tap-power LMMSE 验证
@@ -84,7 +105,7 @@ nr-pusch-estimator-validation --tx-config configs/pusch_4ue.toml --channel-confi
 BLER 配置可用 `[bler].channel_estimators` 选择多个估计器；仿真按 `channel_estimators × detectors × snr_db` 遍历组合。未设置时沿用单个 `channel_estimator`。网页 SIM 配置 `configs/bler_estimator_matrix.toml` 组合 `dmrs`、`dmrs-lmmse`、`perfect` 与 `soft-mmse-pic`，扫描 25–50 dB 六个 SNR，共 18 个结果点，每点最多 2,000 帧（GPU profile）。运行前需按上面的验证命令生成 `/tmp/channel_estimation_validation.prior.npz`；输出路径不同时更新 `dmrs_tap_power_prior_path`。
 
 
-检测器 `lmmse`、`lmmse-sic`、`k-best`、`mmse-pic`、`soft-mmse-pic` 和 `ep` 在 DFT-s-OFDM 的用户×层总流上工作；Sionna layer demapper 将每层 LLR 恢复为各 UE 的唯一 TB 码字。PIC 按全部层消除干扰；soft-PIC 的 LDPC 外信息按码字/层次序互换；SIC 仅对 CRC 通过的 UE 重构所有层并消除其全部发射贡献。K-best 要求接收天线数不少于总流数，路径数量和复杂度由 `detector_parameter` 控制。`detector_parameter` 对 PIC 为迭代轮数，对 EP 为迭代次数；BLER 的 `detectors` 和 `detector_parameters` 保持原名。
+DFT-s-OFDM 的上述检测器工作在用户×层总流上；Sionna layer demapper 在逆 DFT 后将每层 LLR 还原为各 UE 的 TB 码字。PIC 按全部层消除干扰；soft-PIC 按码字/层次交换 LDPC 外信息；SIC 只在 CRC 通过后重构 UE 并抵消其完整贡献。K-best 要求接收天线数不少于总流数，搜索路径数和复杂度由 `detector_parameter` 控制。PIC 的该参数表示迭代轮数，EP 中表示迭代次数；BLER 配置仍使用 `detectors` 与 `detector_parameters`。
 
 EP 与 K-best 共用零时延等效空间信道近似；滤波后剩余的频率选择性记入高斯协方差，而非在 EP 图中显式建模所有跨采样相关性。该近似、软 LLR 校准及收敛行为仍需通过 MATLAB 参考向量和长 SNR 曲线验证。
 

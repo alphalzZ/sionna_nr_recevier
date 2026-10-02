@@ -272,3 +272,12 @@ aggregate JSON 保存在 `/tmp/dmrs_interpolation_comparison.json` 与 `/tmp/dmr
 5. **必要时扩展观测模型。**若残差呈频率/符号相关结构，再评估分数时延、残余 CFO/ICI、非满 CP 多径、独立 UE 定时或 IQ 非理想；用真实独立抓包或有已知发射 bit/信道的仿真验证。不能把参考链路自身 CRC 失败的 `ue*_tx_bits` 当成 oracle 用于调 CSI，也不能通过禁用 CRC、硬编码 UE bit 或只针对该 H5 的索引特判获得表面的 4/4。
 
 若后续要把 `soft-mmse-pic` 宣称为高码率抓包的解码改善，入库条件仍应是 4/4 TB CRC、逐 CB 标志自洽、此前通过的 UE 不回退，并保留固定输入回归；目前 3/4 只能报告为单帧观察。算法自身的采用价值由独立已知 payload 仿真上的 BLER/BER、数值稳定性及计算/显存成本判断。
+
+## 6. CP-OFDM 原生逐 RE 接收路径
+
+本节描述独立于前述 DFT-s-OFDM 抓包优化的仿真路径；这些抓包结论不外推到 CP-OFDM。CP 输入保留 Sionna 原生资源图，按资源元素检测，不做 DFT 解扩/IDFT。支持 LMMSE、LMMSE-SIC、K-best、EP、MMSE-PIC 与 soft-MMSE-PIC；K-best 要求接收天线数不少于所有 UE 的总层数。CP 的 EP 路径使用 double precision：CPU 高 SNR 回环中 float32 EP 未通过 CRC，double precision 通过。代价是更高的计算与内存开销。
+
+DMRS 估计使用原生 pilot mask，而不是把整个 DMRS 符号都当成导频。Type-2 DMRS 可与数据 RE 同处一个 OFDM 符号；`dmrs-lmmse` 只将真实 pilot RE 放入抽头拟合，过滤全零设计行并检查剩余矩阵秩。CP 的 `dmrs_beta` 必须匹配当前原生 Sionna DMRS 配置，配置不兼容时在构造 transmitter 前报错。
+
+回归覆盖 `configs/pusch_cp_2ue_2layer.toml` 的 2 UE × 2 层频域/时域信道路径、perfect/DMRS CSI、六种检测器与 DMRS tap-prior LMMSE；另有 8 流 perfect/DMRS 解码及 type-2 pilot/data 同符号用例。`configs/bler_cp_smoke.toml` 只作两 TB 单帧连通性检查，不代表统计 BLER。端到端 CLI 示例见 `README.md` 的 CP-OFDM smoke。
+

@@ -355,6 +355,11 @@ def save_bler_results(
         "bler_definition": "TB block error if CRC fails or any decoded payload bit differs",
         "channel_domain": simulation_settings.channel_domain,
         "detector_validity_note": (
+            "CP-OFDM uses native Sionna per-resource-element detection; K-best is per RE, EP uses "
+            "double precision, and MMSE-PIC feeds extrinsic LLRs between per-RE iterations. "
+            "No DFT despreading is applied."
+            if tx_settings.pusch.waveform == "cp_ofdm"
+            else
             "DFT-s-OFDM k-best first applies frequency-domain LMMSE, then uses a per-sample zero-lag "
             "effective spatial channel with residual frequency variation in the covariance. DFT-s-OFDM "
             "MMSE-PIC uses soft time-domain moments for iterative frequency-domain cancellation without "

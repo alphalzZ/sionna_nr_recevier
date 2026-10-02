@@ -26,9 +26,11 @@ class MimoCdlChannelTest(unittest.TestCase):
             with self.subTest(users=users):
                 settings = replace(
                     base,
-                    pusch=replace(base.pusch, waveform="cp_ofdm", num_layers=4,
-                                  num_antenna_ports=4, dmrs_length=2 if users == 2 else 1,
-                                  n_size_bwp=6, mcs_index=4),
+                    pusch=replace(
+                        base.pusch, waveform="cp_ofdm", num_layers=4,
+                        num_antenna_ports=4, dmrs_length=2 if users == 2 else 1,
+                        n_size_bwp=6, mcs_index=4, dmrs_beta=2**0.5,
+                    ),
                     users=tuple(UserSettings(f"ue{i}", i + 1,
                                              tuple(range(i * 4, i * 4 + 4)))
                                 for i in range(users)),

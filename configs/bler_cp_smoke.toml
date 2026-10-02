@@ -1,0 +1,14 @@
+# Pair with pusch_cp_2ue_2layer.toml and cdl_38_901_2tx_4rx.toml.
+[bler]
+snr_db = [75.0]
+batch_size = 1
+max_frames_per_snr = 1
+target_block_errors = 1
+seed = 4
+num_decoder_iterations = 20
+channel_estimator = "dmrs"
+detector = "lmmse"
+channel_domain = "frequency"
+device = "cpu"
+l_min = -2
+max_delay_spread_s = 0.3e-6

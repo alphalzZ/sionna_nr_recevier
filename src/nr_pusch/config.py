@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import math
 import tomllib
 from typing import Any
 
@@ -192,6 +193,13 @@ class TxSettings:
             cfg.dmrs.num_cdm_groups_without_data = p.dmrs_num_cdm_groups_without_data
             cfg.dmrs.dmrs_port_set = list(user.dmrs_ports)
             cfg.check_config()
+            if p.waveform == "cp_ofdm" and (
+                not math.isfinite(p.dmrs_beta)
+                or abs(p.dmrs_beta - cfg.dmrs.beta) > 1e-6
+            ):
+                raise ValueError(
+                    "cp_ofdm 的 dmrs_beta 必须等于原生 Sionna DMRS beta"
+                )
             configs.append(cfg)
         return configs
 

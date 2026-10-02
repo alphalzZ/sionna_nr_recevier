@@ -3,6 +3,8 @@ from pathlib import Path
 import unittest
 
 import torch
+from sionna.phy.nr import PUSCHTransmitter
+from sionna.phy.ofdm import OFDMModulator
 
 from nr_pusch.config import TxSettings, UserSettings
 from nr_pusch.transmitter import NrPuschTx
@@ -18,9 +20,12 @@ class MimoTransmitterTest(unittest.TestCase):
             with self.subTest(users=users, waveform=waveform):
                 settings = replace(
                     base,
-                    pusch=replace(base.pusch, waveform=waveform, num_layers=4,
-                                  num_antenna_ports=4, dmrs_length=2 if users == 2 else 1,
-                                  n_size_bwp=6, mcs_index=4),
+                    pusch=replace(
+                        base.pusch, waveform=waveform, num_layers=4,
+                        num_antenna_ports=4, dmrs_length=2 if users == 2 else 1,
+                        n_size_bwp=6, mcs_index=4,
+                        dmrs_beta=2**0.5 if waveform == "cp_ofdm" else base.pusch.dmrs_beta,
+                    ),
                     users=tuple(UserSettings(f"ue{i}", i + 1,
                                              tuple(range(4 * i, 4 * (i + 1))))
                                 for i in range(users)),
@@ -45,12 +50,58 @@ class MimoTransmitterTest(unittest.TestCase):
         settings = replace(base,
                            pusch=replace(base.pusch, waveform="cp_ofdm", num_layers=3,
                                          num_antenna_ports=4, precoding="codebook",
-                                         n_size_bwp=6, mcs_index=4),
+                                         n_size_bwp=6, mcs_index=4, dmrs_beta=2**0.5),
                            users=(UserSettings("ue0", 1, (0, 1, 2)),))
         tx = NrPuschTx(settings, device="cpu")
         generated = tx.generate(seed=8)
         self.assertEqual(generated.frequency_grid.shape[:3], (1, 1, 4))
         self.assertEqual(generated.bits.shape[-1], tx.transport_block_size)
+
+    def test_cp_ofdm_frequency_grid_and_time_iq_match_native_sionna(self):
+        settings = TxSettings.from_toml(ROOT / "configs" / "pusch_cp_2ue_2layer.toml")
+        tx = NrPuschTx(settings, device="cpu")
+        bits = torch.arange(2 * tx.transport_block_size, dtype=torch.int32)
+        bits = (bits % 2).reshape(1, 2, tx.transport_block_size).float()
+
+        sent = tx.generate(bits=bits)
+        native_freq = PUSCHTransmitter(
+            settings.to_sionna_configs(), return_bits=False, output_domain="freq",
+            device="cpu",
+        )
+        native_time = PUSCHTransmitter(
+            settings.to_sionna_configs(), return_bits=False, output_domain="time",
+            device="cpu",
+        )
+        torch.testing.assert_close(
+            sent.frequency_grid, native_freq(bits), rtol=0, atol=1e-5
+        )
+        torch.testing.assert_close(sent.iq, native_time(bits), rtol=0, atol=1e-5)
+        modulated = OFDMModulator(
+            tx._tx_freq.resource_grid.cyclic_prefix_length, device="cpu"
+        )(sent.frequency_grid)
+        torch.testing.assert_close(sent.iq, modulated, rtol=0, atol=1e-5)
+
+    def test_cp_type2_dmrs_symbol_contains_data_and_pilot_re(self):
+        base = TxSettings.from_toml(ROOT / "configs" / "pusch_cp_2ue_2layer.toml")
+        settings = replace(
+            base,
+            pusch=replace(
+                base.pusch,
+                dmrs_config_type=2,
+                dmrs_num_cdm_groups_without_data=1,
+                dmrs_beta=1.0,
+                num_layers=1,
+                num_antenna_ports=1,
+            ),
+            users=(UserSettings("ue0", 1, (0,)),),
+        )
+        tx = NrPuschTx(settings, device="cpu")
+        result = tx.generate(seed=11)
+        mask = tx._tx_freq.pilot_pattern.mask[0, 0]
+        dmrs_symbol = tx.configs[0].dmrs_symbol_indices[0]
+        self.assertTrue(torch.any(mask[dmrs_symbol]))
+        self.assertTrue(torch.any(~mask[dmrs_symbol]))
+        self.assertEqual(result.metadata["frequency_grid_stage"], "Sionna CP-OFDM resource grid")
 
 
 if __name__ == "__main__":
