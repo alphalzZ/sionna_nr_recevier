@@ -876,6 +876,53 @@ def _build_dmrs_frequency_basis(
     )
 
 
+def _dmrs_symbol_indices(resource_grid) -> tuple[int, ...]:
+    """Return all PUSCH DMRS OFDM symbol indices in time order."""
+    mask = resource_grid.pilot_pattern.mask[0, 0]
+    dmrs_symbols = torch.where(mask.any(dim=-1))[0]
+    if dmrs_symbols.numel() == 0:
+        raise ValueError("PUSCH resource grid contains no DMRS OFDM symbols")
+    return tuple(int(symbol) for symbol in dmrs_symbols.tolist())
+
+
+def _interpolate_dmrs_time(
+    values: torch.Tensor,
+    dmrs_symbols: tuple[int, ...],
+    num_ofdm_symbols: int,
+    *,
+    variance: bool = False,
+) -> torch.Tensor:
+    """Interpolate estimates between DMRS occasions and hold at slot edges.
+
+    ``values`` has DMRS occasion on axis ``-2``. Variances use squared
+    interpolation weights, assuming independent per-occasion estimation noise.
+    """
+    if not dmrs_symbols or values.ndim < 2 or values.shape[-2] != len(dmrs_symbols):
+        raise ValueError("DMRS estimates and OFDM symbol positions do not match")
+    if len(dmrs_symbols) == 1:
+        return values[..., :1, :].expand(
+            *values.shape[:-2], num_ofdm_symbols, values.shape[-1]
+        )
+
+    pilot_positions = torch.tensor(dmrs_symbols, dtype=torch.long, device=values.device)
+    symbol_positions = torch.arange(num_ofdm_symbols, dtype=torch.long, device=values.device)
+    right_indices = torch.searchsorted(pilot_positions, symbol_positions).clamp_max(
+        len(dmrs_symbols) - 1
+    )
+    left_indices = (right_indices - 1).clamp_min(0)
+    left_positions = pilot_positions.index_select(0, left_indices)
+    right_positions = pilot_positions.index_select(0, right_indices)
+    denominator = (right_positions - left_positions).clamp_min(1).to(values.real.dtype)
+    fraction = (
+        (symbol_positions - left_positions).to(values.real.dtype) / denominator
+    ).clamp(0.0, 1.0)
+    weights = fraction.reshape((1,) * (values.ndim - 2) + (num_ofdm_symbols, 1))
+    left = values.index_select(-2, left_indices)
+    right = values.index_select(-2, right_indices)
+    if variance:
+        return left * (1.0 - weights).square() + right * weights.square()
+    return left * (1.0 - weights) + right * weights
+
 
 class DftSOfdmDmrsEstimator(torch.nn.Module):
     """Fit frequency-domain OCC DMRS to a finite-tap channel basis.
@@ -885,6 +932,8 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
     sequence, while this transmitter maps a transform-precoded low-PAPR DMRS.
     The fitted taps are only interpolation parameters; input and output are
     both frequency-domain resource grids and CSI.
+    For multiple occasions, the estimator fits each DMRS symbol and linearly
+    interpolates between adjacent estimates, holding edge estimates outside.
     """
 
     def __init__(
@@ -915,11 +964,7 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
             if not torch.isfinite(tap_power_prior).all().item() or not torch.all(tap_power_prior > 0).item():
                 raise ValueError("DMRS tap-power prior 必须全部为正有限值")
         self.register_buffer("_tap_power_prior", tap_power_prior)
-        mask = resource_grid.pilot_pattern.mask[0, 0]
-        dmrs_symbols = torch.where(mask.sum(dim=-1) > 0)[0]
-        if dmrs_symbols.numel() != 1:
-            raise ValueError("初始 DFT-s-OFDM DMRS 估计要求恰好一个 DMRS OFDM 符号")
-        self._dmrs_symbol = int(dmrs_symbols.item())
+        self._dmrs_symbols = _dmrs_symbol_indices(resource_grid)
 
         support_groups: dict[tuple[int, ...], list[int]] = {}
         for user in range(4):
@@ -1089,43 +1134,71 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
             if self._estimate_delay
             else None
         )
-        y_pilot = y[:, 0, :, self._dmrs_symbol, :]
-        for base, partner, design_name, support_name, covariance_name in self._pairs:
-            design = getattr(self, design_name).to(y.device)
-            support = getattr(self, support_name).to(y.device)
-            covariance = getattr(self, covariance_name).to(y.device)
-            observations = y_pilot.index_select(-1, support)
-            rhs = observations.permute(2, 0, 1).reshape(support.numel(), -1)
-            taps, posterior = self._fit_pair(design, rhs, no)
-            for user, tap_slice in (
-                (base, slice(0, self._num_taps)),
-                (partner, slice(self._num_taps, 2 * self._num_taps)),
-            ):
-                user_taps = taps[..., tap_slice]
-                h_freq = user_taps @ self._frequency_basis.to(y.device).T
-                if offsets is not None:
-                    offsets[:, user] = self._estimate_offsets(h_freq)
-                frequency_basis = self._frequency_basis.to(y.device)
-                if posterior is None:
-                    covariance_user = covariance[tap_slice, tap_slice]
-                    frequency_error = torch.einsum(
-                        "nl,lm,nm->n", frequency_basis, covariance_user,
-                        frequency_basis.conj()
-                    ).real.clamp_min(0.0)
-                    estimation_error = no[:, 0, :, None] * frequency_error[None, None, :]
-                else:
-                    covariance_user = posterior[:, :, tap_slice, tap_slice]
-                    estimation_error = torch.einsum(
-                        "nl,balm,nm->ban", frequency_basis, covariance_user,
-                        frequency_basis.conj()
-                    ).real.clamp_min(0.0)
-                h_hat[:, 0, :, user, 0, :, :] = h_freq.unsqueeze(-2).expand(
-                    -1, -1, self._num_ofdm_symbols, -1
-                )
-                estimation_error = estimation_error.unsqueeze(-2).expand(
-                    -1, -1, self._num_ofdm_symbols, -1
-                )
-                err_var[:, 0, :, user, 0, :, :] = estimation_error
+        dmrs_h = torch.empty(
+            (
+                batch,
+                num_rx,
+                num_rx_ant,
+                4,
+                len(self._dmrs_symbols),
+                self._num_subcarriers,
+            ),
+            dtype=y.dtype,
+            device=y.device,
+        )
+        dmrs_error = torch.empty_like(dmrs_h.real)
+        frequency_basis = self._frequency_basis.to(y.device)
+        for dmrs_index, dmrs_symbol in enumerate(self._dmrs_symbols):
+            y_pilot = y[:, 0, :, dmrs_symbol, :]
+            for base, partner, design_name, support_name, covariance_name in self._pairs:
+                design = getattr(self, design_name).to(y.device)
+                support = getattr(self, support_name).to(y.device)
+                covariance = getattr(self, covariance_name).to(y.device)
+                observations = y_pilot.index_select(-1, support)
+                rhs = observations.permute(2, 0, 1).reshape(support.numel(), -1)
+                taps, posterior = self._fit_pair(design, rhs, no)
+                for user, tap_slice in (
+                    (base, slice(0, self._num_taps)),
+                    (partner, slice(self._num_taps, 2 * self._num_taps)),
+                ):
+                    user_taps = taps[..., tap_slice]
+                    h_freq = user_taps @ frequency_basis.T
+                    if offsets is not None and dmrs_index == 0:
+                        offsets[:, user] = self._estimate_offsets(h_freq)
+                    if posterior is None:
+                        covariance_user = covariance[tap_slice, tap_slice]
+                        frequency_error = torch.einsum(
+                            "nl,lm,nm->n",
+                            frequency_basis,
+                            covariance_user,
+                            frequency_basis.conj(),
+                        ).real.clamp_min(0.0)
+                        estimation_error = no[:, 0, :, None] * frequency_error[None, None, :]
+                    else:
+                        covariance_user = posterior[:, :, tap_slice, tap_slice]
+                        estimation_error = torch.einsum(
+                            "nl,balm,nm->ban",
+                            frequency_basis,
+                            covariance_user,
+                            frequency_basis.conj(),
+                        ).real.clamp_min(0.0)
+                    dmrs_h[:, 0, :, user, dmrs_index, :] = h_freq
+                    dmrs_error[:, 0, :, user, dmrs_index, :] = estimation_error
+
+        for user in range(4):
+            h_user = _interpolate_dmrs_time(
+                dmrs_h[:, 0, :, user],
+                self._dmrs_symbols,
+                self._num_ofdm_symbols,
+            )
+            error_user = _interpolate_dmrs_time(
+                dmrs_error[:, 0, :, user],
+                self._dmrs_symbols,
+                self._num_ofdm_symbols,
+                variance=True,
+            )
+            h_hat[:, 0, :, user, 0, :, :] = h_user
+            err_var[:, 0, :, user, 0, :, :] = error_user
         self.last_channel_estimate = h_hat.detach()
         self.last_offsets = offsets
         return h_hat, err_var
@@ -1156,9 +1229,9 @@ class _CbCrcProbe(torch.nn.Module):
 class NrPuschRx:
     """Decode time-domain captures or simulated samples for four PUSCH users.
 
-    ``channel_estimator="dmrs"`` estimates the initial static-slot profile
-    with OCC least squares. ``"dmrs-lmmse"`` applies a CDL tap-power prior;
-    ``"perfect"`` consumes simulated CDL CSI as an upper bound.
+    ``channel_estimator="dmrs"`` fits OCC least squares at each DMRS occasion
+    and interpolates channel estimates across the slot. ``"dmrs-lmmse"`` uses
+    a CDL tap-power prior; ``"perfect"`` consumes simulated CDL CSI as an upper bound.
     """
 
     def __init__(
@@ -1275,8 +1348,7 @@ class NrPuschRx:
                 device=template_tx.device,
             )
             pilot_grid = template_tx.generate(batch_size=1, bits=zero_bits).frequency_grid[0, :, 0]
-            mask = template_tx._tx_freq.pilot_pattern.mask[0, 0]
-            dmrs_symbol = int(torch.where(mask.sum(dim=-1) > 0)[0].item())
+            dmrs_symbol = _dmrs_symbol_indices(template_tx._tx_freq)[0]
             pilot_grid = pilot_grid[:, dmrs_symbol, :]
             estimator = DftSOfdmDmrsEstimator(
                 pilot_grid,

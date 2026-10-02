@@ -85,8 +85,13 @@ class TxSettings:
         if self.pusch.waveform == "dft_s_ofdm":
             if self.pusch.dmrs_config_type != 1:
                 raise NotImplementedError("DFT-s-OFDM 当前仅支持 PUSCH DMRS config type 1")
-            if self.pusch.dmrs_additional_position != 0:
-                raise NotImplementedError("DFT-s-OFDM 当前仅支持单个 PUSCH DMRS 符号")
+            additional_position = self.pusch.dmrs_additional_position
+            if (
+                isinstance(additional_position, bool)
+                or not isinstance(additional_position, int)
+                or additional_position not in {0, 1, 2}
+            ):
+                raise ValueError("dmrs_additional_position 必须为 0、1 或 2 的整数")
             if self.pusch.dmrs_num_cdm_groups_without_data != 2:
                 raise NotImplementedError("DFT-s-OFDM 当前要求两个 type-1 DMRS CDM groups")
             rb_count = self.pusch.n_size_bwp

@@ -8,7 +8,7 @@
 - 2026-10-01 完成当前 CDL-A/4 UE/MCS 20 的预注册 tap-power LMMSE 配对 holdout：25/30 dB BLER 分别降低 12.52%/11.89%，两点配对 97.5% 单侧上界均小于 0，data-RE CSI NMSE 也下降；60 dB 未回归。**仅保留为显式 `dmrs-lmmse` opt-in**，现有 `dmrs` 默认与 H5 抓包 profile 不变；测量细节见 §3.5。
 - 2026-09-29 一轮结构化诊断（约 150 组配置）未能把 ue3 推过 2/6 CB，并已排除 SNR、CSI 偏差、DMRS 端口映射、扰码、检测器选择、PIC/LDPC 轮数、`err_var` 标定、CP 截断与逐符号跟踪等方向；ue3 的 `|h|²`、`err_var/|h|²` 和导频拟合残差都是四 UE 中最优的，单流 QAM 距离也与能解码的 ue2 同档，却 0/6 CB。结论与测量见 §3.1，**下一轮应先核对数据本身而非继续调参**。
 - 低码率抓包统一沿用 `rx_pusch_4ue.toml`，没有把高码率抓包专用的窗口强加给其他抓包：`RxTestVector.h5` 为 4/4，`Case11121314` 为 4/4，`Case78914` 为 3/4（ue0 未通过）。
-- 本接收机目前假定 4 UE、每 UE 1 层、4 根接收天线、一个 DMRS OFDM 符号、两组各两个 UE 的共享 comb/OCC、配置对应的完整 DFT-s-OFDM 数据符号。只有这些几何条件通过代码检查；不代表支持任意 NR PUSCH 配置。
+- 当前支持 4 UE、每 UE 1 层、4 根接收天线和两组共享 comb/OCC。DMRS 估计器逐 occasion 拟合，在相邻 occasion 间按 OFDM 符号位置线性插值，首尾保持最近估计；`err_var` 用平方权重传播独立 occasion 的测量误差。
 - H5 没有提供可靠的接收噪声测量值。profile 中的 `noise_variance` 是调试接收机时采用的模型参数，不是抓包测得的热噪声功率。H5 的 `ue*_tx_bits` 可能是自身 CRC 已失败的参考链路输出，因此对抓包以本机 CRC 判定成功；参考 bit error 仅供诊断。仿真中发送原始 bit 已知，才可直接核对 BER/BLER。
 
 ## 2. 输入、信号模型与处理链
@@ -49,7 +49,7 @@ A_{k,(v,\ell)}=P_v[k]B_{k,\ell},\quad
 \widehat{\mathbf h}_r=\arg\min_{\mathbf h}\|\mathbf y_{r,\mathcal P}-A\mathbf h\|_2^2.
 $$
 
-代码以 `torch.linalg.lstsq` **联合**求解这两个 UE 在每根 RX 天线上的抽头，用 $B$ 合成全部有效子载波的频响，并把单个 DMRS 符号的估计广播到同一 slot 的数据符号。用 $\operatorname{pinv}(A^HA)$ 的用户块、基函数与输入噪声方差计算近似的逐频点 CSI 误差方差。每组导频 RE 数必须至少覆盖两个 UE 合计的抽头数：代码约束为 $|\mathcal P|\ge2N_{\rm tap}$；窗口越宽，拟合自由度与噪声放大风险也越高。该误差方差只建模 LS 噪声传播，不保证覆盖 ICI、模型外多径或未建模的符号内变化。
+代码以 `torch.linalg.lstsq` **联合**求解每个 DMRS occasion 上两个 UE 在每根 RX 天线上的抽头，用 $B$ 合成全部有效子载波的频响，再按相邻 DMRS occasion 线性插值到数据符号。用 $\operatorname{pinv}(A^HA)$ 的用户块、基函数与输入噪声方差计算每个 occasion 的逐频点 CSI 误差方差，并按插值权重平方传播。每组导频 RE 数必须至少覆盖两个 UE 合计的抽头数：代码约束为 $|\mathcal P|\ge2N_{\rm tap}$；窗口越宽，拟合自由度与噪声放大风险也越高。该误差方差不包含时间插值模型误差，也不保证覆盖 ICI、模型外多径或未建模的符号内变化。
 
 `l_max` 使用 Sionna 的 `time_lag_discrete_time_channel(sample_rate_hz,max_delay_spread_s)` 确定；在本抓包 18 MHz 下，2 µs 对应 `l_max=42`，所以高码率 profile 的拟合窗口是 **[-44,42]，共 87 个抽头/UE**。默认 `l_min=-6`、3 µs 则是 [-6,60]。改变 `l_min` 不等于事后给现有 CSI 乘一条相位斜坡：它直接改变了**联合拟合的列空间**，会改变两个共享 comb 用户的分离、插值偏差和噪声传播。这是此次 ue2 恢复的可重复配置变化；无法仅凭 CRC 将原因唯一归结为某一条物理路径。
 
@@ -247,6 +247,21 @@ PYTHONPATH=src /home/le-lei/workspace/test/.venv/bin/python -m unittest \
 回归基线：`tests/integration/test_matlab_rx_capture.py` 检查原始抓包全 4 UE 解码、高码率 profile 至少 ue0–ue2 CRC 通过、SIC 内部使用显式扰码进行 CRC 门控；`soft-mmse-pic` 有 LDPC 外信息位序/纠错单测、4×4 CDL payload/CRC 回环和 paired BLER 检查。历史上一轮加入 learned spatial projection 与配对 bootstrap 用例时，suite 共运行 64 项、63 项通过；唯一失败是 `test_matlab_payload_and_frequency_grid_match_transmitter`，因现有 `configs/pusch_4ue.toml` DMRS 端口映射与供应 MATLAB fixture 置换不一致。空间投影代码及其专用测试现已移除；上述数量仅为历史记录。未改动该用户配置或 fixture。
 
 2026-10-01 本次完整 suite 运行 57 项，56 项通过；唯一失败仍为 `integration.test_pusch_transmitter.PuschTransmitterTest.test_matlab_payload_and_frequency_grid_match_transmitter`，供应 MATLAB fixture 与发射端频域网格有 1,200/33,600 项不匹配。与本估计器变更无关。
+2026-10-02 本次完整 suite 运行 65 项、64 项通过；唯一失败仍是 `test_matlab_payload_and_frequency_grid_match_transmitter`，供应 MATLAB fixture 与发射端频域网格有 1,200/33,600 项不匹配。新增的多 DMRS 接收、映射、Web API 回归均通过；未改动供应 fixture 或活动 TX profile。
+
+### CDL-A 多 DMRS occasion 仿真对比（2026-10-02）
+
+使用 `configs/pusch_4ue.toml`、`configs/cdl_38_901_4x4.toml`（CDL-A、3.5 GHz、0 m/s、4×4）、MCS 20；其余固定为 LS DMRS、频域信道、`soft-mmse-pic` 一轮、20 次 LDPC 迭代、阻尼 0.25、CPU、seed `20260924`。只改变 `dmrs_additional_position`；0/1/2 分别使用 1/2/3 个 DMRS occasion。每点 `batch_size=2`，因此每帧 4 个 TB。
+
+aggregate JSON 保存在 `/tmp/dmrs_interpolation_comparison.json` 与 `/tmp/dmrs_interpolation_comparison_25db_256frames.json`。
+
+| Additional position | Bits/TB | 25 dB BLER / BER（256 帧，1024 TB） | 30 dB BLER（64 帧，256 TB） | 60 dB BLER（64 帧，256 TB） |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 28,168 | 0.40723 / 0.03438 | 0.03125 | 0 |
+| 1 | 26,120 | 0.40430 / 0.03072 | 0.02734 | 0 |
+| 2 | 23,568 | 0.32715 / 0.02599 | 0.01953 | 0 |
+
+在 25 dB 样本中，position 2 相对 position 0 少 82/1024 个 TB CRC 失败（BLER 0.40723→0.32715）；position 1 为 414/1024 对 417/1024，BLER 基本持平但 BER 下降。30 dB 每组仅 256 TB，60 dB 全部为零错误；这些是同 seed 的有限样本观察，不是置信区间或统计 holdout，不能据此保证普遍 BLER 增益。额外 DMRS 会减少数据 RE：表中 bits/TB 分别下降约 7.3% 和 16.3%，故可靠性比较不等于等吞吐比较。高速移动场景未覆盖。
 
 ## 5. 下一轮优化设计与实验纪律
 

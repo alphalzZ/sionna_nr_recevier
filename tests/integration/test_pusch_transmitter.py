@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import unittest
 
@@ -49,6 +50,46 @@ class PuschTransmitterTest(unittest.TestCase):
         generated_zeros = np.count_nonzero(np.abs(grid) < 1e-12, axis=(1, 3))
         reference_zeros = np.count_nonzero(np.abs(reference.frequency_grid) < 1e-12, axis=(2, 3))
         np.testing.assert_array_equal(generated_zeros, reference_zeros)
+
+    def test_additional_dmrs_positions_map_all_configured_occasions(self):
+        settings = TxSettings.from_toml(ROOT / "configs" / "pusch_4ue.toml")
+        for additional_position, expected_symbol_count in ((1, 2), (2, 3)):
+            with self.subTest(additional_position=additional_position):
+                variant = replace(
+                    settings,
+                    pusch=replace(
+                        settings.pusch,
+                        dmrs_additional_position=additional_position,
+                    ),
+                )
+                tx = NrPuschTx(variant, device="cpu")
+                generated = tx.generate(batch_size=1, seed=19)
+                mask = tx._tx_freq.pilot_pattern.mask
+                dmrs_symbols = torch.where(mask[0, 0].any(dim=-1))[0]
+                self.assertEqual(dmrs_symbols.numel(), expected_symbol_count)
+
+                grid = generated.frequency_grid[0]
+                expected_dmrs_re = variant.pusch.n_size_bwp * 12 // 2
+                for user in range(len(variant.users)):
+                    user_mask = mask[user, 0]
+                    user_symbols = torch.where(user_mask.any(dim=-1))[0]
+                    torch.testing.assert_close(user_symbols, dmrs_symbols)
+                    first_support = None
+                    for symbol in user_symbols:
+                        symbol_index = int(symbol.item())
+                        support = grid[user, 0, symbol_index].abs() > 0
+                        self.assertEqual(int(support.sum().item()), expected_dmrs_re)
+                        if first_support is None:
+                            first_support = support
+                        else:
+                            self.assertTrue(torch.equal(support, first_support))
+
+        unsupported = replace(
+            settings,
+            pusch=replace(settings.pusch, dmrs_additional_position=3),
+        )
+        with self.assertRaisesRegex(ValueError, "dmrs_additional_position"):
+            unsupported.validate()
 
     @unittest.skipUnless(torch.cuda.is_available(), "需要可用的 CUDA 设备才能复现全局默认设备与请求设备不一致的场景")
     def test_explicit_cpu_device_overrides_sionna_default_device(self):

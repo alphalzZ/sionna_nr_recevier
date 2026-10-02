@@ -71,5 +71,64 @@ class WebEstimatorMatrixTest(unittest.TestCase):
                 app.shutdown()
 
 
+    def test_web_saves_and_queues_tx_with_additional_dmrs_position_one(self):
+        with tempfile.TemporaryDirectory(prefix="nr-pusch-web-additional-dmrs-") as temporary:
+            root = Path(temporary)
+            config_dir = root / "configs"
+            config_dir.mkdir()
+            simulation_config = ROOT / "configs" / "bler_smoke.toml"
+            for path in (TX_CONFIG, CHANNEL_CONFIG, simulation_config):
+                shutil.copyfile(path, config_dir / path.name)
+
+            app = SimulationWebApp(config_dir, root / "runs")
+            worker_entered = Event()
+            app._execute = lambda _job_id: worker_entered.set()
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                tx_text = app.get_config("tx", TX_CONFIG.name)["text"]
+                tx_text = tx_text.replace(
+                    "dmrs_additional_position = 0",
+                    "dmrs_additional_position = 1",
+                    1,
+                )
+                save_request = Request(
+                    f"{base_url}/api/configs/tx/{TX_CONFIG.name}",
+                    data=json.dumps({"text": tx_text}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="PUT",
+                )
+                with urlopen(save_request, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    saved = json.loads(response.read())
+                self.assertIn("dmrs_additional_position = 1", saved["text"])
+
+                request_data = {
+                    "tx_name": TX_CONFIG.name,
+                    "tx_text": saved["text"],
+                    "channel_name": CHANNEL_CONFIG.name,
+                    "channel_text": app.get_config("channel", CHANNEL_CONFIG.name)["text"],
+                    "simulation_name": simulation_config.name,
+                    "simulation_text": app.get_config("simulation", simulation_config.name)["text"],
+                }
+                run_request = Request(
+                    f"{base_url}/api/runs",
+                    data=json.dumps(request_data).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(run_request, timeout=5) as response:
+                    self.assertEqual(response.status, 201)
+                    job = json.loads(response.read())
+                self.assertTrue(worker_entered.wait(5))
+                self.assertEqual(job["status"], "queued")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+                app.shutdown()
+
 if __name__ == "__main__":
     unittest.main()

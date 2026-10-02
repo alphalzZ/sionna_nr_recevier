@@ -4,7 +4,7 @@
 
 ## 当前发送端
 
-当前实现以 Sionna 2.0.1 的 `PUSCHTransmitter` 生成 PUSCH 数据资源网格，并支持 CP-OFDM 和 DFT-s-OFDM 波形输出。DFT-s-OFDM 对数据符号应用酉 DFT，并按 type-1 低 PAPR 序列生成 DMRS 后进行 OFDM 调制。由于 Sionna 2.0.1 的组合 PUSCH 发射器不支持 transform precoding，配置中的 DFT 预编码 MCS 会映射到同调制阶数和码率的原生 Sionna MCS，以复用其 TB 编码器。当前配置为 DFT-s-OFDM MCS table 1/index 20，目标码率 0.6015625，TB 大小 28,168 bit。
+当前实现以 Sionna 2.0.1 的 `PUSCHTransmitter` 生成 PUSCH 数据资源网格，并支持 CP-OFDM 和 DFT-s-OFDM 波形输出。DFT-s-OFDM 对数据符号应用酉 DFT，并按 type-1 低 PAPR 序列生成 DMRS 后进行 OFDM 调制；`[pusch].dmrs_additional_position` 支持 0、1、2，由 Sionna 资源图决定各 DMRS occasion。由于 Sionna 2.0.1 的组合 PUSCH 发射器不支持 transform precoding，配置中的 DFT 预编码 MCS 会映射到同调制阶数和码率的原生 Sionna MCS，以复用其 TB 编码器。当前活动配置为 DFT-s-OFDM MCS table 1/index 20，目标码率 0.6015625，TB 大小 28,168 bit。
 
 ## CDL 信道
 
@@ -34,11 +34,11 @@ nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /tmp/pusch_rx_grid.npz --
 
 `NrPuschRx` 使用 Sionna PUSCH TB 解码器、4×4 MIMO 检测，以及 DFT-s-OFDM 每数据符号的逆 DFT。时域 IQ 先由 Sionna OFDM 解调为资源网格；直接加载的频域网格跳过这一步。两种输入共用频域 DMRS 估计接口：默认 `channel_estimator="dmrs"` 用发送端实际映射的低 PAPR DMRS 和 OCC 端口序列，对每对共享 comb 的用户做联合 LS 拟合，输出各子载波频响和估计误差方差；显式 `dmrs-lmmse` 模式在相同设计矩阵上使用 CDL tap-power prior 和后验协方差。Sionna 原生 PUSCH 导频序列与本仓库的 DFT-s-OFDM 序列不同，因此保留自定义 OCC 处理。`perfect` 模式直接使用仿真 CDL CSI，仅用于上界对照。
 
-DMRS 的 LS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围：当前为 18 MHz 采样率下的 `-6..60`，共 67 taps。这是接收机的时延范围先验，不读取本帧的真实信道系数。单个 DMRS 符号的估计扩展到整个 slot，适用于当前零速静态 CDL profile；高 Doppler 或多 DMRS 配置需扩展时频插值并用抓包参考验证。
+DMRS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围：当前为 18 MHz 采样率下的 `-6..60`，共 67 taps，这是时延范围先验，不读取本帧真实信道系数。多个 DMRS occasion 各自拟合 CSI，再按 OFDM 符号位置对相邻估计做复数线性插值；首个/末个 occasion 之外保持最近估计。`err_var` 按插值权重平方传播，假设各 occasion 的估计噪声独立，不包含信道时变造成的插值模型误差；高 Doppler 场景仍需独立验证。
 
 ### CDL tap-power LMMSE 验证
 
-`dmrs-lmmse` 是显式 opt-in；现有 `dmrs` 默认、活动 TX/CDL profile 和 DMRS 资源均不变。prior 仅由独立训练 seed 下的 CDL realization 拟合，不使用开发/holdout 信道、payload 或 CRC。主验证固定单符号 DMRS 与 `soft-mmse-pic` 检测器，每帧只生成一次 payload、CDL realization 和 AWGN，再配对运行 LS、LMMSE 和 perfect-CSI 三臂；增加 DMRS 符号不能满足优化验收。
+`dmrs-lmmse` 是显式 opt-in；现有 `dmrs` 默认和活动 TX/CDL profile 不变。LMMSE 算法验证固定单符号 DMRS；另行比较 `dmrs_additional_position=0/1/2` 的可靠性与 TBS 资源代价，结果见 `docs/receiver_optimization.md`，不能视为等吞吐比较。
 
 短时连通性验证（`--frames-per-snr` 只覆盖 development/holdout，60 dB 安全检查仍使用配置中的 64 帧）：
 
