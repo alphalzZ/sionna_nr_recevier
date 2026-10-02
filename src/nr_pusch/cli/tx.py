@@ -10,7 +10,7 @@ from nr_pusch.transmitter import NrPuschTx
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate 4-UE NR PUSCH time-domain IQ")
+    parser = argparse.ArgumentParser(description="Generate configurable NR PUSCH time-domain IQ")
     parser.add_argument("--config", required=True, help="TOML transmit configuration")
     parser.add_argument("--output", required=True, help="Output NPZ path")
     parser.add_argument("--batch-size", type=int, default=1)
@@ -25,6 +25,11 @@ def main() -> None:
     print(f"IQ: {iq_path}")
     print(f"Manifest: {manifest_path}")
     print(f"IQ shape [batch,user,tx_antenna,sample]: {tuple(result.iq.shape)}")
+    print(
+        f"Topology: {len(settings.users)} users × {settings.pusch.num_layers} layers/user "
+        f"= {len(settings.users) * settings.pusch.num_layers} streams; "
+        f"{settings.pusch.num_antenna_ports} Tx antennas/user"
+    )
     print(f"Transport block size per user: {transmitter.transport_block_size} bits")
     print(f"Sample rate: {result.sample_rate_hz} Hz")
 

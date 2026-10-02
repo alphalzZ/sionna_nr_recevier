@@ -1,4 +1,4 @@
-"""Decode a captured or simulated four-antenna PUSCH IQ archive."""
+"""Decode a captured or simulated PUSCH IQ archive."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from nr_pusch.transmitter import NrPuschTx
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Analyze and decode four-user DFT-s-OFDM PUSCH captures")
+    parser = argparse.ArgumentParser(description="Analyze and decode configurable NR PUSCH captures")
     parser.add_argument(
         "--rx-config", "--tx-config", dest="rx_config", required=True,
         help="TOML PUSCH profile used to configure the receiver",
@@ -189,6 +189,13 @@ def main() -> None:
             parser.error(f"无法读取加扰序列: {exc}")
         scrambling_sequences = torch.from_numpy(sequences)
     settings = TxSettings.from_toml(args.rx_config)
+    if input_format == "matlab-h5" and (
+        len(settings.users) != 4 or settings.pusch.num_layers != 1
+        or settings.pusch.num_antenna_ports != 1
+    ):
+        parser.error("MATLAB H5 夹具仅支持四用户、单层、单发射天线的固定捕获格式")
+    if args.channel_config is not None and channel_estimator != "dmrs-lmmse":
+        ChannelSettings.from_toml(args.channel_config).validate_transmitter(settings)
     dmrs_tap_power_prior = None
     prior_path_value = receiver_profile.get("dmrs_tap_power_prior_path")
     if channel_estimator != "dmrs-lmmse" and prior_path_value is not None:
@@ -209,6 +216,7 @@ def main() -> None:
             channel_config_path = Path(args.rx_config).resolve().parent / channel_config_path
         try:
             channel_settings = ChannelSettings.from_toml(channel_config_path)
+            channel_settings.validate_transmitter(settings)
             tx_preview = NrPuschTx(settings, device=args.device)
             compatibility = dmrs_prior_compatibility(
                 settings,
@@ -306,6 +314,11 @@ def main() -> None:
     crc = result.crc_status.detach().cpu()
     print(f"Decoded blocks: {crc.numel()}")
     print(f"CRC pass: {int(crc.sum())}/{crc.numel()}")
+    print(
+        f"Topology: {len(settings.users)} users × {settings.pusch.num_layers} "
+        f"layers/user; {settings.pusch.num_antenna_ports} Tx/user → "
+        f"{result.metadata['num_rx_antennas']} Rx antennas"
+    )
     for index, passed in enumerate(crc.reshape(-1).tolist()):
         print(f"UE {index}: {'PASS' if passed else 'FAIL'}")
     if reference_comparison is not None:

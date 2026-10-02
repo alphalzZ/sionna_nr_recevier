@@ -634,7 +634,7 @@ function renderRxResult(result) {
   }
   const users = Array.isArray(result.constellation?.users) ? result.constellation.users : [];
   const count = users.reduce((total, user) => total + Math.min(user.real?.length || 0, user.imag?.length || 0), 0);
-  $("rx-constellation-count").textContent = `${count} 个复数符号 · 每 UE 独立坐标`;
+  $("rx-constellation-count").textContent = `${count} 个复数符号 · 每 UE/层独立坐标`;
   requestAnimationFrame(() => drawConstellation(result.constellation));
 }
 

@@ -25,7 +25,7 @@ class CarrierSettings:
 class UserSettings:
     name: str
     n_rnti: int
-    dmrs_port: int
+    dmrs_ports: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,12 @@ class PuschSettings:
     dmrs_additional_position: int
     dmrs_num_cdm_groups_without_data: int
     dmrs_beta: float
+    num_layers: int = 1
+    num_antenna_ports: int = 1
+    precoding: str = "non-codebook"
+    tpmi: int = 0
+    dmrs_length: int = 1
+    dft_s_dmrs_port_order: str = "comb-first"
 
 
 @dataclass(frozen=True)
@@ -58,24 +64,36 @@ class TxSettings:
         pusch_raw = dict(raw["pusch"])
         pusch_raw["symbol_allocation"] = tuple(pusch_raw["symbol_allocation"])
         pusch = PuschSettings(**pusch_raw)
-        users = tuple(UserSettings(**u) for u in raw["users"])
+        users = tuple(UserSettings(**{**u, "dmrs_ports": tuple(u["dmrs_ports"])}) for u in raw["users"])
         settings = cls(carrier=carrier, pusch=pusch, users=users)
         settings.validate()
         return settings
 
     def validate(self) -> None:
-        if len(self.users) != 4:
-            raise ValueError(f"首批发送配置要求 4 个用户，当前为 {len(self.users)}")
+        p = self.pusch
+        if not self.users:
+            raise ValueError("至少需要一个用户")
+        if not 1 <= p.num_layers <= 4:
+            raise ValueError("num_layers 必须为 1..4")
+        if len(self.users) * p.num_layers > 8:
+            raise ValueError("总流数不能超过 8")
+        if p.num_antenna_ports not in {1, 2, 4} or p.num_layers > p.num_antenna_ports:
+            raise ValueError("num_antenna_ports 必须是 1、2 或 4，且不少于 num_layers")
+        if p.precoding == "non-codebook" and p.num_layers != p.num_antenna_ports:
+            raise ValueError("non-codebook 要求 num_layers 等于 num_antenna_ports")
         if len({u.name for u in self.users}) != len(self.users):
             raise ValueError("用户 name 必须唯一")
         if len({u.n_rnti for u in self.users}) != len(self.users):
-            raise ValueError("4 个用户的 n_rnti 必须互不相同")
-        if any(not 0 <= u.dmrs_port <= 3 for u in self.users):
-            raise ValueError("当前首批配置要求 DMRS port 位于 0..3")
-        if len({u.dmrs_port for u in self.users}) != len(self.users):
-            raise ValueError("同一时频资源上的 4 个用户必须使用不同 DMRS port")
+            raise ValueError("用户 n_rnti 必须互不相同")
+        ports = [port for u in self.users for port in u.dmrs_ports]
+        if any(len(u.dmrs_ports) != p.num_layers for u in self.users):
+            raise ValueError("每个用户 dmrs_ports 数量必须等于 num_layers")
+        if len(set(ports)) != len(ports):
+            raise ValueError("同一时频资源上的 DMRS ports 必须互不重复")
         if self.pusch.waveform not in {"cp_ofdm", "dft_s_ofdm"}:
             raise ValueError("waveform 仅支持 cp_ofdm 或 dft_s_ofdm")
+        if p.dft_s_dmrs_port_order not in {"comb-first", "native"}:
+            raise ValueError("dft_s_dmrs_port_order 必须为 comb-first 或 native")
         if self.carrier.subcarrier_spacing_khz not in {15, 30, 60, 120, 240}:
             raise ValueError("subcarrier_spacing_khz 必须是 NR numerology 对应的有效值")
         if self.pusch.n_size_bwp < 1:
@@ -101,6 +119,7 @@ class TxSettings:
             if rb_count != 1:
                 raise ValueError("DFT-s-OFDM BWP size must yield a 2/3/5-smooth DFT length")
             self.effective_sionna_mcs()
+        self._build_sionna_configs()
 
     def effective_sionna_mcs(self) -> tuple[int, int]:
         """Return a non-transform Sionna MCS with equivalent Qm and code rate.
@@ -137,8 +156,11 @@ class TxSettings:
         return candidates[0]
 
     def to_sionna_configs(self) -> list[PUSCHConfig]:
-        """Build one single-layer PUSCH config per UE."""
+        """Build one native PUSCH config per UE."""
         self.validate()
+        return self._build_sionna_configs()
+
+    def _build_sionna_configs(self) -> list[PUSCHConfig]:
         configs: list[PUSCHConfig] = []
         for user in self.users:
             cfg = PUSCHConfig()
@@ -157,16 +179,18 @@ class TxSettings:
             cfg.n_size_bwp = p.n_size_bwp
             cfg.n_start_bwp = p.n_start_bwp
             cfg.n_rnti = user.n_rnti
-            cfg.num_layers = 1
-            cfg.num_antenna_ports = 1
-            cfg.precoding = "non-codebook"
+            cfg.num_layers = p.num_layers
+            cfg.num_antenna_ports = p.num_antenna_ports
+            cfg.precoding = p.precoding
+            cfg.tpmi = p.tpmi
             cfg.transform_precoding = False
             cfg.tb.mcs_table, cfg.tb.mcs_index = self.effective_sionna_mcs()
             cfg.dmrs.config_type = p.dmrs_config_type
             cfg.dmrs.type_a_position = p.dmrs_type_a_position
             cfg.dmrs.additional_position = p.dmrs_additional_position
+            cfg.dmrs.length = p.dmrs_length
             cfg.dmrs.num_cdm_groups_without_data = p.dmrs_num_cdm_groups_without_data
-            cfg.dmrs.dmrs_port_set = [user.dmrs_port]
+            cfg.dmrs.dmrs_port_set = list(user.dmrs_ports)
             cfg.check_config()
             configs.append(cfg)
         return configs

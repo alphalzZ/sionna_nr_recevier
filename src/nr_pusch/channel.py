@@ -1,4 +1,4 @@
-"""Sionna 38.901 CDL channel application for four single-antenna PUSCH UEs."""
+"""Sionna 38.901 CDL channel for configurable multi-antenna PUSCH UEs."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ class ChannelResult:
 
     iq: torch.Tensor  # [batch, rx_antenna, sample]
     per_user_iq: torch.Tensor  # [batch, user, rx_antenna, sample]
-    channel_taps: torch.Tensor  # [batch, user, rx_antenna, sample, tap]
+    channel_taps: torch.Tensor  # [batch, user, rx_antenna, tx_antenna, sample, tap]
     sample_rate_hz: int
     metadata: dict[str, Any]
 
@@ -35,15 +35,12 @@ class FrequencyChannelResult:
 
     grid: torch.Tensor  # [batch, num_rx=1, rx_antenna, ofdm_symbol, fft_bin]
     per_user_grid: torch.Tensor  # [batch, user, rx_antenna, ofdm_symbol, fft_bin]
-    channel_frequency_response: torch.Tensor  # [batch, 1, rx_ant, user, 1, symbol, fft_bin]
+    channel_frequency_response: torch.Tensor  # [batch, 1, rx_ant, user, tx_ant, symbol, fft]
     metadata: dict[str, Any]
 
 
 class NrPuschCdlChannel:
-    """Apply independent uplink CDL realizations and sum four UE waveforms."""
-
-    num_users = 4
-    tx_antennas_per_user = 1
+    """Apply independent uplink CDL realizations and sum UE waveforms."""
 
     def __init__(
         self,
@@ -58,8 +55,8 @@ class NrPuschCdlChannel:
         c = settings.channel
         a = settings.antennas
         self.ut_array = AntennaArray(
-            num_rows=1,
-            num_cols=1,
+            num_rows=a.tx_num_rows,
+            num_cols=a.tx_num_cols,
             polarization="single",
             polarization_type=a.polarization_type,
             antenna_pattern=a.antenna_pattern,
@@ -87,9 +84,11 @@ class NrPuschCdlChannel:
         batch processing efficient while matching the time path's tap support.
         The single-tap OFDM model still assumes a sufficient cyclic prefix.
         """
-        if frequency_grid.ndim != 5 or frequency_grid.shape[1:3] != (self.num_users, 1):
+        tx_antennas = self.settings.antennas.tx_num_rows * self.settings.antennas.tx_num_cols
+        if (frequency_grid.ndim != 5 or frequency_grid.shape[1] < 1
+                or frequency_grid.shape[2] != tx_antennas):
             raise ValueError(
-                "frequency_grid 形状必须为 [batch, 4 users, 1 tx antenna, symbols, fft_size]"
+                f"frequency_grid 形状必须为 [batch, user, {tx_antennas} tx antenna, symbols, fft_size]"
             )
         if not frequency_grid.is_complex():
             raise ValueError("frequency_grid 必须为复数张量")
@@ -99,6 +98,7 @@ class NrPuschCdlChannel:
             frequency_grid = frequency_grid.to(self.device)
 
         batch_size = frequency_grid.shape[0]
+        num_users = frequency_grid.shape[1]
         num_symbols = resource_grid.num_ofdm_symbols
         fft_size = resource_grid.fft_size
         num_rx_antennas = self.settings.antennas.rx_num_rows * self.settings.antennas.rx_num_cols
@@ -114,7 +114,7 @@ class NrPuschCdlChannel:
         # per OFDM symbol, avoiding the many Nyquist-rate time samples needed
         # by ApplyTimeChannel.
         a, tau = self._cdl(
-            batch_size * self.num_users,
+            batch_size * num_users,
             num_symbols,
             1.0 / resource_grid.ofdm_symbol_duration,
         )
@@ -135,9 +135,9 @@ class NrPuschCdlChannel:
             dim=-1,
         )
         h_freq = h_flat.reshape(
-            batch_size, self.num_users, 1, num_rx_antennas, 1,
+            batch_size, num_users, 1, num_rx_antennas, 1, tx_antennas,
             num_symbols, fft_size,
-        ).permute(0, 2, 3, 1, 4, 5, 6).contiguous()
+        ).squeeze(2).permute(0, 3, 2, 1, 4, 5, 6).contiguous()
 
         y = self._apply_ofdm_channel(frequency_grid, h_freq)
         # Retain per-UE contributions for diagnostics, using the same channel
@@ -152,8 +152,9 @@ class NrPuschCdlChannel:
             "direction": self.settings.channel.direction,
             "grid_axes": ["batch", "num_rx", "rx_antenna", "ofdm_symbol", "fft_bin"],
             "channel_axes": ["batch", "num_rx", "rx_antenna", "user", "tx_antenna", "ofdm_symbol", "fft_bin"],
-            "num_users": self.num_users,
+            "num_users": num_users,
             "num_rx_antennas": num_rx_antennas,
+            "num_tx_antennas_per_user": tx_antennas,
             "num_ofdm_symbols": num_symbols,
             "fft_size": fft_size,
             "subcarrier_spacing_hz": float(resource_grid.subcarrier_spacing),
@@ -177,16 +178,15 @@ class NrPuschCdlChannel:
         iq: torch.Tensor,
         sample_rate_hz: int,
     ) -> ChannelResult:
-        """Apply CDL to `[batch, 4 users, 1 tx antenna, sample]` IQ.
+        """Apply CDL to ``[batch, user, tx_antenna, sample]`` IQ.
 
-        Each UE gets an independently drawn CDL realization. The returned
-        `iq` sums the four users over the air; `per_user_iq` is retained for
-        tests and interference diagnostics. The output includes the channel
-        filter tail (`num_taps - 1`) as standard linear convolution does.
+        UE links are independent; their received antenna contributions sum
+        over the air. The output includes the channel filter tail.
         """
-        if iq.ndim != 4 or iq.shape[1] != self.num_users or iq.shape[2] != 1:
+        tx_antennas = self.settings.antennas.tx_num_rows * self.settings.antennas.tx_num_cols
+        if iq.ndim != 4 or iq.shape[1] < 1 or iq.shape[2] != tx_antennas:
             raise ValueError(
-                "iq 形状必须为 [batch, 4 users, 1 tx antenna, samples]，"
+                f"iq 形状必须为 [batch, user, {tx_antennas} tx antenna, samples]，"
                 f"实际为 {tuple(iq.shape)}"
             )
         if sample_rate_hz <= 0:
@@ -205,7 +205,7 @@ class NrPuschCdlChannel:
         num_channel_steps = num_samples + num_taps - 1
 
         # Flatten batch and UE axes so each UE is a distinct CDL link.
-        tx = iq[:, :, 0, :].reshape(batch_size * num_users, 1, 1, num_samples)
+        tx = iq.reshape(batch_size * num_users, 1, tx_antennas, num_samples)
         a, tau = channel(batch_size * num_users, num_channel_steps, float(sample_rate_hz))
         h_time = cir_to_time_channel(
             float(sample_rate_hz),
@@ -223,8 +223,8 @@ class NrPuschCdlChannel:
         rx = apply_time_channel(tx, h_time)
         num_rx_antennas = self.settings.antennas.rx_num_rows * self.settings.antennas.rx_num_cols
         per_user_iq = rx[:, 0, :, :].reshape(batch_size, num_users, num_rx_antennas, -1)
-        channel_taps = h_time[:, 0, :, 0, 0, :, :].reshape(
-            batch_size, num_users, num_rx_antennas, num_channel_steps, num_taps
+        channel_taps = h_time[:, 0, :, 0, :, :, :].reshape(
+            batch_size, num_users, num_rx_antennas, tx_antennas, num_channel_steps, num_taps
         )
         output = per_user_iq.sum(dim=1)
         metadata = {
@@ -234,7 +234,8 @@ class NrPuschCdlChannel:
             "iq_axes": ["batch", "rx_antenna", "sample"],
             "per_user_iq_axes": ["batch", "user", "rx_antenna", "sample"],
             "num_users": num_users,
-            "tx_antennas_per_user": 1,
+            "tx_antennas_per_user": tx_antennas,
+            "channel_tap_axes": ["batch", "user", "rx_antenna", "tx_antenna", "sample", "tap"],
             "num_rx_antennas": num_rx_antennas,
             "delay_spread_s": self.settings.channel.delay_spread_s,
             "carrier_frequency_hz": self.settings.channel.carrier_frequency_hz,

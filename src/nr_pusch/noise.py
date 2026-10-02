@@ -26,8 +26,8 @@ def add_awgn(iq: torch.Tensor, snr_db: float, *, seed: int = 0) -> NoisySignal:
     across the available samples, including any CDL channel-filter tail.
     ``noise_variance`` follows Sionna's variance-per-complex-sample convention.
     """
-    if iq.ndim != 3 or iq.shape[1] != 4 or not iq.is_complex():
-        raise ValueError("iq 形状必须为复数 [batch, 4 rx_antennas, samples]")
+    if iq.ndim != 3 or iq.shape[1] < 1 or not iq.is_complex():
+        raise ValueError("iq 形状必须为复数 [batch, rx_antennas, samples]")
     if not torch.isfinite(torch.tensor(snr_db)).item():
         raise ValueError("snr_db 必须为有限数值")
     power = iq.abs().square().mean(dim=-1)
@@ -51,8 +51,8 @@ def add_awgn_resource_grid(
     seed: int = 0,
 ) -> NoisyResourceGrid:
     """Add complex AWGN to ``[batch, rx, rx_ant, symbol, fft_bin]`` grids."""
-    if grid.ndim != 5 or grid.shape[2] != 4 or not grid.is_complex():
-        raise ValueError("grid 形状必须为复数 [batch, num_rx, 4 rx_antennas, symbols, fft_bins]")
+    if grid.ndim != 5 or grid.shape[1] < 1 or grid.shape[2] < 1 or not grid.is_complex():
+        raise ValueError("grid 形状必须为复数 [batch, num_rx, rx_antennas, symbols, fft_bins]")
     if not torch.isfinite(torch.tensor(snr_db)).item():
         raise ValueError("snr_db 必须为有限数值")
     power = grid.abs().square().mean(dim=(-1, -2))

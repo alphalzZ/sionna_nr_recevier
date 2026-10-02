@@ -20,26 +20,29 @@ dmrs_type_a_position = 2
 dmrs_additional_position = 0
 dmrs_num_cdm_groups_without_data = 2
 dmrs_beta = 1.4125375446227544
+# This RX capture uses native OCC-first low-PAPR port ordering; the MATLAB
+# transmitter fixture uses the default comb-first ordering.
+dft_s_dmrs_port_order = "native"
 
 [[users]]
 name = "ue0"
 n_rnti = 1456
-dmrs_port = 0
+dmrs_ports = [0]
 
 [[users]]
 name = "ue1"
 n_rnti = 1460
-dmrs_port = 1
+dmrs_ports = [1]
 
 [[users]]
 name = "ue2"
 n_rnti = 1457
-dmrs_port = 2
+dmrs_ports = [2]
 
 [[users]]
 name = "ue3"
 n_rnti = 1459
-dmrs_port = 3
+dmrs_ports = [3]
 
 [receiver]
 channel_estimator = "dmrs"

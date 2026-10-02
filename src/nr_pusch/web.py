@@ -176,6 +176,9 @@ class SimulationWebApp:
                 self._validate(kind, path)
                 if kind == "simulation":
                     simulation_settings = BlerSettings.from_toml(path)
+            ChannelSettings.from_toml(directory / "channel.toml").validate_transmitter(
+                TxSettings.from_toml(directory / "tx.toml")
+            )
             assert simulation_settings is not None
             job = {
                 "id": job_id,
@@ -594,16 +597,23 @@ class SimulationWebApp:
             ] or [f"UE{index}" for index in range(crc.shape[-1])]
             constellation_users: list[dict[str, Any]] = []
             for user_index in range(real.shape[1]):
-                user_real = real[:, user_index, :].reshape(-1)
-                user_imag = imag[:, user_index, :].reshape(-1)
-                sample_indices = np.linspace(
-                    0, user_real.size - 1, min(1500, user_real.size), dtype=np.int64
-                )
-                constellation_users.append({
-                    "name": user_names[user_index % len(user_names)],
-                    "real": user_real[sample_indices].tolist(),
-                    "imag": user_imag[sample_indices].tolist(),
-                })
+                for layer_index in range(real.shape[2]):
+                    user_real = real[:, user_index, layer_index, :].reshape(-1)
+                    user_imag = imag[:, user_index, layer_index, :].reshape(-1)
+                    sample_indices = np.linspace(
+                        0, user_real.size - 1, min(1500, user_real.size), dtype=np.int64
+                    )
+                    constellation_users.append({
+                        "name": (
+                            user_names[user_index % len(user_names)]
+                            if real.shape[2] == 1 else
+                            f"{user_names[user_index % len(user_names)]} · layer {layer_index}"
+                        ),
+                        "user": user_index,
+                        "layer": layer_index,
+                        "real": user_real[sample_indices].tolist(),
+                        "imag": user_imag[sample_indices].tolist(),
+                    })
             crc_labels = [
                 user_names[index % len(user_names)]
                 if crc.ndim < 2 or crc.shape[0] == 1

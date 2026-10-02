@@ -26,7 +26,7 @@ class TxResult:
 
 
 class NrPuschTx:
-    """Generate four independently configured UE PUSCH waveforms.
+    """Generate separate UE waveforms with configured layer and antenna axes.
 
     The returned UE axis is not summed over the air interface. Each UE signal is
     kept separate so a channel model or captured receiver can combine them.
@@ -106,7 +106,12 @@ class NrPuschTx:
             "waveform": self.settings.pusch.waveform,
             "users": [u.name for u in self.settings.users],
             "iq_axes": ["batch", "user", "tx_antenna", "sample"],
-            "num_layers_per_user": 1,
+            "num_users": len(self.settings.users),
+            "num_layers_per_user": self.settings.pusch.num_layers,
+            "num_tx_antennas": self.settings.pusch.num_antenna_ports,
+            "total_streams": len(self.settings.users) * self.settings.pusch.num_layers,
+            "frequency_grid_axes": ["batch", "user", "tx_antenna", "symbol", "subcarrier"],
+            "bits_axes": ["batch", "user", "tb_bit"],
             "sionna_output_domain": "time",
             "frequency_grid_stage": (
                 "post DFT-s-OFDM transform precoding" if self.settings.pusch.waveform == "dft_s_ofdm"
@@ -151,19 +156,15 @@ class NrPuschTx:
         return output
 
     def _map_transform_precoded_dmrs(self, grid: torch.Tensor) -> torch.Tensor:
-        """Replace Sionna's CP-OFDM DMRS with transform-precoded low-PAPR DMRS.
+        """Replace native CP-OFDM pilots with low-PAPR type-1 DMRS per layer.
 
-        The supported initial profile uses PUSCH DMRS configuration type 1,
-        ports 0--3, no group/sequence hopping, and one OFDM symbol per DMRS
-        occasion. Its low-PAPR base sequence follows TS 38.211 clauses 5.2.2
-        and 6.4.1.1.1.2; port-dependent comb placement and frequency cover code
-        follow clause 6.4.1.1.3.
+        MATLAB TX fixtures use comb-first port order; MATLAB RX captures use
+        Sionna's native OCC-first order. The profile selects the convention.
         """
         if self.settings.pusch.dmrs_config_type != 1:
             raise NotImplementedError("DFT-s-OFDM DMRS currently supports config type 1 only")
 
         output = grid.clone()
-        mask = self._tx_freq.pilot_pattern.mask
         beta = self.settings.pusch.dmrs_beta
         for user_index, cfg in enumerate(self.configs):
             start = (cfg.n_start_bwp - cfg.carrier.n_start_grid) * 12
@@ -183,24 +184,33 @@ class NrPuschTx:
             n = torch.remainder(n, n_zc)
             phase = -torch.pi * q * n * (n + 1) / n_zc
             sequence = torch.polar(torch.full_like(phase, beta), phase).to(dtype=grid.dtype)
-
-            port = self.settings.users[user_index].dmrs_port
-            k_prime = port // 2
-            cover = torch.where(
-                torch.arange(m_zc, device=grid.device) % 2 == 0,
-                1.0,
-                -1.0,
-            ).to(dtype=grid.real.dtype)
-            if port % 2 == 0:
-                cover = torch.ones_like(cover)
-            sequence = sequence * cover
-
-            for symbol_index in range(grid.shape[-2]):
-                is_dmrs = torch.any(mask[user_index, 0, symbol_index, start:stop] != 0).item()
-                if not is_dmrs:
-                    continue
-                output[:, user_index, :, symbol_index, start:stop] = 0
-                output[:, user_index, :, symbol_index, start + k_prime:stop:2] = sequence
+            frequency_cover = torch.where(
+                torch.arange(m_zc, device=grid.device) % 2 == 0, 1.0, -1.0
+            )
+            for symbol_index in cfg.dmrs_symbol_indices:
+                dmrs_layers = torch.zeros(
+                    (cfg.num_layers, num_subcarriers), dtype=grid.dtype, device=grid.device
+                )
+                l_prime = cfg.dmrs_symbol_indices.index(symbol_index) % cfg.dmrs.length
+                for layer, port in enumerate(cfg.dmrs.dmrs_port_set):
+                    if self.settings.pusch.dft_s_dmrs_port_order == "native":
+                        delta = int(cfg.dmrs.deltas[layer])
+                        alternating = int(cfg.dmrs.w_f[1, layer]) == -1
+                    else:
+                        delta = port % 2
+                        alternating = (port // 2) % 2 == 1
+                    time_cover = cfg.dmrs.w_t[l_prime, layer]
+                    dmrs_layers[layer, delta::2] = sequence * (
+                        frequency_cover if alternating else 1.0
+                    ) * time_cover
+                if cfg.precoding == "codebook":
+                    matrix = torch.as_tensor(
+                        cfg.precoding_matrix, device=grid.device, dtype=grid.dtype
+                    )
+                    dmrs_antennas = matrix @ dmrs_layers
+                else:
+                    dmrs_antennas = dmrs_layers
+                output[:, user_index, :, symbol_index, start:stop] = dmrs_antennas
         return output
 
 

@@ -32,7 +32,7 @@ class CdlChannelTest(unittest.TestCase):
         self.assertEqual(result.iq.ndim, 3)
         self.assertEqual(tuple(result.iq.shape[:2]), (1, 4))
         self.assertEqual(tuple(result.per_user_iq.shape[:3]), (1, 4, 4))
-        self.assertEqual(tuple(result.channel_taps.shape[:3]), (1, 4, 4))
+        self.assertEqual(tuple(result.channel_taps.shape[:4]), (1, 4, 4, 1))
         self.assertEqual(result.iq.shape[-1], tx_result.iq.shape[-1] + result.metadata["channel_tail_samples"])
         self.assertTrue(torch.isfinite(result.iq).all())
         torch.testing.assert_close(result.iq, result.per_user_iq.sum(dim=1))
@@ -55,7 +55,7 @@ class CdlChannelTest(unittest.TestCase):
             / time_grid.abs().square().mean()
         ).sqrt()
         self.assertLess(relative_error.item(), 0.01)
-        time_taps = result.channel_taps.permute(0, 2, 1, 3, 4).unsqueeze(1).unsqueeze(4)
+        time_taps = result.channel_taps.permute(0, 2, 1, 3, 4, 5).unsqueeze(1)
         time_csi = time_to_ofdm_channel(time_taps, rg, l_min)
         torch.testing.assert_close(
             time_csi, frequency.channel_frequency_response, rtol=1e-4, atol=1e-4

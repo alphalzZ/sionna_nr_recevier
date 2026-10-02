@@ -15,16 +15,17 @@ from nr_pusch.estimator_validation import (
 
 class EstimatorValidationGateTest(unittest.TestCase):
     def test_data_re_nmse_returns_per_frame_user_and_antenna_values(self):
-        truth = torch.ones((2, 1, 2, 4, 1, 3, 5), dtype=torch.complex64)
+        truth = torch.ones((2, 1, 2, 4, 2, 3, 5), dtype=torch.complex64)
         estimated = truth.clone()
         estimated[1, 0, 1, 2, 0] *= 2
-        data_masks = torch.ones((4, 3, 5), dtype=torch.bool)
+        data_masks = torch.ones((4, 2, 3, 5), dtype=torch.bool)
+        data_masks[:, 1, 0, :] = False
 
         nmse = _data_re_nmse(estimated, truth, data_masks)
 
         self.assertEqual(nmse.shape, (2, 4, 2))
         np.testing.assert_array_equal(nmse[0], np.zeros((4, 2)))
-        self.assertEqual(nmse[1, 2, 1], 1.0)
+        self.assertEqual(nmse[1, 2, 1], 15 / 25)
 
     def test_paired_bootstrap_resamples_whole_frame_clusters(self):
         difference = np.full(32, -4.0)

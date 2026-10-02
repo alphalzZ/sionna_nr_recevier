@@ -1,24 +1,30 @@
 # Repository structure and test boundaries
 
-This repository keeps TX, RX, and IQ ingestion in one small Python package. TX and RX exchange IQ files plus JSON manifests; no receiver code depends on a live transmitter object.
+TX and RX exchange IQ or OFDM grids through NPZ/JSON artifacts; MATLAB H5
+ingestion remains a separate fixed four-user capture adapter.
 
-## Current modules
+## Signal path
 
-- `config.py`: TOML parsing, validation, and conversion to one Sionna PUSCH config per UE.
-- `transmitter.py`: 4-UE/one-layer Sionna waveform adapter.
-- `artifacts.py`: portable IQ/payload archive and resolved-run manifest.
-- `cli/tx.py`: command-line sender.
+1. `config.py` parses shared PUSCH parameters plus each UE's `dmrs_ports`.
+   Sionna verifies its native one-to-four-layer PUSCH constraints.
+2. `transmitter.py` returns separate physical antenna waveforms and one TB
+   payload per UE; the optional codebook precoder maps layers to antennas.
+3. `channel.py` draws independent CDL links per UE and combines every physical
+   TX antenna at each configurable BS RX antenna. Frequency CSI uses
+   `[batch,1,rx_antenna,user,tx_antenna,symbol,fft_bin]`; time taps use
+   `[batch,user,rx_antenna,tx_antenna,time,tap]`.
+4. `noise.py` adds variance calibrated separately for every batch/RX antenna.
+5. `receiver.py` projects perfect physical CSI through Sionna's codebook when
+   needed, or jointly estimates effective layer CSI from DMRS. Detectors
+   return `[batch,user,layer,coded_bit]`; Sionna interleaves layers back into
+   one TB codeword per UE before decoding.
+6. `bler.py` counts a block error whenever UE CRC fails or decoded payload
+   differs. `estimator_validation.py` compares effective layer CSI on data RE.
 
-Later receiver work will add independent `iq/` and `receiver/` modules. MATLAB H5 schema and its adapter are intentionally deferred until the actual fixture is available.
-
-## Sionna-level test nodes
-
-1. Config and UE ordering into the Sionna wrapper.
-2. Sionna frequency-grid output when a fixture contains that stage.
-3. DFT-s-OFDM adapter output when transform precoding is implemented.
-4. Final time-domain IQ versus MATLAB reference, after applying fixture-defined alignment/scaling rules.
-5. Sionna receiver input IQ to per-UE payload bits and CRC status.
-6. Local TX-to-RX loopback through a deterministic channel.
-
-The tests target public composite interfaces and repository adapters. Sionna's internal CRC, LDPC, DMRS, channel-estimation, and detector substeps are not duplicated as separate repository unit tests.
+The legacy scalar DFT-s-OFDM DMRS estimator is restricted to the four-user,
+single-layer, one-port non-codebook capture profile; multi-port codebook
+profiles use the generic layer-domain MIMO DMRS estimator.
+The regression profile remains four single-layer UEs on one physical TX port
+each and four RX antennas. MATLAB fixture files and their specialized readers
+are not generalized or regenerated.
 

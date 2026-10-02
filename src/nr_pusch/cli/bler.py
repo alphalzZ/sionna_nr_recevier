@@ -1,4 +1,4 @@
-"""Run a configured SNR versus BLER sweep for four-user PUSCH."""
+"""Run a configured SNR versus BLER sweep for multi-user PUSCH."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from nr_pusch.simulation_config import BlerSettings
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Simulate four-user NR PUSCH SNR versus BLER")
+    parser = argparse.ArgumentParser(description="Simulate NR PUSCH SNR versus BLER")
     parser.add_argument("--tx-config", required=True, help="TOML PUSCH transmit configuration")
     parser.add_argument("--channel-config", required=True, help="TOML CDL channel configuration")
     parser.add_argument("--simulation-config", required=True, help="TOML BLER simulation settings")
@@ -28,6 +28,7 @@ def main() -> None:
 
     tx_settings = TxSettings.from_toml(args.tx_config)
     channel_settings = ChannelSettings.from_toml(args.channel_config)
+    channel_settings.validate_transmitter(tx_settings)
     simulation_settings = BlerSettings.from_toml(args.simulation_config)
     progress_path = Path(args.progress_jsonl) if args.progress_jsonl else None
     if progress_path is not None:
@@ -55,6 +56,12 @@ def main() -> None:
         tx_settings=tx_settings,
         channel_settings=channel_settings,
         simulation_settings=simulation_settings,
+    )
+    print(
+        f"Topology: {len(tx_settings.users)} users × {tx_settings.pusch.num_layers} "
+        f"layers/user = {len(tx_settings.users) * tx_settings.pusch.num_layers} streams; "
+        f"{tx_settings.pusch.num_antenna_ports} Tx/user → "
+        f"{channel_settings.antennas.rx_num_rows * channel_settings.antennas.rx_num_cols} Rx"
     )
     print("Estimator       Detector        Device  SNR [dB]  BLER      CRC fail  BER       TB errors / TBs  Runtime [s]")
     for point in sweep.points:

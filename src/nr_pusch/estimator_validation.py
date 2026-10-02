@@ -146,9 +146,16 @@ def run_estimator_validation(
         raise RuntimeError("发送端与接收端 sample rate 不一致")
 
     mask_tx = transmitter.generate(batch_size=1, seed=training_seed)
-    pilot_mask = transmitter._tx_freq.pilot_pattern.mask[0, 0].to(device=device).bool()
-    active_re = mask_tx.frequency_grid[0, :, 0].abs() > 0
-    data_masks = active_re & ~pilot_mask.unsqueeze(0)
+    pilot_mask = transmitter._tx_freq.pilot_pattern.mask.to(device=device).bool()
+    active_re = mask_tx.frequency_grid[0].abs().any(dim=1)
+    data_masks = active_re[:, None] & ~pilot_mask
+    precoder = (
+        torch.as_tensor(
+            np.stack([cfg.precoding_matrix for cfg in tx_settings.to_sionna_configs()]),
+            dtype=mask_tx.frequency_grid.dtype, device=device,
+        )
+        if tx_settings.pusch.precoding == "codebook" else None
+    )
     if not torch.any(data_masks).item():
         raise RuntimeError("无法从配置的资源栅格确定 PUSCH data RE")
 
@@ -203,6 +210,10 @@ def run_estimator_validation(
                     seed=split_seed + (snr_index + 1) * 1_000_003 + frame_start,
                 )
                 truth = channel_result.channel_frequency_response
+                effective_truth = (
+                    torch.einsum("bxruasf,ual->bxrulsf", truth, precoder)
+                    if precoder is not None else truth
+                )
                 for estimator_index, estimator in enumerate(_ESTIMATORS):
                     receiver = receivers[estimator]
                     started_frame = time.perf_counter()
@@ -212,13 +223,13 @@ def run_estimator_validation(
                         channel_frequency_response=truth if estimator == "perfect" else None,
                     )
                     estimated_h = (
-                        truth
+                        effective_truth
                         if estimator == "perfect"
                         else receiver._estimator.last_channel_estimate
                     )
                     if estimated_h is None:
                         raise RuntimeError(f"{estimator} estimator did not retain its CSI estimate")
-                    nmse = _data_re_nmse(estimated_h, truth, data_masks)
+                    nmse = _data_re_nmse(estimated_h, effective_truth, data_masks)
                     crc = rx_result.crc_status.detach().cpu().numpy().reshape(
                         current_batch, num_users
                     )
@@ -348,18 +359,15 @@ def _data_re_nmse(
     )
     for batch_index in range(estimated.shape[0]):
         for user in range(data_masks.shape[0]):
-            mask = data_masks[user]
             for rx_ant in range(estimated.shape[2]):
-                estimate_user = estimated[batch_index, 0, rx_ant, user, 0][mask]
-                truth_user = truth[batch_index, 0, rx_ant, user, 0][mask]
+                mask = data_masks[user]
+                estimate_user = estimated[batch_index, 0, rx_ant, user][mask]
+                truth_user = truth[batch_index, 0, rx_ant, user][mask]
                 power = truth_user.abs().square().sum()
                 result[batch_index, user, rx_ant] = (
-                    float(
-                        (estimate_user - truth_user).abs().square().sum().item()
-                        / power.item()
-                    )
-                    if power.item() > 0
-                    else float("nan")
+                    float((estimate_user - truth_user).abs().square().sum().item()
+                          / power.item())
+                    if power.item() > 0 else float("nan")
                 )
     return result
 

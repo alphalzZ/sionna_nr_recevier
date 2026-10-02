@@ -1,7 +1,28 @@
-# Transmitter interface and initial coverage
+# Transmitter interface and MIMO coverage
 
-The initial sender wraps Sionna 2.0.1 `PUSCHTransmitter` with four `PUSCHConfig` objects. Each config represents one UE with one layer and one transmit antenna. The Sionna output keeps the UE signals separate; RF/channel superposition belongs to a later channel harness.
+`TxSettings` builds one native Sionna 2.0.1 `PUSCHConfig` per UE. Users share
+PUSCH resource/MCS/layer settings and carry separate transport blocks and
+non-overlapping DMRS port sets. Each UE supports 1–4 layers, with at most eight
+concurrent layers across all UEs. Native antenna-port counts are 1, 2, or 4;
+non-codebook requires one physical antenna per layer. Codebook configurations
+may use more antenna ports than layers, with a native TPMI. Sionna validates
+the remaining PUSCH/DMRS combinations.
 
-The transmitter currently exports Sionna's time-domain CP-OFDM output, Sionna's pre-modulation resource grid, and the payload bits used to generate them. NPZ axis order is `[batch, user, tx_antenna, sample]` for `iq`, `[batch, user, tx_antenna, symbol, subcarrier]` for `frequency_grid`, and `[batch, user, transport_block_bit]` for `bits`. A JSON sidecar records the resolved TOML settings and library versions.
+The exported NPZ keeps `iq` as `[batch,user,tx_antenna,sample]`,
+`frequency_grid` as `[batch,user,tx_antenna,symbol,subcarrier]`, and `bits` as
+`[batch,user,tb_bit]`. The antenna axis is physical after optional codebook
+precoding; it is *not* the layer axis. The JSON manifest records all three axis
+definitions, users, layers per UE, physical antennas per UE, and total streams.
 
-For DFT-s-OFDM, the adapter applies a unitary DFT on each data-bearing OFDM symbol inside the configured contiguous BWP, replaces Sionna's CP-OFDM pilots with type-1 low-PAPR DMRS, and runs Sionna's OFDM modulator on the resulting grid. `[pusch].dmrs_additional_position` accepts 0, 1, or 2; the mapper writes every DMRS occasion marked by Sionna's resource grid, with one OFDM symbol per occasion. The profile supports no group/sequence hopping and DMRS ports 0--3. The Zadoff-Chu sequence, port comb, and frequency cover were matched to the supplied MATLAB vector. Since the pinned Sionna composite does not accept transform-precoding MCS tables, the adapter maps to a native MCS with the same modulation order and code rate; the selected project MCS remains in the manifest.
+CP-OFDM uses Sionna's native pilot, layer mapping, and precoder. For
+DFT-s-OFDM the adapter applies unitary DFT per data-bearing layer, maps
+type-1 low-PAPR DMRS, and uses native DMRS symbol positions, time OCC,
+and codebook precoding. The MATLAB TX reference uses comb-first port order
+(ports 0/2 on the even comb); the supplied MATLAB RX captures use native
+OCC-first order (ports 0/1 on the even comb). RX capture profiles explicitly
+set `dft_s_dmrs_port_order = "native"`; other profiles default to `"comb-first"`.
+Single-symbol DMRS permits type-1 ports 0–3; eight streams require length 2,
+ports 0–7, and `dmrs_additional_position` 0 or 1. This adapter supports no
+group/sequence hopping. Sionna's composite lacks transform-precoding MCS
+tables, so the adapter selects an equivalent native MCS with the same
+modulation order and target rate, retaining the configured MCS in metadata.

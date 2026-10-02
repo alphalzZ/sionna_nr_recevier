@@ -21,7 +21,7 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="Input NPZ containing tx 'iq' or 'frequency_grid'")
     parser.add_argument("--sample-rate-hz", required=True, type=int, help="Input IQ sample rate")
     parser.add_argument("--domain", choices=("time", "frequency"), default="time")
-    parser.add_argument("--tx-config", help="Required in frequency mode to define the Sionna resource grid")
+    parser.add_argument("--tx-config", help="TX profile for topology checks; required in frequency mode")
     parser.add_argument("--output", required=True, help="Output NPZ path")
     parser.add_argument("--device", default=None, help="Sionna device, e.g. cpu or cuda:0")
     args = parser.parse_args()
@@ -31,12 +31,20 @@ def main() -> None:
     if output_path.suffix.lower() != ".npz":
         parser.error("--output 必须使用 .npz 后缀")
     settings = ChannelSettings.from_toml(args.config)
+    tx_settings = TxSettings.from_toml(args.tx_config) if args.tx_config else None
+    if tx_settings is not None:
+        settings.validate_transmitter(tx_settings)
     channel = NrPuschCdlChannel(settings, device=args.device)
     if args.domain == "time":
         with np.load(input_path) as archive:
             if "iq" not in archive:
                 parser.error("时域模式输入 NPZ 缺少 'iq' 数组")
             iq = torch.from_numpy(np.array(archive["iq"], copy=True))
+        if tx_settings is not None:
+            if iq.shape[1] != len(tx_settings.users):
+                parser.error("iq 用户数与 --tx-config 不一致")
+            if args.sample_rate_hz != NrPuschTx(tx_settings, device=args.device).sample_rate_hz:
+                parser.error("--sample-rate-hz 与 --tx-config 的采样率不一致")
         result = channel.apply(iq, args.sample_rate_hz)
         arrays = {
             "iq": result.iq.detach().cpu().numpy().astype(np.complex64, copy=False),
@@ -46,7 +54,7 @@ def main() -> None:
         axis_info = {
             "iq": ["batch", "rx_antenna", "sample"],
             "per_user_iq": ["batch", "user", "rx_antenna", "sample"],
-            "channel_taps": ["batch", "user", "rx_antenna", "time", "tap"],
+            "channel_taps": result.metadata["channel_tap_axes"],
         }
         shape_summary = f"IQ shape [batch,rx_antenna,sample]: {tuple(result.iq.shape)}"
     else:
@@ -56,7 +64,11 @@ def main() -> None:
             if "frequency_grid" not in archive:
                 parser.error("频域模式输入 NPZ 缺少 'frequency_grid' 数组")
             frequency_grid = torch.from_numpy(np.array(archive["frequency_grid"], copy=True))
-        tx = NrPuschTx(TxSettings.from_toml(args.tx_config), device=args.device)
+        tx = NrPuschTx(tx_settings, device=args.device)
+        if frequency_grid.shape[1] != len(tx_settings.users):
+            parser.error("frequency_grid 用户数与 --tx-config 不一致")
+        if args.sample_rate_hz != tx.sample_rate_hz:
+            parser.error("--sample-rate-hz 与 --tx-config 的资源栅格采样率不一致")
         result = channel.apply_frequency(frequency_grid, tx._tx_freq.resource_grid)
         arrays = {
             "grid": result.grid.detach().cpu().numpy().astype(np.complex64, copy=False),
@@ -96,6 +108,11 @@ def main() -> None:
     )
     print(f"Channelized {args.domain} output: {output_path}")
     print(shape_summary)
+    print(
+        f"Topology: {result.metadata['num_users']} users × "
+        f"{result.metadata.get('num_tx_antennas_per_user', result.metadata.get('tx_antennas_per_user'))} "
+        f"Tx antennas → {result.metadata['num_rx_antennas']} Rx antennas"
+    )
 
 
 if __name__ == "__main__":

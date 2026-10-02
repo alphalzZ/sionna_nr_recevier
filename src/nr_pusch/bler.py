@@ -80,6 +80,7 @@ def estimate_dmrs_tap_power_prior(
         raise ValueError("num_realizations 必须为正整数")
     if max_delay_spread_s <= 0:
         raise ValueError("max_delay_spread_s 必须大于 0")
+    channel_settings.validate_transmitter(tx_settings)
     device = use_device(device)
     sionna.phy.config.seed = seed
     torch.manual_seed(seed)
@@ -99,8 +100,8 @@ def estimate_dmrs_tap_power_prior(
         empty_grid = torch.zeros(
             (
                 current_batch,
-                4,
-                1,
+                len(tx_settings.users),
+                tx_settings.pusch.num_antenna_ports,
                 resource_grid.num_ofdm_symbols,
                 resource_grid.fft_size,
             ),
@@ -111,7 +112,7 @@ def estimate_dmrs_tap_power_prior(
         # The configured validation channel is static over a slot. Use one
         # response per UE/RX/realization to avoid counting OFDM symbols as
         # additional independent channel draws.
-        response = response[:, 0, :, :, 0, 0, :]
+        response = response[:, 0, :, :, :, 0, :]
         response_matrix = response.reshape(-1, resource_grid.fft_size).T.contiguous()
         taps = torch.linalg.lstsq(basis, response_matrix).solution
         power_sum += taps.abs().square().to(torch.float64).sum(dim=1)
@@ -140,6 +141,7 @@ def simulate_bler(
     skipped instead of simulated. This assumes BLER does not grow with SNR.
     """
     simulation_settings.validate()
+    channel_settings.validate_transmitter(tx_settings)
     device = use_device(device or simulation_settings.device)
     sionna.phy.config.seed = simulation_settings.seed
     torch.manual_seed(simulation_settings.seed)

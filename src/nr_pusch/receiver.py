@@ -1,4 +1,4 @@
-"""Four-user PUSCH receiver with Sionna LMMSE and NR transport decoding."""
+"""Configurable multi-user PUSCH receiver with native NR TB decoding."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from sionna.phy.fec.scrambling import Descrambler, Scrambler
 from sionna.phy.fec.ldpc import LDPC5GDecoder
 from sionna.phy.mimo import KBestDetector as FlatKBestDetector
 from sionna.phy.mimo import StreamManagement, lmmse_matrix, whiten_channel
-from sionna.phy.nr import PUSCHReceiver, PUSCHTransmitter, TBDecoder
+from sionna.phy.nr import LayerDemapper, PUSCHReceiver, PUSCHTransmitter, TBDecoder
 from sionna.phy.ofdm import (
     LMMSEEqualizer,
     LinearDetector,
@@ -74,6 +74,15 @@ def _use_explicit_tx_scrambling(
         binary=True,
         device=transmitter.device,
     )
+
+def _codeword_to_layers(llr: torch.Tensor, layers: int, bits_per_symbol: int) -> torch.Tensor:
+    """Inverse of native single-codeword LayerDemapper, preserving symbol order."""
+    batch, users, count = llr.shape
+    data = count // (layers * bits_per_symbol)
+    return llr.reshape(batch, users, data, layers, bits_per_symbol).permute(
+        0, 1, 3, 2, 4
+    ).reshape(batch, users, layers, data * bits_per_symbol)
+
 
 class _LdpcSoftFeedback(torch.nn.Module):
     """Return rate-matched LDPC posterior-minus-channel extrinsic LLRs."""
@@ -139,11 +148,13 @@ class DftSOfdmMimoDetector(torch.nn.Module):
     """Detect spread symbols, undo DFT spreading, then produce QAM LLRs."""
 
     def __init__(self, transmitter: PUSCHTransmitter, stream_management: StreamManagement,
-                 method: str = "lmmse", parameter: int | None = None):
+                 method: str = "lmmse", parameter: int | None = None,
+                 *, spread: bool = True):
         super().__init__()
         self._resource_grid = transmitter.resource_grid
         self.method = method
         self.parameter = parameter
+        self._spread = spread
         bps = transmitter._num_bits_per_symbol
         if method == "lmmse":
             self._detector = LMMSEEqualizer(
@@ -173,7 +184,9 @@ class DftSOfdmMimoDetector(torch.nn.Module):
         symbol_indices = torch.div(ordered_indices, fft_size, rounding_mode="floor")
         counts = torch.bincount(symbol_indices, minlength=self._resource_grid.num_ofdm_symbols)
         active_counts = counts[counts > 0]
-        if active_counts.numel() == 0 or not torch.all(active_counts == fft_size).item():
+        if active_counts.numel() == 0:
+            raise ValueError("PUSCH 资源映射没有数据符号")
+        if spread and not torch.all(active_counts == fft_size).item():
             raise ValueError(
                 "DFT-s-OFDM receiver requires each data-bearing OFDM symbol to contain "
                 "one complete effective-subcarrier allocation"
@@ -205,24 +218,22 @@ class DftSOfdmMimoDetector(torch.nn.Module):
             # Sionna hard_out=True returns QAM point indices for symbol output.
             x_hat = self._constellation.points[x_hat.to(torch.long)]
         batch, num_tx, num_streams, num_data = x_hat.shape
-        expected = self._num_spread_symbols * self._fft_size
-        if num_data != expected:
-            raise ValueError(
-                f"PUSCH 数据符号数 {num_data} 与 DFT-s-OFDM 资源映射预期 {expected} 不符"
-            )
-
-        x_hat = x_hat.reshape(batch, num_tx, num_streams, self._num_spread_symbols, self._fft_size)
-        # Tx applies a unitary forward DFT per data-bearing OFDM symbol.
-        x_hat = torch.fft.ifft(x_hat, dim=-1, norm="ortho")
-        # The unitary inverse DFT produces correlated noise when subcarrier
-        # variances differ. Average variance per spread symbol for LLR scaling.
-        if self.method == "lmmse":
-            no_eff = no_eff.reshape_as(x_hat.real).mean(dim=-1, keepdim=True).expand_as(x_hat.real)
-        else:
-            no_eff = torch.as_tensor(no, dtype=x_hat.real.dtype, device=x_hat.device)
-            if no_eff.ndim >= 2:
-                no_eff = no_eff.mean(dim=tuple(range(1, no_eff.ndim)))
-            no_eff = no_eff.reshape(batch, 1, 1, 1, 1).expand_as(x_hat.real)
+        if self._spread:
+            expected = self._num_spread_symbols * self._fft_size
+            if num_data != expected:
+                raise ValueError(
+                    f"PUSCH 数据符号数 {num_data} 与 DFT-s-OFDM 资源映射预期 {expected} 不符"
+                )
+            x_hat = x_hat.reshape(batch, num_tx, num_streams,
+                                  self._num_spread_symbols, self._fft_size)
+            x_hat = torch.fft.ifft(x_hat, dim=-1, norm="ortho")
+            if self.method == "lmmse":
+                no_eff = no_eff.reshape_as(x_hat.real).mean(dim=-1, keepdim=True).expand_as(x_hat.real)
+            else:
+                no_eff = torch.as_tensor(no, dtype=x_hat.real.dtype, device=x_hat.device)
+                if no_eff.ndim >= 2:
+                    no_eff = no_eff.mean(dim=tuple(range(1, no_eff.ndim)))
+                no_eff = no_eff.reshape(batch, 1, 1, 1, 1).expand_as(x_hat.real)
         x_hat = x_hat.reshape(batch, num_tx, num_streams, self._num_data_symbols)
         no_eff = no_eff.reshape_as(x_hat.real)
         llr = self._demapper(x_hat, no_eff)
@@ -241,6 +252,8 @@ class DftSOfdmKBestDetector(DftSOfdmMimoDetector):
     ) -> None:
         super().__init__(transmitter, stream_management, method="lmmse")
         self.k = 64 if k is None else k
+        self._num_streams = stream_management._num_tx * stream_management._num_streams_per_tx
+        self._num_layers = stream_management._num_streams_per_tx
         self._flat_detector = FlatKBestDetector(
             "symbol",
             num_streams=stream_management._num_tx * stream_management._num_streams_per_tx,
@@ -262,7 +275,8 @@ class DftSOfdmKBestDetector(DftSOfdmMimoDetector):
         batch, num_rx, num_rx_ant, num_symbols, fft_size = y.shape
         if num_rx != 1 or fft_size != self._fft_size:
             raise ValueError("K-best DFT-s-OFDM 仅支持单接收端口和当前资源网格尺寸")
-
+        if num_rx_ant < self._num_streams:
+            raise ValueError("K-best 要求接收天线数不少于总流数")
         # Match Sionna's LMMSEEqualizer covariance construction. All four UE
         # streams are desired streams, so only thermal noise and CSI error enter S.
         y_eff = self._detector._removed_nulled_scs(y)
@@ -314,31 +328,24 @@ class DftSOfdmKBestDetector(DftSOfdmMimoDetector):
 
         regularization = covariance_time.diagonal(dim1=-2, dim2=-1).real.mean(dim=-1)
         regularization = regularization.clamp_min(1e-4) * 1e-5 + 1e-7
-        eye = torch.eye(num_rx_ant, dtype=covariance_time.dtype, device=y.device)
+        eye = torch.eye(self._num_streams, dtype=covariance_time.dtype, device=y.device)
         covariance_time = (covariance_time + covariance_time.mH) * 0.5
         covariance_time = covariance_time + regularization[..., None, None] * eye
 
-        flat_y = z_time.reshape(-1, num_rx_ant)
+        flat_y = z_time.reshape(-1, self._num_streams)
         flat_h = h_zero_lag.unsqueeze(2).expand(
-            batch,
-            self._num_spread_symbols,
-            self._fft_size,
-            num_rx_ant,
-            num_rx_ant,
-        ).reshape(-1, num_rx_ant, num_rx_ant)
+            batch, self._num_spread_symbols, self._fft_size,
+            self._num_streams, self._num_streams,
+        ).reshape(-1, self._num_streams, self._num_streams)
         flat_covariance = covariance_time.unsqueeze(2).expand(
-            batch,
-            self._num_spread_symbols,
-            self._fft_size,
-            num_rx_ant,
-            num_rx_ant,
-        ).reshape(-1, num_rx_ant, num_rx_ant)
+            batch, self._num_spread_symbols, self._fft_size,
+            self._num_streams, self._num_streams,
+        ).reshape(-1, self._num_streams, self._num_streams)
         symbol_indices = self._flat_detector(flat_y, flat_h, flat_covariance)
         symbols = self._constellation.points[symbol_indices.to(torch.long)]
         symbols = symbols.reshape(
-            batch, self._num_spread_symbols, self._fft_size, num_rx_ant
+            batch, self._num_spread_symbols, self._fft_size, self._num_streams
         )
-        bits_per_symbol = int(torch.as_tensor(self._num_bits_per_symbol).reshape(-1)[0])
         information_matrix = h_zero_lag.mH @ torch.linalg.solve(
             covariance_time, h_zero_lag
         )
@@ -347,13 +354,15 @@ class DftSOfdmKBestDetector(DftSOfdmMimoDetector):
             post_detection_covariance, dim1=-2, dim2=-1
         ).real.clamp_min(1e-7)
         post_detection_variance = post_detection_variance.unsqueeze(2).expand(
-            batch, self._num_spread_symbols, self._fft_size, num_rx_ant
+            batch, self._num_spread_symbols, self._fft_size, self._num_streams
         )
         symbols = symbols.permute(0, 3, 1, 2).reshape(
-            batch, num_rx_ant, 1, self._num_data_symbols
+            batch, self._num_streams // self._num_layers,
+            self._num_layers, self._num_data_symbols
         )
         post_detection_variance = post_detection_variance.permute(0, 3, 1, 2).reshape(
-            batch, num_rx_ant, 1, self._num_data_symbols
+            batch, self._num_streams // self._num_layers,
+            self._num_layers, self._num_data_symbols
         )
         llr = self._demapper(symbols, post_detection_variance)
         self.last_llr = llr
@@ -435,18 +444,19 @@ class DftSOfdmEpDetector(DftSOfdmMimoDetector):
         cov_time = post_eq_noise.mean(dim=2) + (h_residual @ h_residual.mH).mean(dim=2)
         cov_time = (cov_time + cov_time.mH) * 0.5
         scale = cov_time.diagonal(dim1=-2, dim2=-1).real.mean(dim=-1).clamp_min(1e-6)
-        eye_rx = torch.eye(num_rx_ant, dtype=y.dtype, device=y.device)
+        num_streams = h_flat.shape[-1]
+        eye_rx = torch.eye(num_streams, dtype=y.dtype, device=y.device)
         cov_time = cov_time + (scale * 1e-6)[..., None, None] * eye_rx
 
         # Whiten each effective 4x4 spatial system. Leading dimensions combine
         # batch, data-bearing OFDM symbols, and time samples.
-        flat_y = z_time.reshape(-1, num_rx_ant)
+        flat_y = z_time.reshape(-1, num_streams)
         flat_h = h_flat.unsqueeze(2).expand(
-            batch, self._num_spread_symbols, self._fft_size, num_rx_ant, num_rx_ant
-        ).reshape(-1, num_rx_ant, num_rx_ant)
+            batch, self._num_spread_symbols, self._fft_size, num_streams, num_streams
+        ).reshape(-1, num_streams, num_streams)
         flat_cov = cov_time.unsqueeze(2).expand(
-            batch, self._num_spread_symbols, self._fft_size, num_rx_ant, num_rx_ant
-        ).reshape(-1, num_rx_ant, num_rx_ant)
+            batch, self._num_spread_symbols, self._fft_size, num_streams, num_streams
+        ).reshape(-1, num_streams, num_streams)
         chol = torch.linalg.cholesky(flat_cov)
         yw = torch.linalg.solve_triangular(chol, flat_y.unsqueeze(-1), upper=False).squeeze(-1)
         hw = torch.linalg.solve_triangular(chol, flat_h, upper=False)
@@ -491,11 +501,13 @@ class DftSOfdmEpDetector(DftSOfdmMimoDetector):
         posterior_mean = (posterior_cov @ (rhs + site_natural).unsqueeze(-1)).squeeze(-1)
         posterior_var = torch.diagonal(posterior_cov, dim1=-2, dim2=-1).real.clamp_min(eps)
         means = posterior_mean.reshape(
-            batch, self._num_spread_symbols, self._fft_size, num_users
-        ).permute(0, 3, 1, 2).reshape(batch, num_users, 1, self._num_data_symbols)
+            batch, self._num_spread_symbols, self._fft_size, num_streams
+        ).permute(0, 3, 1, 2).reshape(
+            batch, h_hat.shape[3], h_hat.shape[4], self._num_data_symbols
+        )
         variances = posterior_var.reshape(
-            batch, self._num_spread_symbols, self._fft_size, num_users
-        ).permute(0, 3, 1, 2).reshape(batch, num_users, 1, self._num_data_symbols)
+            batch, self._num_spread_symbols, self._fft_size, num_streams
+        ).permute(0, 3, 1, 2).reshape_as(means.real)
         llr = self._demapper(means, variances)
         self.last_llr = llr
         return llr
@@ -537,6 +549,8 @@ class DftSOfdmMmsePicDetector(DftSOfdmMimoDetector):
         if num_rx != 1 or fft_size != self._fft_size:
             raise ValueError("MMSE-PIC DFT-s-OFDM 仅支持单接收端口和当前资源网格尺寸")
         users = h_hat.shape[3]
+        layers = h_hat.shape[4]
+        streams = users * layers
         bps = int(torch.as_tensor(self._num_bits_per_symbol).reshape(-1)[0])
         data_symbols = self._data_symbol_indices
 
@@ -546,9 +560,9 @@ class DftSOfdmMmsePicDetector(DftSOfdmMimoDetector):
 
         y_eff = self._detector._removed_nulled_scs(y)
         y_data = y_eff[:, 0].index_select(2, data_symbols).permute(0, 2, 3, 1)
-        h_data = torch.broadcast_to(h_hat, h_hat.shape)[:, 0, :, :, 0]
+        h_data = torch.broadcast_to(h_hat, h_hat.shape)[:, 0].flatten(2, 3)
         h_data = h_data.index_select(3, data_symbols).permute(0, 3, 4, 1, 2)
-        err_data = torch.broadcast_to(err_var, h_hat.shape)[:, 0, :, :, 0]
+        err_data = torch.broadcast_to(err_var, h_hat.shape)[:, 0].flatten(2, 3)
         err_data = err_data.index_select(3, data_symbols).permute(0, 3, 4, 1, 2)
         no = torch.as_tensor(no, dtype=y.real.dtype, device=y.device)
         if no.ndim == 3 and no.shape[1] == 1:
@@ -560,21 +574,21 @@ class DftSOfdmMmsePicDetector(DftSOfdmMimoDetector):
 
         for _ in range(self.num_iterations):
             bit_llrs = llr.reshape(
-                batch, users, 1, self._num_data_symbols, bps
+                batch, users, layers, self._num_data_symbols, bps
             )
             symbol_logits = self._llrs_to_logits(bit_llrs)
             soft_mean, soft_variance = self._symbol_moments(symbol_logits)
             soft_mean = soft_mean.reshape(
-                batch, users, self._num_spread_symbols, fft_size
+                batch, streams, self._num_spread_symbols, fft_size
             )
             soft_variance = soft_variance.reshape(
-                batch, users, self._num_spread_symbols, fft_size
+                batch, streams, self._num_spread_symbols, fft_size
             ).clamp_min(0.0)
 
             soft_frequency = torch.fft.fft(soft_mean, dim=-1, norm="ortho")
             variance_frequency = soft_variance.mean(dim=-1).permute(0, 2, 1)
             variance_frequency = variance_frequency.unsqueeze(2).expand(
-                batch, self._num_spread_symbols, fft_size, users
+                batch, self._num_spread_symbols, fft_size, streams
             )
 
             # Parallel interference cancellation for every desired UE.
@@ -613,8 +627,8 @@ class DftSOfdmMmsePicDetector(DftSOfdmMimoDetector):
                 dim=-1, keepdim=True
             ).expand_as(x_hat_td.real)
             llr_new = self._demapper(
-                x_hat_td.reshape(batch, users, 1, self._num_data_symbols),
-                no_eff_td.reshape(batch, users, 1, self._num_data_symbols),
+                x_hat_td.reshape(batch, users, layers, self._num_data_symbols),
+                no_eff_td.reshape(batch, users, layers, self._num_data_symbols),
             )
             llr = (1.0 - self.damping) * llr + self.damping * llr_new
 
@@ -651,6 +665,10 @@ class DftSOfdmSoftMmsePicDetector(DftSOfdmMimoDetector):
             tb_decoder, num_decoder_iterations, device
         )
         bps = int(torch.as_tensor(self._num_bits_per_symbol).reshape(-1)[0])
+        self._layer_demapper = LayerDemapper(
+            transmitter._layer_mapper, num_bits_per_symbol=bps,
+            device=transmitter.device,
+        )
         self._llrs_to_logits = LLRs2SymbolLogits(bps, device=transmitter.device)
         self._symbol_moments = SymbolLogits2Moments(
             constellation=self._constellation, device=transmitter.device
@@ -667,15 +685,17 @@ class DftSOfdmSoftMmsePicDetector(DftSOfdmMimoDetector):
         if num_rx != 1 or fft_size != self._fft_size:
             raise ValueError("soft-mmse-pic 仅支持单接收端口和当前资源网格尺寸")
         users = h_hat.shape[3]
+        layers = h_hat.shape[4]
+        streams = users * layers
         bps = int(torch.as_tensor(self._num_bits_per_symbol).reshape(-1)[0])
         data_symbols = self._data_symbol_indices
         llr = super().forward(y, h_hat, err_var, no)
 
         y_eff = self._detector._removed_nulled_scs(y)
         y_data = y_eff[:, 0].index_select(2, data_symbols).permute(0, 2, 3, 1)
-        h_data = torch.broadcast_to(h_hat, h_hat.shape)[:, 0, :, :, 0]
+        h_data = torch.broadcast_to(h_hat, h_hat.shape)[:, 0].flatten(2, 3)
         h_data = h_data.index_select(3, data_symbols).permute(0, 3, 4, 1, 2)
-        err_data = torch.broadcast_to(err_var, h_hat.shape)[:, 0, :, :, 0]
+        err_data = torch.broadcast_to(err_var, h_hat.shape)[:, 0].flatten(2, 3)
         err_data = err_data.index_select(3, data_symbols).permute(0, 3, 4, 1, 2)
         no = torch.as_tensor(no, dtype=y.real.dtype, device=y.device)
         if no.ndim == 3 and no.shape[1] == 1:
@@ -687,27 +707,29 @@ class DftSOfdmSoftMmsePicDetector(DftSOfdmMimoDetector):
         prior = torch.zeros_like(llr.reshape(batch, users, -1))
 
         for _ in range(self.num_feedback_iterations):
-            extrinsic = self._feedback(llr.squeeze(2))
+            extrinsic = self._feedback(self._layer_demapper(llr))
             prior = (
                 (1.0 - self.damping) * prior + self.damping * extrinsic
             ).clamp(-20.0, 20.0)
-            cancellation_llr = (llr.squeeze(2) + prior).clamp(-20.0, 20.0)
+            cancellation_llr = (
+                llr + _codeword_to_layers(prior, layers, bps)
+            ).clamp(-20.0, 20.0)
             symbol_logits = self._llrs_to_logits(
                 cancellation_llr.reshape(
-                    batch, users, 1, self._num_data_symbols, bps
+                    batch, users, layers, self._num_data_symbols, bps
                 )
             )
             soft_mean, soft_variance = self._symbol_moments(symbol_logits)
             soft_mean = soft_mean.reshape(
-                batch, users, self._num_spread_symbols, fft_size
+                batch, streams, self._num_spread_symbols, fft_size
             )
             soft_variance = soft_variance.reshape(
-                batch, users, self._num_spread_symbols, fft_size
+                batch, streams, self._num_spread_symbols, fft_size
             ).clamp_min(0.0)
             soft_frequency = torch.fft.fft(soft_mean, dim=-1, norm="ortho")
             variance_frequency = soft_variance.mean(dim=-1).permute(0, 2, 1)
             variance_frequency = variance_frequency.unsqueeze(2).expand(
-                batch, self._num_spread_symbols, fft_size, users
+                batch, self._num_spread_symbols, fft_size, streams
             )
             h_soft = h_data * soft_frequency.permute(0, 2, 3, 1).unsqueeze(-2)
             y_cancelled = (
@@ -744,8 +766,8 @@ class DftSOfdmSoftMmsePicDetector(DftSOfdmMimoDetector):
                 dim=-1, keepdim=True
             ).expand_as(estimate_td.real)
             llr = self._demapper(
-                estimate_td.reshape(batch, users, 1, self._num_data_symbols),
-                variance_td.reshape(batch, users, 1, self._num_data_symbols),
+                estimate_td.reshape(batch, users, layers, self._num_data_symbols),
+                variance_td.reshape(batch, users, layers, self._num_data_symbols),
             )
             if not torch.isfinite(llr).all().item():
                 raise RuntimeError("soft-mmse-pic produced non-finite detector LLRs")
@@ -775,6 +797,16 @@ class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
         )
         self._reencoder = NrPuschTx(settings, device=device)
         self._num_users = len(settings.users)
+        self._layer_demapper = LayerDemapper(
+            transmitter._layer_mapper,
+            num_bits_per_symbol=transmitter._num_bits_per_symbol,
+            device=device,
+        )
+        self._precoding_matrix = (
+            torch.as_tensor(settings.to_sionna_configs()[0].precoding_matrix,
+                            dtype=torch.complex64, device=device)
+            if settings.pusch.precoding == "codebook" else None
+        )
         if scrambling_sequences is not None:
             sequences = scrambling_sequences.to(device=transmitter.device)
             num_code_bits = int(transmitter._tb_encoder.n)
@@ -820,7 +852,7 @@ class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
                 llr_final = torch.zeros_like(llr)
             llr_final[:, user] = llr[:, user]
 
-            decoded_bits, crc_status = self._sic_decoder(llr)
+            decoded_bits, crc_status = self._sic_decoder(self._layer_demapper(llr))
             # Sionna may retain a singleton transport-block axis on CRC status
             # (for example [batch, user, 1]); flatten the selected UE to keep
             # cancellation masks aligned with the batch axis.
@@ -840,10 +872,17 @@ class DftSOfdmLmmseSicDetector(DftSOfdmMimoDetector):
             tx_bits[:, user] = decoded_user_bits.to(dtype=tx_bits.dtype)
             reconstructed_grid = self._reencoder.generate(
                 batch_size=y.shape[0], bits=tx_bits
-            ).frequency_grid[:, user, 0]
-
-            h_user = h_hat[:, :, :, user, 0, :, :]
-            contribution = h_user * reconstructed_grid[:, None, None, :, :]
+            ).frequency_grid[:, user]
+            if self._precoding_matrix is not None:
+                reconstructed_grid = torch.einsum(
+                    "la,basf->blsf",
+                    torch.linalg.pinv(self._precoding_matrix),
+                    reconstructed_grid,
+                )
+            h_user = h_hat[:, :, :, user]
+            contribution = (
+                h_user * reconstructed_grid[:, None, None]
+            ).sum(dim=3)
             mask_y = cancel_mask.reshape(-1, 1, 1, 1, 1)
             residual_y = residual_y - mask_y * contribution
 
@@ -1204,11 +1243,124 @@ class DftSOfdmDmrsEstimator(torch.nn.Module):
         return h_hat, err_var
 
 
+class MimoDmrsEstimator(torch.nn.Module):
+    """Jointly fit layer channels on each DMRS comb and frontloaded occasion."""
+
+    def __init__(self, pilots: torch.Tensor, resource_grid, length: int,
+                 l_min: int, l_max: int, *, estimate_delay: bool = False,
+                 tap_power_prior: torch.Tensor | None = None):
+        super().__init__()
+        # pilots: [user, layer, DMRS symbol, subcarrier], before codebook mapping.
+        self._users, self._layers, num_dmrs, self._subcarriers = pilots.shape
+        self._symbols = resource_grid.num_ofdm_symbols
+        self._dmrs_symbols = _dmrs_symbol_indices(resource_grid)
+        if len(self._dmrs_symbols) != num_dmrs or num_dmrs % length:
+            raise ValueError("DMRS 模板与配置的 DMRS length/符号数不一致")
+        self._length = length
+        self._num_taps = l_max - l_min + 1
+        self._estimate_delay = estimate_delay
+        self.last_offsets: torch.Tensor | None = None
+        self.last_channel_estimate: torch.Tensor | None = None
+        basis = _build_dmrs_frequency_basis(self._subcarriers, l_min, l_max,
+                                             device=pilots.device)
+        self.register_buffer("_basis", basis)
+        if tap_power_prior is not None:
+            tap_power_prior = torch.as_tensor(tap_power_prior, device=pilots.device,
+                                              dtype=pilots.real.dtype)
+            if (tuple(tap_power_prior.shape) != (self._num_taps,)
+                    or not torch.isfinite(tap_power_prior).all()
+                    or not torch.all(tap_power_prior > 0)):
+                raise ValueError("DMRS tap-power prior 必须为正有限 taps 向量")
+        self.register_buffer("_prior", tap_power_prior)
+        self._groups = []
+        for parity in (0, 1):
+            streams = [(user, layer) for user in range(self._users)
+                       for layer in range(self._layers)
+                       if torch.any(pilots[user, layer, 0, parity::2].abs() > 0)]
+            if not streams:
+                continue
+            support = torch.arange(parity, self._subcarriers, 2, device=pilots.device)
+            if support.numel() * length < len(streams) * self._num_taps:
+                raise ValueError("DMRS pilot RE 数量不足以拟合所有层的信道 taps")
+            for occasion in range(num_dmrs // length):
+                start = occasion * length
+                design = torch.cat(
+                    [torch.cat([
+                        pilots[user, layer, start + offset, support, None] * basis[support]
+                        for user, layer in streams
+                    ], dim=-1) for offset in range(length)], dim=0)
+                if torch.linalg.matrix_rank(design).item() < design.shape[-1]:
+                    raise ValueError("DMRS 端口 OCC 不足以区分所有层的信道")
+                gram_inverse = torch.linalg.pinv(design.mH @ design)
+                self._groups.append((streams, support, occasion, design, gram_inverse))
+        self._occasion_symbols = tuple(
+            self._dmrs_symbols[i * length] for i in range(num_dmrs // length)
+        )
+
+    def forward(self, y: torch.Tensor, no: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, num_rx, antennas, _, _ = y.shape
+        if num_rx != 1:
+            raise ValueError("DMRS estimator 仅支持一个 BS 接收端口")
+        no = torch.as_tensor(no, dtype=y.real.dtype, device=y.device)
+        if no.ndim == 2 and no.shape == (batch, antennas):
+            no = no.unsqueeze(1)
+        no = torch.broadcast_to(no, (batch, 1, antennas))[:, 0]
+        estimate = torch.zeros((batch, 1, antennas, self._users, self._layers,
+                                len(self._occasion_symbols), self._subcarriers),
+                               dtype=y.dtype, device=y.device)
+        error = torch.zeros_like(estimate.real)
+        basis = self._basis.to(y.device)
+        for streams, support, occasion, design, inverse in self._groups:
+            design = design.to(y.device)
+            support = support.to(y.device)
+            observations = torch.cat([
+                y[:, 0, :, self._dmrs_symbols[occasion * self._length + offset], :]
+                .index_select(-1, support)
+                for offset in range(self._length)
+            ], dim=-1).reshape(batch * antennas, -1).T
+            if self._prior is None or not torch.any(no > 0):
+                taps = torch.linalg.lstsq(design, observations).solution
+                covariance = inverse.to(y.device)[None] * no.reshape(-1, 1, 1)
+            else:
+                work = design.to(torch.complex128)
+                rhs = observations.to(torch.complex128)
+                powers = self._prior.to(y.device).repeat(len(streams)).double()
+                variances = no.reshape(-1).double().clamp_min(_MIN_NOISE_VARIANCE)
+                precision = (work.mH @ work)[None] / variances[:, None, None]
+                precision = precision + torch.diag(1.0 / powers)[None]
+                covariance = torch.linalg.inv(precision).to(design.dtype)
+                taps = (torch.matmul(
+                    covariance.to(work.dtype),
+                    ((work.mH @ rhs).T / variances[:, None]).unsqueeze(-1)
+                ).squeeze(-1).T).to(design.dtype)
+            for index, (user, layer) in enumerate(streams):
+                tap_slice = slice(index * self._num_taps, (index + 1) * self._num_taps)
+                response = (taps[tap_slice].T @ basis.T).reshape(
+                    batch, antennas, self._subcarriers
+                )
+                estimate[:, 0, :, user, layer, occasion] = response
+                covariance_stream = covariance[:, tap_slice, tap_slice]
+                uncertainty = torch.einsum(
+                    "nl,blm,nm->bn", basis, covariance_stream, basis.conj()
+                ).real.clamp_min(0).reshape(batch, antennas, self._subcarriers)
+                error[:, 0, :, user, layer, occasion] = uncertainty
+        h_hat = _interpolate_dmrs_time(estimate, self._occasion_symbols, self._symbols)
+        err_var = _interpolate_dmrs_time(error, self._occasion_symbols, self._symbols,
+                                          variance=True)
+        self.last_channel_estimate = h_hat.detach()
+        if self._estimate_delay:
+            self.last_offsets = torch.stack([
+                DftSOfdmDmrsEstimator._estimate_offsets(h_hat[:, 0, :, user, 0, 0])
+                for user in range(self._users)
+            ], dim=1)
+        return h_hat, err_var
+
+
 @dataclass
 class RxResult:
     bits: torch.Tensor  # [batch, user, transport_block_bit]
     crc_status: torch.Tensor  # [batch, user], True means CRC pass
-    constellation: torch.Tensor  # [batch, user, data_symbol], soft QAM estimates
+    constellation: torch.Tensor  # [batch, user, layer, data_symbol], soft QAM estimates
     metadata: dict[str, Any]
 
 
@@ -1227,7 +1379,7 @@ class _CbCrcProbe(torch.nn.Module):
 
 
 class NrPuschRx:
-    """Decode time-domain captures or simulated samples for four PUSCH users.
+    """Decode time-domain captures or frequency grids for configured PUSCH UEs.
 
     ``channel_estimator="dmrs"`` fits OCC least squares at each DMRS occasion
     and interpolates channel estimates across the slot. ``"dmrs-lmmse"`` uses
@@ -1253,8 +1405,8 @@ class NrPuschRx:
         scrambling_sequences: torch.Tensor | None = None,
     ) -> None:
         settings.validate()
-        if settings.pusch.waveform != "dft_s_ofdm":
-            raise NotImplementedError("当前接收机仅支持仓库配置的 DFT-s-OFDM PUSCH")
+        if settings.pusch.waveform not in {"dft_s_ofdm", "cp_ofdm"}:
+            raise ValueError("不支持的 PUSCH 波形")
         if channel_estimator not in {"perfect", "dmrs", "dmrs-lmmse"}:
             raise ValueError("channel_estimator 仅支持 perfect、dmrs 或 dmrs-lmmse")
         if channel_estimator == "dmrs-lmmse" and dmrs_tap_power_prior is None:
@@ -1285,7 +1437,9 @@ class NrPuschRx:
         self._num_bits_per_symbol = int(torch.as_tensor(tx._num_bits_per_symbol).reshape(-1)[0])
         self._fft_size = tx.resource_grid.fft_size
         _, l_max = time_lag_discrete_time_channel(self.sample_rate_hz, max_delay_spread_s)
-        stream_management = StreamManagement(np.ones((1, len(settings.users)), dtype=bool), 1)
+        stream_management = StreamManagement(
+            np.ones((1, len(settings.users)), dtype=bool), settings.pusch.num_layers
+        )
         tb_decoder = TBDecoder(
             tx._tb_encoder,
             num_bp_iter=num_decoder_iterations,
@@ -1338,26 +1492,57 @@ class NrPuschRx:
             )
         else:
             detector_block = DftSOfdmMimoDetector(
-                tx, stream_management, detector, detector_parameter
+                tx, stream_management, detector, detector_parameter,
+                spread=settings.pusch.waveform == "dft_s_ofdm"
             )
-        if channel_estimator in {"dmrs", "dmrs-lmmse"}:
+        if (settings.pusch.waveform == "cp_ofdm"
+                and settings.pusch.dmrs_config_type == 2
+                and channel_estimator == "dmrs"):
+            estimator = None  # Native LS supports type-2 CP-OFDM pilots.
+        elif channel_estimator in {"dmrs", "dmrs-lmmse"}:
             template_tx = NrPuschTx(settings, device=device)
             zero_bits = torch.zeros(
                 (1, len(settings.users), int(template_tx.transport_block_size)),
-                dtype=torch.float32,
-                device=template_tx.device,
+                dtype=torch.float32, device=template_tx.device,
             )
-            pilot_grid = template_tx.generate(batch_size=1, bits=zero_bits).frequency_grid[0, :, 0]
-            dmrs_symbol = _dmrs_symbol_indices(template_tx._tx_freq)[0]
-            pilot_grid = pilot_grid[:, dmrs_symbol, :]
-            estimator = DftSOfdmDmrsEstimator(
-                pilot_grid,
-                tx.resource_grid,
-                l_min=l_min,
-                l_max=l_max,
-                estimate_delay=estimate_delay,
-                tap_power_prior=dmrs_tap_power_prior,
-            )
+            transmitted_pilots = template_tx.generate(
+                batch_size=1, bits=zero_bits
+            ).frequency_grid[0]
+            dmrs_symbols = _dmrs_symbol_indices(template_tx._tx_freq)
+            if (settings.pusch.waveform == "dft_s_ofdm"
+                    and settings.pusch.num_layers == 1
+                    and settings.pusch.num_antenna_ports == 1
+                    and settings.pusch.precoding == "non-codebook"
+                    and len(settings.users) == 4
+                    and settings.pusch.dmrs_length == 1):
+                estimator = DftSOfdmDmrsEstimator(
+                    transmitted_pilots[:, 0, dmrs_symbols[0], :],
+                    tx.resource_grid, l_min=l_min, l_max=l_max,
+                    estimate_delay=estimate_delay,
+                    tap_power_prior=dmrs_tap_power_prior,
+                )
+            else:
+                if settings.pusch.precoding == "codebook":
+                    pilots = torch.stack([
+                        torch.einsum(
+                            "la,ask->lsk",
+                            torch.linalg.pinv(torch.as_tensor(
+                                cfg.precoding_matrix, device=device,
+                                dtype=transmitted_pilots.dtype
+                            )),
+                            transmitted_pilots[user].index_select(
+                                1, torch.as_tensor(dmrs_symbols, device=transmitted_pilots.device)
+                            ),
+                        )
+                        for user, cfg in enumerate(settings.to_sionna_configs())
+                    ])
+                else:
+                    pilots = transmitted_pilots[:, :, dmrs_symbols, :]
+                estimator = MimoDmrsEstimator(
+                    pilots, tx.resource_grid, settings.pusch.dmrs_length,
+                    l_min, l_max, estimate_delay=estimate_delay,
+                    tap_power_prior=dmrs_tap_power_prior,
+                )
         else:
             estimator = "perfect"
         if track_cb_crc and tb_decoder._cb_crc_decoder is not None:
@@ -1402,16 +1587,17 @@ class NrPuschRx:
         """Decode `[batch, rx_antenna, sample]` received complex IQ samples."""
         if self.input_domain != "time":
             raise ValueError("该接收机使用 frequency 输入；请调用 receive_frequency_grid")
-        if iq.ndim != 3 or iq.shape[1] != 4 or not iq.is_complex():
-            raise ValueError("iq 形状必须为复数 [batch, 4 rx_antennas, samples]")
+        if iq.ndim != 3 or iq.shape[1] < 1 or not iq.is_complex():
+            raise ValueError("iq 形状必须为复数 [batch, rx_antennas, samples]")
         if self.channel_estimator == "perfect":
             if channel_taps is None:
                 raise ValueError("perfect CSI 模式要求提供 CDL channel_taps")
-            if channel_taps.ndim != 5 or channel_taps.shape[:3] != (iq.shape[0], 4, 4):
-                raise ValueError("channel_taps 形状必须为 [batch, 4 users, 4 rx_antennas, time, taps]")
-            # Sionna PUSCHReceiver perfect time-domain CSI axis order:
-            # [batch, num_rx=1, rx_ant, num_tx=user, tx_ant=1, time, tap].
-            h = channel_taps.permute(0, 2, 1, 3, 4).unsqueeze(1).unsqueeze(4)
+            expected = (iq.shape[0], len(self.settings.users), iq.shape[1],
+                        self.settings.pusch.num_antenna_ports)
+            if channel_taps.ndim != 6 or channel_taps.shape[:4] != expected:
+                raise ValueError(f"channel_taps 形状必须为 {expected} + [time, taps]")
+            # Physical antenna CSI; PUSCHReceiver applies native codebook W.
+            h = channel_taps.permute(0, 2, 1, 3, 4, 5).unsqueeze(1)
         else:
             h = None
         y = iq.unsqueeze(1)
@@ -1435,16 +1621,18 @@ class NrPuschRx:
             raise ValueError("该接收机使用 time 输入；请调用 receive")
         if (
             grid.ndim != 5
-            or grid.shape[1:3] != (1, 4)
+            or grid.shape[1] != 1
+            or grid.shape[2] < 1
             or grid.shape[-2:] != (self._num_ofdm_symbols, self._fft_size)
             or not grid.is_complex()
         ):
             raise ValueError(
-                "grid 形状必须为复数 [batch, 1, 4 rx_antennas, configured_symbols, fft_size]"
+                "grid 形状必须为复数 [batch, 1, rx_antennas, configured_symbols, fft_size]"
             )
         if self.channel_estimator == "perfect":
             expected = (
-                grid.shape[0], 1, 4, len(self.settings.users), 1,
+                grid.shape[0], 1, grid.shape[2], len(self.settings.users),
+                self.settings.pusch.num_antenna_ports,
                 self._num_ofdm_symbols, self._fft_size,
             )
             if channel_frequency_response is None:
@@ -1490,7 +1678,7 @@ class NrPuschRx:
         constellation, _ = SymbolLogits2Moments(
             constellation=mimo_detector._constellation, device=self.device
         )(symbol_logits)
-        constellation = constellation.squeeze(2)
+        # Preserve the explicit layer axis, including single-layer profiles.
         cb_crc_status = None
         if self.track_cb_crc and self._cb_crc_status:
             latest = self._cb_crc_status[-1]
@@ -1557,7 +1745,13 @@ class NrPuschRx:
             ),
             "crc_status_axes": ["batch", "user"],
             "bits_axes": ["batch", "user", "transport_block_bit"],
-            "constellation_axes": ["batch", "user", "qam_symbol"],
+            "constellation_axes": ["batch", "user", "layer", "qam_symbol"],
+            "num_users": len(self.settings.users),
+            "num_layers_per_user": self.settings.pusch.num_layers,
+            "num_tx_antennas_per_user": self.settings.pusch.num_antenna_ports,
+            "num_rx_antennas": y.shape[2],
+            "total_streams": len(self.settings.users) * self.settings.pusch.num_layers,
+            "llr_axes": ["batch", "user", "layer", "coded_bit"],
             "sample_rate_hz": self.sample_rate_hz,
             **delay_metadata,
             **sic_metadata,

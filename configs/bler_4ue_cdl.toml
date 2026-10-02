@@ -29,4 +29,3 @@ l_min = -6
 device = "cpu"
 # frequency applies CDL per OFDM resource element and supports larger batches;
 # time models sample-level convolution and CP-related ISI.
-channel_domain = "frequency"

@@ -9,6 +9,7 @@ from threading import Event, Thread
 from urllib.request import Request, urlopen
 import unittest
 
+from nr_pusch.config import TxSettings
 from nr_pusch.simulation_config import BlerSettings
 from nr_pusch.web import SimulationWebApp, make_handler
 
@@ -128,6 +129,28 @@ class WebEstimatorMatrixTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+                app.shutdown()
+
+    def test_web_saves_mimo_profile_through_common_validator(self):
+        source = ROOT / "configs" / "pusch_2ue_4layer.toml"
+        with tempfile.TemporaryDirectory(prefix="nr-pusch-web-mimo-") as temporary:
+            root = Path(temporary)
+            config_dir = root / "configs"
+            config_dir.mkdir()
+            shutil.copyfile(source, config_dir / source.name)
+            app = SimulationWebApp(config_dir, root / "runs")
+            try:
+                text = source.read_text(encoding="utf-8")
+                saved = app.save_config("tx", source.name, text)
+                self.assertIn("dmrs_ports = [4, 5, 6, 7]", saved["text"])
+                self.assertEqual(len(TxSettings.from_toml(config_dir / source.name).users), 2)
+                with self.assertRaises(ValueError):
+                    app.save_config(
+                        "tx", source.name,
+                        text.replace("dmrs_ports = [4, 5, 6, 7]",
+                                     "dmrs_ports = [0, 5, 6, 7]"))
+                self.assertEqual((config_dir / source.name).read_text(encoding="utf-8"), text)
+            finally:
                 app.shutdown()
 
 if __name__ == "__main__":

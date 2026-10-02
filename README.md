@@ -1,14 +1,45 @@
 # NR PUSCH Lab
 
-一个小型、配置驱动的 5G NR PUSCH 发送与 IQ 分析仓库。首批目标为 4 用户上行 MU-MIMO，每用户 1 层；发送端通过独立 IQ 文件和运行清单与接收端解耦。
+配置驱动的 5G NR PUSCH 发送、CDL 信道与 IQ 分析仓库；支持单 UE 多层、单发射天线多接收天线及多 UE 聚合流。原 4 UE × 1 层 × 1 Tx × 4 Rx 配置保持为回归基线。
 
 ## 当前发送端
 
 当前实现以 Sionna 2.0.1 的 `PUSCHTransmitter` 生成 PUSCH 数据资源网格，并支持 CP-OFDM 和 DFT-s-OFDM 波形输出。DFT-s-OFDM 对数据符号应用酉 DFT，并按 type-1 低 PAPR 序列生成 DMRS 后进行 OFDM 调制；`[pusch].dmrs_additional_position` 支持 0、1、2，由 Sionna 资源图决定各 DMRS occasion。由于 Sionna 2.0.1 的组合 PUSCH 发射器不支持 transform precoding，配置中的 DFT 预编码 MCS 会映射到同调制阶数和码率的原生 Sionna MCS，以复用其 TB 编码器。当前活动配置为 DFT-s-OFDM MCS table 1/index 20，目标码率 0.6015625，TB 大小 28,168 bit。
 
+### MIMO TOML 拓扑
+
+`[pusch]` 的 `num_layers`（每 UE，1–4）、`num_antenna_ports`（1/2/4）、
+`precoding`（`non-codebook` 或 `codebook`）、`tpmi`、`dmrs_length` 均可配置；
+缺省分别为 1、1、`non-codebook`、0、1。所有 UE 共用 PUSCH 资源、
+MCS、层数、端口数和预编码模式；每个 `[[users]]` 使用长度等于层数的
+`dmrs_ports` 数组，所有并发流的 DMRS 端口必须唯一。总流数上限为 8，
+并非允许单个 PUSCH 使用 8 层；non-codebook 还要求层数等于天线端口数。
+原配置只把 `dmrs_port = n` 迁移为 `dmrs_ports = [n]`，其余参数不变。
+type-1 单符号支持端口 0–3；5–8 流使用 `dmrs_length = 2` 和端口 0–7，
+此时原生 Sionna 只允许 `dmrs_additional_position` 0 或 1。
+DFT-s-OFDM 的自定义低 PAPR 映射仅实现 type 1；不合法组合在配置阶段报错。
+
+示例：`configs/pusch_1ue_1tx_4rx.toml` 配旧 CDL 的 1 Tx/4 Rx；
+`configs/pusch_1ue_4layer.toml` 与 `configs/pusch_2ue_4layer.toml`
+配 `configs/cdl_38_901_4tx_8rx.toml` 的 4 Tx/8 Rx。频域示例：
+
+```bash
+nr-pusch-tx --config configs/pusch_2ue_4layer.toml --output /tmp/pusch_8stream_tx.npz --device cpu
+nr-pusch-channel --config configs/cdl_38_901_4tx_8rx.toml --tx-config configs/pusch_2ue_4layer.toml --domain frequency --input /tmp/pusch_8stream_tx.npz --sample-rate-hz 18000000 --output /tmp/pusch_8stream_rx.npz --device cpu
+nr-pusch-rx --tx-config configs/pusch_2ue_4layer.toml --input /tmp/pusch_8stream_rx.npz --input-domain frequency --channel-estimator perfect --noise-variance 0.000001 --output /tmp/pusch_8stream_decode.npz --device cpu
+```
+八流 DMRS/LMMSE 单点连通性检查：
+`nr-pusch-bler --tx-config configs/pusch_2ue_4layer.toml --channel-config configs/cdl_38_901_4tx_8rx.toml --simulation-config configs/bler_8stream_smoke.toml --output /tmp/pusch_8stream_bler.csv --device cpu`。
+该配置只发一帧，不用于评估统计 BLER。
+
+
+NPZ 的物理发射天线轴与层轴不混用。RX 星座与 LLR 保留
+`[batch,user,layer,symbol_or_bit]`，TB bits/CRC 仍按 UE 返回。
+MATLAB H5 reader 仅服务原四用户固定夹具；新拓扑使用 NPZ 输入。
+
 ## CDL 信道
 
-`NrPuschCdlChannel` 使用 Sionna TR 38.901 CDL A–E 模型处理 4 个独立的上行 UE 链路，每个 UE 使用 1 根发射天线；4 条链路在 4 天线 BS 接收端叠加。接收阵列形状、CDL 模型、载波频率、时延扩展和速度范围等参数位于 `configs/cdl_38_901_4x4.toml`。该 profile 使用单极化 2×2 接收阵列。
+`NrPuschCdlChannel` 使用 Sionna TR 38.901 CDL A–E 模型处理每个 UE 的独立上行链路，将每个物理发射端口的贡献合并到接收阵列。`[antennas]` 中的 `tx_num_rows/tx_num_cols` 缺省 1×1，`rx_num_rows/rx_num_cols` 可为任意正整数；TX 阵列天线数须等于 PUSCH 天线端口数。原 `configs/cdl_38_901_4x4.toml` 为单端口 UE、单极化 2×2 BS 阵列。
 
 BLER 链路默认用 `channel_domain = "frequency"`：按 OFDM 符号采样 CDL CIR，使用与时域链路相同的有限长度 sinc taps 和时延范围生成频响，再直接施加到发射资源网格，保留 batch 并行，不生成逐采样 CIR 和时域卷积。该单抽头频域模型假设 CP 足以覆盖时延扩展，不模拟 CP 不足导致的 ISI 或符号内快速时变造成的 ICI。设为 `channel_domain = "time"` 可使用时域卷积；独立 IQ 抓包的信道命令也继续使用时域路径。
 
@@ -19,7 +50,7 @@ nr-pusch-tx --config configs/pusch_4ue.toml --output /tmp/pusch_tx.npz --seed 7
 nr-pusch-channel --config configs/cdl_38_901_4x4.toml --input /tmp/pusch_tx.npz --sample-rate-hz 18000000 --output /tmp/pusch_rx.npz
 ```
 
-发送输入必须为 NPZ 中的 `iq` 数组，轴顺序为 `[batch,user,tx_antenna,sample]`。信道结果 `iq` 轴顺序为 `[batch,rx_antenna,sample]`，`per_user_iq` 为 `[batch,user,rx_antenna,sample]`。输出包含线性卷积产生的信道尾部；未加入噪声和路径损耗，默认保留 CDL 的实际归一化功率设置。
+发送 NPZ 的 `iq` 为 `[batch,user,tx_antenna,sample]`；信道输出 `iq` 为 `[batch,rx_antenna,sample]`、`per_user_iq` 为 `[batch,user,rx_antenna,sample]`、`channel_taps` 为 `[batch,user,rx_antenna,tx_antenna,time,tap]`。频域 CSI 为 `[batch,1,rx_antenna,user,tx_antenna,symbol,fft_bin]`。信道输出包含线性卷积尾部；噪声由独立的 AWGN 步骤加入。
 
 离线资源网格也可直接应用频域信道；输入使用发送 NPZ 中的 `frequency_grid`，并提供发送 TOML 以取得 FFT/子载波间隔配置：
 
@@ -32,7 +63,7 @@ nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /tmp/pusch_rx_grid.npz --
 
 ## 多用户接收和 BLER
 
-`NrPuschRx` 使用 Sionna PUSCH TB 解码器、4×4 MIMO 检测，以及 DFT-s-OFDM 每数据符号的逆 DFT。时域 IQ 先由 Sionna OFDM 解调为资源网格；直接加载的频域网格跳过这一步。两种输入共用频域 DMRS 估计接口：默认 `channel_estimator="dmrs"` 用发送端实际映射的低 PAPR DMRS 和 OCC 端口序列，对每对共享 comb 的用户做联合 LS 拟合，输出各子载波频响和估计误差方差；显式 `dmrs-lmmse` 模式在相同设计矩阵上使用 CDL tap-power prior 和后验协方差。Sionna 原生 PUSCH 导频序列与本仓库的 DFT-s-OFDM 序列不同，因此保留自定义 OCC 处理。`perfect` 模式直接使用仿真 CDL CSI，仅用于上界对照。
+`NrPuschRx` 以 Sionna PUSCH TB 解码器合并每 UE 多层码字。时域 IQ 经 OFDM 解调，频域网格直接检测；DFT-s-OFDM 数据先均衡、按层逆 DFT。`perfect` 接收物理 TX 天线 CSI，codebook 时应用原生预编码矩阵；`dmrs` 从每层导频的 comb/OCC 联合估计有效层信道，`dmrs-lmmse` 加入 CDL tap-power prior。保留原 4 UE 单层捕获的 MATLAB 对照估计路径。信道估计输出 `[batch,1,rx_antenna,user,layer,symbol,subcarrier]`，最终 TB/CRC 按 UE。
 
 DMRS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围：当前为 18 MHz 采样率下的 `-6..60`，共 67 taps，这是时延范围先验，不读取本帧真实信道系数。多个 DMRS occasion 各自拟合 CSI，再按 OFDM 符号位置对相邻估计做复数线性插值；首个/末个 occasion 之外保持最近估计。`err_var` 按插值权重平方传播，假设各 occasion 的估计噪声独立，不包含信道时变造成的插值模型误差；高 Doppler 场景仍需独立验证。
 
@@ -53,7 +84,7 @@ nr-pusch-estimator-validation --tx-config configs/pusch_4ue.toml --channel-confi
 BLER 配置可用 `[bler].channel_estimators` 选择多个估计器；仿真按 `channel_estimators × detectors × snr_db` 遍历组合。未设置时沿用单个 `channel_estimator`。网页 SIM 配置 `configs/bler_estimator_matrix.toml` 组合 `dmrs`、`dmrs-lmmse`、`perfect` 与 `soft-mmse-pic`，扫描 25–50 dB 六个 SNR，共 18 个结果点，每点最多 2,000 帧（GPU profile）。运行前需按上面的验证命令生成 `/tmp/channel_estimation_validation.prior.npz`；输出路径不同时更新 `dmrs_tap_power_prior_path`。
 
 
-检测器可选 `lmmse`、`lmmse-sic`、`k-best`、`mmse-pic`、`soft-mmse-pic` 和 `ep`。`detector_parameter` 对 `mmse-pic` 表示 QAM-PIC 轮数，对 `soft-mmse-pic` 表示 LDPC 外反馈轮数；BLER 支持用 `detector_parameters` 分别配置，CLI 也提供 `--detector`、`--detector-parameter` 和 `--detector-damping`。`k-best` 和 `ep` 均先做频域 LMMSE 预均衡并 IDFT；每个时域采样点建立四流空间模型，频率变化与等化噪声合并为残余 ISI 协方差。K-best 在该模型上搜索有限星座路径。EP 则为四个 QAM 用户维护复高斯近似因子，以 cavity 分布对离散星座做矩匹配，并对因子参数阻尼迭代，最后由后验均值和方差形成软 LLR。`mmse-pic` 从时域 LLR 计算软星座期望，DFT 回频域后并行消除其他 UE，并更新 LLR；它不调用 LDPC 译码器做检测反馈。`soft-mmse-pic` 在相同初始 LMMSE 检测后运行 LDPC BP，以码块位序的 posterior-minus-channel 外信息反馈；取消时将当前检测器 LLR 与已阻尼的 LDPC 外信息组合为其他 UE 的软符号概率，对目标 UE 使用天线噪声加权单流 LMMSE，并由最终检测器 LLR 经原 TBDecoder 给出 TB/CB CRC。其默认外反馈轮数为 1、阻尼为 0.25，独立于旧 `mmse-pic` 的 4 轮默认值；默认 BLER 与抓包 profile 不切换。`lmmse-sic` 按估计信道功率从强到弱处理 UE：仅在该 UE CRC 通过时重编码、重构其 DFT-s-OFDM 资源网格并消除干扰。单次接收 JSON sidecar 会记录 SIC 检测顺序和每个 UE 消除前的 CRC 状态。BLER 配置中的 `detectors` 会按相同 seed、CDL、SNR 和 payload 顺序比较检测器；例如 `{ "k-best" = 16, "mmse-pic" = 4, "soft-mmse-pic" = 1, "ep" = 10 }`。
+检测器 `lmmse`、`lmmse-sic`、`k-best`、`mmse-pic`、`soft-mmse-pic` 和 `ep` 在 DFT-s-OFDM 的用户×层总流上工作；Sionna layer demapper 将每层 LLR 恢复为各 UE 的唯一 TB 码字。PIC 按全部层消除干扰；soft-PIC 的 LDPC 外信息按码字/层次序互换；SIC 仅对 CRC 通过的 UE 重构所有层并消除其全部发射贡献。K-best 要求接收天线数不少于总流数，路径数量和复杂度由 `detector_parameter` 控制。`detector_parameter` 对 PIC 为迭代轮数，对 EP 为迭代次数；BLER 的 `detectors` 和 `detector_parameters` 保持原名。
 
 EP 与 K-best 共用零时延等效空间信道近似；滤波后剩余的频率选择性记入高斯协方差，而非在 EP 图中显式建模所有跨采样相关性。该近似、软 LLR 校准及收敛行为仍需通过 MATLAB 参考向量和长 SNR 曲线验证。
 
