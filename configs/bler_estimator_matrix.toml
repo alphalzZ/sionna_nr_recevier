@@ -1,6 +1,7 @@
 [bler]
 # Starter web matrix: three channel estimators × soft-MMSE-PIC at two SNRs.
-# Generate this prior with the documented estimator-validation command first.
+# DMRS-LMMSE 先验由 nr-pusch-estimator-validation 在 acceptance_gate 通过后发布到
+# configs/tap_power_prior/，本机不提交 NPZ；运行前先完成一次验证。
 snr_db = [25.0, 30.0, 35.0, 40.0, 45.0, 50.0]
 batch_size = 8
 max_frames_per_snr = 2000
@@ -9,7 +10,6 @@ seed = 20260924
 num_decoder_iterations = 20
 channel_estimator = "dmrs"
 channel_estimators = ["dmrs", "dmrs-lmmse", "perfect"]
-dmrs_tap_power_prior_path = "/tmp/channel_estimation_validation.prior.npz"
 detector = "soft-mmse-pic"
 detectors = ["soft-mmse-pic"]
 detector_parameters = { "soft-mmse-pic" = 4 }

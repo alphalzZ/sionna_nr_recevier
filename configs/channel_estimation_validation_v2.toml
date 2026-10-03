@@ -1,0 +1,40 @@
+# 版本 2 验收门槛：CP-OFDM 用 9% + 上界非严格（<= 0），GPU + batch 20。
+# 与 configs/channel_estimation_validation.toml 的差异：门槛三项阈值，以及
+# device/batch_size（批量大小会改变信道实现与噪声的随机抽样顺序，见下文）。
+# 其余训练/holdout/高 SNR 设置完全一致，用于可追溯地复现“放宽后的”结论。
+# 门槛阈值不得为了让某个波形通过而临时调整；改动请新增版本化配置并在摘要 JSON 中
+# 记录 acceptance_gate.thresholds。版本 1 的结论（CP 30 dB FAIL）保持不变。
+[bler]
+snr_db = [25.0, 30.0]
+batch_size = 20
+max_frames_per_snr = 3000
+target_block_errors = 1000000000
+seed = 20260924
+num_decoder_iterations = 20
+channel_estimator = "dmrs"
+detector = "soft-mmse-pic"
+detector_parameter = 1
+detector_parameters = { "soft-mmse-pic" = 1 }
+detector_damping = 0.25
+detectors = ["soft-mmse-pic"]
+device = "cuda:0"
+channel_domain = "frequency"
+l_min = -6
+max_delay_spread_s = 3e-6
+estimate_delay = false
+stop_at_zero_bler = false
+
+[estimator_validation]
+training_seed = 21260924
+training_realizations = 256
+development_seed = 20260924
+development_frames_per_snr = 512
+holdout_seed = 22260924
+holdout_frames_per_snr = 3000
+bootstrap_seed = 20261001
+bootstrap_replicates = 10000
+high_snr_db = 60.0
+high_snr_frames = 64
+min_relative_bler_reduction = 0.09
+max_paired_bler_difference_97_5pct_upper = 0.0
+require_strict_upper_bound = false

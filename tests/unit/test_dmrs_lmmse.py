@@ -3,12 +3,17 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import tempfile
+import shutil
 import unittest
 
 from nr_pusch.channel_config import ChannelSettings
 from nr_pusch.dmrs_prior import (
+    default_prior_dir,
     dmrs_prior_compatibility,
     load_dmrs_tap_power_prior,
+    prior_registry_path,
+    publish_accepted_dmrs_prior,
+    resolve_dmrs_tap_power_prior,
     save_dmrs_tap_power_prior,
 )
 
@@ -221,6 +226,164 @@ class DmrsTapLmmseTest(unittest.TestCase):
                 device="cpu",
             )
 
+
+
+class DmrsPriorRegistryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sionna.phy.config.seed = 17
+        cls.settings = TxSettings.from_toml(ROOT / "configs" / "pusch_4ue.toml")
+        cls.transmitter = NrPuschTx(cls.settings, device="cpu")
+        cls.channel_settings = ChannelSettings.from_toml(
+            ROOT / "configs" / "cdl_38_901_4x4.toml"
+        )
+
+    def _compatibility(self, **overrides):
+        values = dict(
+            l_min=-6,
+            max_delay_spread_s=3e-6,
+            fft_size=self.transmitter._tx_freq.resource_grid.fft_size,
+            sample_rate_hz=self.transmitter.sample_rate_hz,
+        )
+        values.update(overrides)
+        return dmrs_prior_compatibility(
+            self.settings, self.channel_settings, **values
+        )
+
+    def _candidate(self, directory: Path, compatibility) -> Path:
+        taps = compatibility["l_max"] - compatibility["l_min"] + 1
+        path = Path(directory) / "candidate.prior.npz"
+        save_dmrs_tap_power_prior(
+            path,
+            torch.full((taps,), 0.25),
+            compatibility=compatibility,
+            training_seed=42,
+            training_realizations=8,
+        )
+        return path
+
+    def test_registry_key_separates_waveforms_and_ignores_mcs(self):
+        dft = self._compatibility()
+        cp_settings = replace(
+            self.settings,
+            pusch=replace(self.settings.pusch, waveform="cp_ofdm", dmrs_beta=2**0.5),
+        )
+        cp_settings.validate()
+        cp = dmrs_prior_compatibility(
+            cp_settings,
+            self.channel_settings,
+            l_min=-6,
+            max_delay_spread_s=3e-6,
+            fft_size=self.transmitter._tx_freq.resource_grid.fft_size,
+            sample_rate_hz=self.transmitter.sample_rate_hz,
+        )
+        store = Path("configs") / "tap_power_prior"
+        self.assertNotEqual(prior_registry_path(store, dft), prior_registry_path(store, cp))
+        self.assertEqual(
+            prior_registry_path(store, dft).parent.name,
+            "dft_s_ofdm",
+        )
+        self.assertEqual(
+            prior_registry_path(store, cp).parent.name,
+            "cp_ofdm",
+        )
+        mcs_changed = replace(
+            self.settings,
+            pusch=replace(self.settings.pusch, mcs_index=1),
+        )
+        mcs_changed.validate()
+        self.assertEqual(
+            prior_registry_path(
+                store,
+                dmrs_prior_compatibility(
+                    mcs_changed,
+                    self.channel_settings,
+                    l_min=-6,
+                    max_delay_spread_s=3e-6,
+                    fft_size=self.transmitter._tx_freq.resource_grid.fft_size,
+                    sample_rate_hz=self.transmitter.sample_rate_hz,
+                ),
+            ),
+            prior_registry_path(store, dft),
+        )
+        self.assertNotEqual(
+            prior_registry_path(store, self._compatibility(max_delay_spread_s=2e-6)),
+            prior_registry_path(store, dft),
+        )
+
+    def test_publish_requires_an_accepted_gate_and_resolves_by_key(self):
+        compatibility = self._compatibility()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = root / "tap_power_prior"
+            candidate = self._candidate(root, compatibility)
+            with self.assertRaisesRegex(ValueError, "acceptance_gate"):
+                publish_accepted_dmrs_prior(
+                    store,
+                    candidate,
+                    compatibility=compatibility,
+                    acceptance_gate={"passed": False},
+                )
+            self.assertFalse(store.exists())
+            published = publish_accepted_dmrs_prior(
+                store,
+                candidate,
+                compatibility=compatibility,
+                acceptance_gate={"passed": True, "margin_db": 1.25},
+            )
+            self.assertEqual(published, prior_registry_path(store, compatibility))
+            prior, path, metadata = resolve_dmrs_tap_power_prior(
+                store, expected_compatibility=compatibility
+            )
+            self.assertEqual(path, published)
+            self.assertEqual(prior.shape, (compatibility["l_max"] + 7,))
+            self.assertRegex(metadata["accepted_gate_sha256"], r"\A[0-9a-f]{64}\Z")
+            self.assertEqual(metadata["training_realizations"], 8)
+            with self.assertRaisesRegex(ValueError, "未找到"):
+                resolve_dmrs_tap_power_prior(
+                    store, expected_compatibility=self._compatibility(l_min=-5)
+                )
+            self.assertEqual(list(store.rglob("*.tmp")), [])
+
+    def test_unaccepted_candidate_is_not_selectable_and_republish_is_atomic(self):
+        compatibility = self._compatibility()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = root / "tap_power_prior"
+            candidate = self._candidate(root, compatibility)
+            unmarked = prior_registry_path(store, compatibility)
+            unmarked.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(candidate, unmarked)
+            with self.assertRaisesRegex(ValueError, "缺少通过验证的 acceptance 标记"):
+                resolve_dmrs_tap_power_prior(
+                    store, expected_compatibility=compatibility
+                )
+            published = publish_accepted_dmrs_prior(
+                store,
+                candidate,
+                compatibility=compatibility,
+                acceptance_gate={"passed": True},
+            )
+            replacement = self._candidate(root, compatibility)
+            with self.assertRaises(ValueError):
+                publish_accepted_dmrs_prior(
+                    store,
+                    replacement,
+                    compatibility=self._compatibility(max_delay_spread_s=2e-6),
+                    acceptance_gate={"passed": True},
+                )
+            prior, _, _ = resolve_dmrs_tap_power_prior(
+                store, expected_compatibility=compatibility
+            )
+            torch.testing.assert_close(prior, torch.full((compatibility["l_max"] + 7,), 0.25))
+            self.assertTrue(published.is_file())
+            self.assertEqual(list(store.rglob("*.tmp")), [])
+
+    def test_default_prior_dir_sits_beside_the_channel_profile(self):
+        self.assertEqual(
+            default_prior_dir(ROOT / "configs" / "cdl_38_901_4x4.toml"),
+            ROOT / "configs" / "tap_power_prior",
+        )
 
 if __name__ == "__main__":
     unittest.main()

@@ -89,10 +89,11 @@ Create workload-specific immutable validation snapshots for DFT and CP. Run sepa
 nr-pusch-estimator-validation --tx-config <TX-snapshot> \
   --channel-config <CDL-snapshot> --validation-config <validation-snapshot> \
   --output "$BASE/estimator-validation/<profile>/validation.json" \
-  --device cuda:0 --prior-realizations 32 --frames-per-snr <cap>
+  --device cuda:0 --prior-realizations 32 --frames-per-snr <cap> \
+  --prior-dir "$BASE/tap_power_prior"
 ```
 
-Use `--frames-per-snr 16` unless 8 is selected before any measured performance run; the same choice applies to both profiles. Keep the configured 64-frame high-SNR check. Preserve summary JSON, per-frame NPZ and prior NPZ in each profile directory. Point each measured profile at a prior calibrated for its TX/CDL, tap-window, FFT and sample-rate compatibility settings; changing only MCS table/index does not invalidate the channel tap-power prior, while any other compatibility-field mismatch remains an error. Run the strict prior compatibility path before the BLER matrix. These reduced runs are diagnostic and do not establish the full registered statistical acceptance gate; the checked-in full validation profile historically took 74m56 on an RTX 3060.
+Use `--frames-per-snr 16` unless 8 is selected before any measured performance run; the same choice applies to both profiles. Keep the configured 64-frame high-SNR check. Preserve summary JSON, per-frame NPZ and the diagnostic prior NPZ in each profile directory. Only a passing acceptance gate publishes the candidate into the shared prior directory keyed by its TX/CDL, tap-window, FFT and sample-rate compatibility, so measured profiles need no explicit prior path; changing only MCS table/index does not invalidate the channel tap-power prior, while any other compatibility-field mismatch remains an error. These reduced runs are diagnostic and do not establish the full registered statistical acceptance gate, so they publish nothing; the checked-in full validation profile historically took 74m56 on an RTX 3060.
 
 ### 7. Frozen workload choice
 
@@ -132,7 +133,7 @@ channel_domain = "frequency"
 l_min = -6
 max_delay_spread_s = 3e-6
 stop_at_zero_bler = false
-dmrs_tap_power_prior_path = "<this-workload's exact prior>"
+# 先验按信道配置在共享目录中自动查找，不要填写 dmrs_tap_power_prior_path
 ```
 
 Do not add retries, omit detectors, or change settings silently. The low-count matrix is descriptive, not statistically significant. Do not interpret shared seeds as statistically paired BLER observations across detector arms.

@@ -33,7 +33,6 @@ class BlerSettings:
     l_min: int = -6
     max_delay_spread_s: float | None = None
     estimate_delay: bool = False
-    dmrs_tap_power_prior_path: str | None = None
     channel_estimators: tuple[str, ...] | None = None
 
     _SUPPORTED_CHANNEL_ESTIMATORS = frozenset({"perfect", "dmrs", "dmrs-lmmse"})
@@ -62,13 +61,9 @@ class BlerSettings:
         values.setdefault("device", "cpu")
         values.setdefault("stop_at_zero_bler", False)
         values.setdefault("channel_domain", "frequency")
-        prior_path = values.get("dmrs_tap_power_prior_path")
-        if prior_path is not None:
-            prior_path = Path(prior_path)
-            values["dmrs_tap_power_prior_path"] = str(
-                prior_path.resolve()
-                if prior_path.is_absolute()
-                else (config_path.parent / prior_path).resolve()
+        if "dmrs_tap_power_prior_path" in values:
+            raise ValueError(
+                "dmrs_tap_power_prior_path 已移除；先验改为按信道配置在共享先验目录中自动查找"
             )
         settings = cls(**values)
         settings.validate()
@@ -107,11 +102,6 @@ class BlerSettings:
             raise ValueError(
                 "channel_estimators 必须是非空且不重复的 perfect、dmrs、dmrs-lmmse 列表"
             )
-        if "dmrs-lmmse" in estimators:
-            if not isinstance(self.dmrs_tap_power_prior_path, str) or not self.dmrs_tap_power_prior_path:
-                raise ValueError("dmrs-lmmse 必须配置 dmrs_tap_power_prior_path")
-        elif self.dmrs_tap_power_prior_path is not None:
-            raise ValueError("dmrs_tap_power_prior_path 仅能用于包含 dmrs-lmmse 的仿真")
         allowed = self._SUPPORTED_DETECTORS
         if self.detector not in allowed or not self.detectors or any(x not in allowed for x in self.detectors):
             raise ValueError(f"detector(s) 必须属于 {sorted(allowed)}")

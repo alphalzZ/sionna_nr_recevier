@@ -26,8 +26,6 @@ class BlerSettingsTest(unittest.TestCase):
             ("dmrs", "dmrs-lmmse", "perfect"),
         )
         self.assertEqual(settings.detectors, ("soft-mmse-pic",))
-        self.assertEqual(settings.dmrs_tap_power_prior_path, "/tmp/channel_estimation_validation.prior.npz")
-
 
     def test_soft_mmse_pic_runs_with_each_profile_batch_size(self):
         for name, batch_size, feedback_rounds in (
@@ -102,7 +100,7 @@ class BlerSettingsTest(unittest.TestCase):
         self.assertEqual(settings.l_min, -44)
         self.assertEqual(settings.max_delay_spread_s, 2e-6)
 
-    def test_dmrs_lmmse_requires_and_resolves_prior_path(self):
+    def test_lmmse_profile_needs_no_prior_path_and_rejects_removed_key(self):
         common = [
             "[bler]",
             "snr_db = [25.0]",
@@ -117,23 +115,15 @@ class BlerSettingsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "validation.toml"
             config_path.write_text("\n".join(common), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "dmrs_tap_power_prior_path"):
-                BlerSettings.from_toml(config_path)
+            settings = BlerSettings.from_toml(config_path)
+            self.assertEqual(settings.channel_estimators_for_sweep, ("dmrs-lmmse",))
+            self.assertFalse(hasattr(settings, "dmrs_tap_power_prior_path"))
             config_path.write_text(
                 "\n".join(common + ['dmrs_tap_power_prior_path = "artifacts/prior.npz"']),
                 encoding="utf-8",
             )
-            settings = BlerSettings.from_toml(config_path)
-        self.assertEqual(
-            settings.dmrs_tap_power_prior_path,
-            str((Path(directory) / "artifacts" / "prior.npz").resolve()),
-        )
-
-    def test_estimator_matrix_requires_prior_when_dmrs_lmmse_is_selected(self):
-        settings = BlerSettings.from_toml(ROOT / "configs" / "bler_estimator_matrix.toml")
-        without_prior = dataclasses.replace(settings, dmrs_tap_power_prior_path=None)
-        with self.assertRaisesRegex(ValueError, "dmrs_tap_power_prior_path"):
-            without_prior.validate()
+            with self.assertRaisesRegex(ValueError, "dmrs_tap_power_prior_path 已移除"):
+                BlerSettings.from_toml(config_path)
 
 
     def test_rejects_invalid_receiver_window(self):

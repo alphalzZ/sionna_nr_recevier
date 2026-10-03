@@ -525,6 +525,28 @@ async function initRxConfigs() {
     api("/api/rx/configs"),
   ]);
   if (configsResult.status === "rejected") throw configsResult.reason;
+  const channelConfigs = state.configs.channel;
+  const channelSelect = $("rx-channel-select");
+  channelSelect.replaceChildren();
+  if (!channelConfigs.length) {
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "无可用信道配置";
+    channelSelect.append(empty);
+    channelSelect.disabled = true;
+  } else {
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "请选择 CDL 配置";
+    channelSelect.append(placeholder);
+    channelConfigs.forEach((name) => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      channelSelect.append(option);
+    });
+    channelSelect.disabled = false;
+  }
   if (defaultsResult.status === "fulfilled" && defaultsResult.value && typeof defaultsResult.value === "object") {
     state.rxDefaults = { ...state.rxDefaults, ...defaultsResult.value };
   }
@@ -565,6 +587,8 @@ async function initRxConfigs() {
   $("rx-detector-damping").value = String(state.rxDefaults.detector_damping ?? 0.25);
   $("rx-max-delay-spread").value = state.rxDefaults.max_delay_spread_s ?? "";
   $("rx-detector").dispatchEvent(new Event("change"));
+  $("rx-channel-estimator").value = state.rxDefaults.channel_estimator || "dmrs";
+  $("rx-channel-estimator").dispatchEvent(new Event("change"));
   $("rx-default-meta").textContent = state.rxDefaults.available
     ? `${state.rxDefaults.input_name || "本地默认夹具"} · ${state.rxDefaults.config_name || "默认配置"}`
     : "未发现本地默认夹具，请选择上传文件";
@@ -689,6 +713,13 @@ function fileToBase64(file) {
   });
 }
 
+function syncRxChannelControl() {
+  const channelSelect = $("rx-channel-select");
+  const needsChannel = $("rx-channel-estimator").value === "dmrs-lmmse";
+  channelSelect.disabled = state.rxBusy || !needsChannel || !channelSelect.options.length;
+  channelSelect.required = needsChannel;
+}
+
 function setRxBusy(busy) {
   state.rxBusy = busy;
   const button = $("rx-decode-button");
@@ -697,6 +728,8 @@ function setRxBusy(busy) {
   $("rx-scrambling").disabled = busy || isUsingDefaultRxCapture();
   $("rx-use-default").disabled = busy || !state.rxDefaults.available;
   $("rx-config-select").disabled = busy;
+  $("rx-channel-estimator").disabled = busy;
+  syncRxChannelControl();
   $("rx-decode-label").textContent = busy ? "正在分析…" : "开始接收分析";
   $("rx-submit-hint").textContent = busy
     ? (isUsingDefaultRxCapture() ? "内置采集正在解码，可能需要数秒" : "文件正在上传并解码，较大波形可能需要数秒")
@@ -913,10 +946,15 @@ async function decodeRx(event) {
       input_format: useDefaultCapture ? (state.rxDefaults.input_format || "matlab-h5") : inputFormat,
       input_domain: useDefaultCapture ? (state.rxDefaults.input_domain || "frequency") : $("rx-input-domain").value,
       noise_variance: noiseVariance,
-      channel_estimator: useDefaultCapture ? (state.rxDefaults.channel_estimator || "dmrs") : "dmrs",
+      channel_estimator: $("rx-channel-estimator").value,
       detector: $("rx-detector").value,
       device: $("rx-device").value,
     };
+    if ($("rx-channel-estimator").value === "dmrs-lmmse") {
+      const channelName = $("rx-channel-select").value;
+      if (!channelName) return showAlert("DMRS-LMMSE 需要选择匹配采集的信道配置。", true);
+      payload.channel_config_name = channelName;
+    }
     const delaySpread = $("rx-max-delay-spread").value.trim();
     if (delaySpread) payload.max_delay_spread_s = Number(delaySpread);
     else if (useDefaultCapture && Number.isFinite(Number(state.rxDefaults.max_delay_spread_s))) {
@@ -1041,6 +1079,7 @@ function drawChart(points) {
 document.querySelectorAll(".config-tab").forEach((tab) => tab.addEventListener("click", () => switchKind(tab.dataset.kind).catch((error) => showAlert(error.message))));
 $("bler-workflow-tab").addEventListener("click", () => switchWorkflow("bler"));
 $("rx-workflow-tab").addEventListener("click", () => switchWorkflow("rx"));
+$("rx-channel-estimator").addEventListener("change", syncRxChannelControl);
 $("rx-form").addEventListener("submit", decodeRx);
 $("rx-config-select").addEventListener("change", (event) => loadRxConfig(event.target.value).catch((error) => showAlert(error.message)));
 $("rx-config-editor").addEventListener("input", (event) => {
@@ -1153,4 +1192,6 @@ window.addEventListener("resize", () => {
   if (state.rxResult) drawConstellation(state.rxResult.constellation);
 });
 
-Promise.all([initConfigs(), loadRuns(), initRxConfigs()]).catch((error) => showAlert(error.message));
+initConfigs()
+  .then(() => Promise.all([loadRuns(), initRxConfigs()]))
+  .catch((error) => showAlert(error.message));

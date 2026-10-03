@@ -30,7 +30,7 @@ import numpy as np
 from .channel_config import ChannelSettings
 from .config import TxSettings
 from .simulation_config import BlerSettings
-from .dmrs_prior import dmrs_prior_compatibility, load_dmrs_tap_power_prior
+from .dmrs_prior import dmrs_prior_compatibility, resolve_dmrs_tap_power_prior
 from .transmitter import NrPuschTx
 
 
@@ -70,6 +70,7 @@ class SimulationWebApp:
             raise FileNotFoundError(f"配置目录不存在: {self.config_dir}")
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.python = python
+        self.prior_dir = self.config_dir / "tap_power_prior"
         self._lock = threading.RLock()
         self._jobs: dict[str, dict[str, Any]] = {}
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
@@ -260,11 +261,6 @@ class SimulationWebApp:
                             if simulation_settings.max_delay_spread_s is not None
                             else channel_settings.channel.max_delay_spread_s
                         )
-                        if not simulation_settings.dmrs_tap_power_prior_path:
-                            raise ValueError("DMRS-LMMSE 缺少 tap-power prior")
-                        prior_path = Path(simulation_settings.dmrs_tap_power_prior_path)
-                        if not prior_path.is_file():
-                            raise ValueError(f"DMRS prior 文件不存在: {prior_path}")
                         transmitter = NrPuschTx(tx_settings, device="cpu")
                         compatibility = dmrs_prior_compatibility(
                             tx_settings,
@@ -274,13 +270,10 @@ class SimulationWebApp:
                             fft_size=transmitter._tx_freq.resource_grid.fft_size,
                             sample_rate_hz=transmitter.sample_rate_hz,
                         )
-                        load_dmrs_tap_power_prior(
-                            prior_path,
+                        resolve_dmrs_tap_power_prior(
+                            self.prior_dir,
                             expected_compatibility=compatibility,
                             device="cpu",
-                        )
-                        texts["simulation"] = self._pin_prior_path(
-                            texts["simulation"], prior_path.resolve()
                         )
                     except Exception as exc:
                         errors.append({"kind": "simulation", "message": str(exc)})
@@ -297,17 +290,6 @@ class SimulationWebApp:
             "settings": settings,
         }
 
-    @staticmethod
-    def _pin_prior_path(text: str, prior_path: Path) -> str:
-        lines = text.splitlines(keepends=True)
-        for index, line in enumerate(lines):
-            content = line.rstrip("\r\n")
-            if re.match(r"^\s*dmrs_tap_power_prior_path\s*=", content):
-                newline = line[len(content):]
-                assignment = content.split("=", 1)[0].rstrip()
-                lines[index] = f'{assignment} = {json.dumps(str(prior_path))}{newline}'
-                return "".join(lines)
-        raise ValueError("仿真配置缺少 dmrs_tap_power_prior_path")
 
     def validate_run(self, data: dict[str, Any]) -> dict[str, Any]:
         prepared = self._prepare_run(data)
@@ -451,6 +433,7 @@ class SimulationWebApp:
             "--simulation-config", str(directory / "simulation.toml"),
             "--output", str(directory / "results.csv"),
             "--progress-jsonl", str(directory / "progress.jsonl"),
+            "--prior-dir", str(self.prior_dir),
         ]
         try:
             with (directory / "run.log").open("wb") as log:
@@ -724,6 +707,17 @@ class SimulationWebApp:
             raise ApiError(400, "max_delay_spread_s 必须是正数") from exc
         if not math.isfinite(max_delay_spread_s) or max_delay_spread_s <= 0:
             raise ApiError(400, "max_delay_spread_s 必须是正数")
+        rx_channel_config: Path | None = None
+        if channel_estimator == "dmrs-lmmse":
+            channel_config_name = data.get("channel_config_name")
+            if not isinstance(channel_config_name, str) or not channel_config_name:
+                raise ApiError(400, "dmrs-lmmse 需要选择与采集匹配的信道配置")
+            rx_channel_config = self._profile_path("channel", channel_config_name)
+            if "dmrs_tap_power_prior_path" in profile_receiver:
+                raise ApiError(
+                    400,
+                    "dmrs_tap_power_prior_path 已移除；先验改为按信道配置在共享先验目录中自动查找",
+                )
         if use_default_capture:
             payload = default_capture_path.read_bytes()
         else:
@@ -766,7 +760,32 @@ class SimulationWebApp:
                 self._validate("rx", config_copy)
             except (OSError, ValueError, KeyError, TypeError, tomllib.TOMLDecodeError) as exc:
                 raise ApiError(400, f"接收配置无效: {exc}") from exc
+            if rx_channel_config is not None:
+                try:
+                    rx_tx_settings = TxSettings.from_toml(config_copy)
+                    rx_channel_settings = ChannelSettings.from_toml(rx_channel_config)
+                    rx_channel_settings.validate_transmitter(rx_tx_settings)
+                    rx_transmitter = NrPuschTx(rx_tx_settings, device="cpu")
+                    rx_compatibility = dmrs_prior_compatibility(
+                        rx_tx_settings,
+                        rx_channel_settings,
+                        l_min=int(receiver_default("l_min", -6)),
+                        max_delay_spread_s=max_delay_spread_s,
+                        fft_size=rx_transmitter._tx_freq.resource_grid.fft_size,
+                        sample_rate_hz=rx_transmitter.sample_rate_hz,
+                    )
+                    resolve_dmrs_tap_power_prior(
+                        self.prior_dir,
+                        expected_compatibility=rx_compatibility,
+                        device="cpu",
+                    )
+                except Exception as exc:
+                    raise ApiError(422, f"无法加载匹配的 DMRS tap-power prior: {exc}") from exc
             capture.write_bytes(payload)
+            if rx_channel_config is not None:
+                channel_copy = directory / "channel.toml"
+                channel_copy.write_bytes(rx_channel_config.read_bytes())
+                self._validate("channel", channel_copy)
             scrambling_copy: Path | None = None
             if scrambling_payload is not None:
                 scrambling_copy = directory / f"scrambling{Path(str(scrambling_name)).suffix.lower()}"
@@ -783,6 +802,13 @@ class SimulationWebApp:
                 "--output", str(output), "--device", device,
                 "--cb-crc",
             ]
+            if rx_channel_config is not None:
+                command.extend(
+                    (
+                        "--channel-config", str(directory / "channel.toml"),
+                        "--prior-dir", str(self.prior_dir),
+                    )
+                )
             if parameter is not None:
                 command.extend(("--detector-parameter", str(parameter)))
             if scrambling_copy is not None:

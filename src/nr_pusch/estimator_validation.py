@@ -16,7 +16,11 @@ from .channel import NrPuschCdlChannel
 from .channel_config import ChannelSettings
 from .config import TxSettings
 from .device import use_device
-from .dmrs_prior import dmrs_prior_compatibility, save_dmrs_tap_power_prior
+from .dmrs_prior import (
+    dmrs_prior_compatibility,
+    publish_accepted_dmrs_prior,
+    save_dmrs_tap_power_prior,
+)
 from .noise import add_awgn_resource_grid
 from .receiver import NrPuschRx
 from .simulation_config import BlerSettings
@@ -34,6 +38,7 @@ def run_estimator_validation(
     validation_settings: dict[str, Any],
     *,
     output: str | Path,
+    prior_dir: str | Path,
     device: str | None = None,
     prior_realizations: int | None = None,
     frames_per_snr: int | None = None,
@@ -60,6 +65,15 @@ def run_estimator_validation(
         raise ValueError("估计器验证只支持已统一的频域信道链路")
     if tuple(simulation_settings.snr_db) != (25.0, 30.0):
         raise ValueError("估计器验证主 SNR 必须严格为 25 和 30 dB")
+    min_relative_bler_reduction = _threshold_setting(
+        validation_settings, "min_relative_bler_reduction", 0.10
+    )
+    max_paired_bler_difference_97_5pct_upper = _threshold_setting(
+        validation_settings, "max_paired_bler_difference_97_5pct_upper", 0.0
+    )
+    require_strict_upper_bound = _boolean_setting(
+        validation_settings, "require_strict_upper_bound", True
+    )
     training_seed = _integer_setting(validation_settings, "training_seed")
     development_seed = _integer_setting(validation_settings, "development_seed")
     holdout_seed = _integer_setting(validation_settings, "holdout_seed")
@@ -291,6 +305,16 @@ def run_estimator_validation(
         frame_counts,
         bootstrap_replicates,
         bootstrap_seed,
+        min_relative_bler_reduction=min_relative_bler_reduction,
+        max_paired_bler_difference_97_5pct_upper=max_paired_bler_difference_97_5pct_upper,
+        require_strict_upper_bound=require_strict_upper_bound,
+    )
+    published_prior = (
+        publish_accepted_dmrs_prior(
+            prior_dir, prior_path, compatibility=compatibility, acceptance_gate=acceptance
+        )
+        if acceptance["passed"]
+        else None
     )
     summary = {
         "estimators": list(_ESTIMATORS),
@@ -324,6 +348,7 @@ def run_estimator_validation(
             "summary": str(output_path),
             "frames": str(frame_path),
             "prior": str(prior_path),
+            **({"published_prior": str(published_prior)} if published_prior else {}),
         },
         "runtime_s": time.perf_counter() - split_started,
     }
@@ -339,6 +364,25 @@ def _positive_override(
     if isinstance(override, bool) or not isinstance(override, int) or override < 1:
         raise ValueError(f"--{flag} 必须为正整数")
     return override
+
+
+def _threshold_setting(settings: dict[str, Any], key: str, default: float) -> float:
+    value = settings.get(key, default)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not np.isfinite(value)
+        or value < 0.0
+    ):
+        raise ValueError(f"estimator_validation.{key} 必须为非负有限数")
+    return float(value)
+
+
+def _boolean_setting(settings: dict[str, Any], key: str, default: bool) -> bool:
+    value = settings.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"estimator_validation.{key} 必须为布尔值")
+    return value
 
 
 def _integer_setting(settings: dict[str, Any], key: str) -> int:
@@ -449,6 +493,10 @@ def _acceptance_gate(
     frame_counts: tuple[int, ...],
     bootstrap_replicates: int,
     bootstrap_seed: int,
+    *,
+    min_relative_bler_reduction: float = 0.10,
+    max_paired_bler_difference_97_5pct_upper: float = 0.0,
+    require_strict_upper_bound: bool = True,
 ) -> dict[str, Any]:
     holdout_index = _SPLITS.index("holdout")
     checks: dict[str, Any] = {}
@@ -480,8 +528,12 @@ def _acceptance_gate(
             "candidate_data_re_nmse": float(candidate_nmse),
             "passed": bool(
                 relative_reduction is not None
-                and relative_reduction >= 0.10
-                and upper < 0.0
+                and relative_reduction >= min_relative_bler_reduction
+                and (
+                    upper < max_paired_bler_difference_97_5pct_upper
+                    if require_strict_upper_bound
+                    else upper <= max_paired_bler_difference_97_5pct_upper
+                )
                 and candidate_nmse < baseline_nmse
             ),
         }
@@ -497,7 +549,17 @@ def _acceptance_gate(
         "candidate_block_errors": candidate_high_errors,
         "passed": bool(high_passed),
     }
-    return {"checks": checks, "passed": bool(passes and high_passed)}
+    return {
+        "thresholds": {
+            "min_relative_bler_reduction": min_relative_bler_reduction,
+            "max_paired_bler_difference_97_5pct_upper":
+                max_paired_bler_difference_97_5pct_upper,
+            "require_strict_upper_bound": require_strict_upper_bound,
+            "high_snr_no_regression": True,
+        },
+        "checks": checks,
+        "passed": bool(passes and high_passed),
+    }
 
 
 def _paired_bootstrap_upper(

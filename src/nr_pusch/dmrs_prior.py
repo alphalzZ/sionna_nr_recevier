@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import hashlib
 import json
+import os
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -14,8 +17,10 @@ from sionna.phy.channel import time_lag_discrete_time_channel
 from .channel_config import ChannelSettings
 from .config import TxSettings
 
-
 _FORMAT_VERSION = 1
+
+
+_GATE_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def dmrs_prior_compatibility(
@@ -60,6 +65,45 @@ def _compatibility_without_mcs(compatibility: Any) -> Any:
     return normalized
 
 
+def prior_registry_path(prior_dir: str | Path, compatibility: dict[str, Any]) -> Path:
+    """Return the registry file that holds the prior for this exact run geometry."""
+    normalized = _compatibility_without_mcs(compatibility)
+    if not isinstance(normalized, dict):
+        raise ValueError("DMRS prior 兼容性必须是字典")
+    tx_pusch = normalized.get("tx_pusch")
+    waveform = tx_pusch.get("waveform") if isinstance(tx_pusch, dict) else None
+    if not isinstance(waveform, str) or not waveform:
+        raise ValueError("DMRS prior 兼容性缺少 tx_pusch.waveform")
+    digest = hashlib.sha256(
+        json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return Path(prior_dir) / waveform / f"{digest}.npz"
+
+
+def default_prior_dir(channel_config_path: str | Path) -> Path:
+    """Return the shared prior directory that sits beside a channel configuration."""
+    return Path(channel_config_path).resolve().parent / "tap_power_prior"
+
+
+def resolve_dmrs_tap_power_prior(
+    prior_dir: str | Path,
+    *,
+    expected_compatibility: dict[str, Any],
+    device: str | torch.device | None = None,
+) -> tuple[torch.Tensor, Path, dict[str, Any]]:
+    """Look up the accepted prior for one geometry inside a shared prior directory."""
+    path = prior_registry_path(prior_dir, expected_compatibility)
+    if not path.is_file():
+        raise ValueError(f"未找到与当前 TX/CDL/抽头窗口匹配的已通过验证的 DMRS prior: {path}")
+    prior, metadata = load_dmrs_tap_power_prior(
+        path, expected_compatibility=expected_compatibility, device=device
+    )
+    marker = metadata.get("accepted_gate_sha256")
+    if not isinstance(marker, str) or not _GATE_SHA256.fullmatch(marker):
+        raise ValueError(f"DMRS prior {path} 缺少通过验证的 acceptance 标记")
+    return prior, path, metadata
+
+
 def save_dmrs_tap_power_prior(
     path: str | Path,
     tap_power: torch.Tensor | np.ndarray,
@@ -67,6 +111,7 @@ def save_dmrs_tap_power_prior(
     compatibility: dict[str, Any],
     training_seed: int,
     training_realizations: int,
+    accepted_gate_sha256: str | None = None,
 ) -> Path:
     """Write a portable NPZ prior with explicit provenance and run geometry."""
     output = Path(path)
@@ -77,12 +122,16 @@ def save_dmrs_tap_power_prior(
     _validate_tap_power(values)
     if training_realizations < 1:
         raise ValueError("training_realizations 必须为正整数")
+    if accepted_gate_sha256 is not None and not _GATE_SHA256.fullmatch(accepted_gate_sha256):
+        raise ValueError("accepted_gate_sha256 必须是 64 位小写十六进制摘要")
     metadata = {
         "format_version": _FORMAT_VERSION,
         "compatibility": compatibility,
         "training_seed": int(training_seed),
         "training_realizations": int(training_realizations),
     }
+    if accepted_gate_sha256 is not None:
+        metadata["accepted_gate_sha256"] = accepted_gate_sha256
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as stream:
         np.savez_compressed(
@@ -91,6 +140,41 @@ def save_dmrs_tap_power_prior(
             metadata_json=np.asarray(json.dumps(metadata, sort_keys=True, separators=(",", ":"))),
         )
     return output
+
+
+def publish_accepted_dmrs_prior(
+    prior_dir: str | Path,
+    candidate_path: str | Path,
+    *,
+    compatibility: dict[str, Any],
+    acceptance_gate: dict[str, Any],
+) -> Path:
+    """Promote a validated candidate into the shared prior directory atomically."""
+    if not isinstance(acceptance_gate, dict) or acceptance_gate.get("passed") is not True:
+        raise ValueError("仅 acceptance_gate.passed 为 true 的候选才可发布到共享先验目录")
+    tap_power, metadata = load_dmrs_tap_power_prior(
+        candidate_path, expected_compatibility=compatibility
+    )
+    gate_digest = hashlib.sha256(
+        json.dumps(acceptance_gate, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    target = prior_registry_path(prior_dir, compatibility)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged = target.with_name(f"{target.stem}.{os.getpid()}.tmp")
+    try:
+        save_dmrs_tap_power_prior(
+            staged,
+            tap_power,
+            compatibility=compatibility,
+            training_seed=int(metadata["training_seed"]),
+            training_realizations=int(metadata["training_realizations"]),
+            accepted_gate_sha256=gate_digest,
+        )
+        os.replace(staged, target)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    return target
 
 
 def load_dmrs_tap_power_prior(

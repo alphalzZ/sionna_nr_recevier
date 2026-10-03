@@ -90,7 +90,7 @@ DMRS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围：当前
 
 ### CDL tap-power LMMSE 验证
 
-`dmrs-lmmse` 是显式 opt-in；现有 `dmrs` 默认和活动 TX/CDL profile 不变。LMMSE 算法验证固定单符号 DMRS；另行比较 `dmrs_additional_position=0/1/2` 的可靠性与 TBS 资源代价，结果见 `docs/receiver_optimization.md`，不能视为等吞吐比较。
+`dmrs-lmmse` 是显式 opt-in；现有 `dmrs` 默认和活动 TX/CDL profile 不变。LMMSE 算法验证固定单符号 DMRS；另行比较 `dmrs_additional_position=0/1/2` 的可靠性与 TBS 资源代价，结果见 `docs/receiver_optimization.md`，不能视为等吞吐比较。tap-power prior 的物理含义、需要训练几份先验、以及跨天线配置复用的理论依据与当前限制见 `docs/dmrs_tap_power_prior.md`；本文档只给出生成、验收和发布步骤。
 
 短时连通性验证（`--frames-per-snr` 只覆盖 development/holdout，60 dB 安全检查仍使用配置中的 64 帧）：
 
@@ -98,11 +98,62 @@ DMRS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围：当前
 nr-pusch-estimator-validation --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38_901_4x4.toml --validation-config configs/channel_estimation_validation.toml --output /tmp/channel_estimation_smoke.json --device cpu --prior-realizations 8 --frames-per-snr 2
 ```
 
-预注册的正式运行去掉两个 smoke 覆盖参数；`configs/channel_estimation_validation.toml` 固定训练 256 个独立 realization、development 512 帧/SNR、holdout 3,000 帧/SNR、25/30 dB 和 60 dB/64 帧。JSON、paired frame NPZ、tap prior NPZ 写到同 basename 的 `/tmp/channel_estimation_validation.*`。仅当 holdout 的 25/30 dB 两点 BLER 都至少相对降低 10%、paired frame-cluster bootstrap 的 97.5% 单侧差值上界都小于 0、data-RE CSI NMSE 两点都下降，且 60 dB TB errors 不高于基线时，才报告通过；`perfect` 只作同帧上界。失败时保留当前默认且不宣称优化。
+#### 完整产生 tap_power_prior
 
-常规 `nr-pusch-bler` 的 `[bler]` 可设置 `channel_estimator = "dmrs-lmmse"` 和 `dmrs_tap_power_prior_path`；相对路径以该 TOML 所在目录为基准。`nr-pusch-rx` 的 `[receiver]` 同样读取 `dmrs_tap_power_prior_path`，并要求 `--channel-config` 提供 prior 对应的 CDL TOML，以对 TX、CDL、抽头窗、FFT 和采样率做精确兼容检查。prior 缺失或不兼容会报错，不会回退到 LS。
+正式运行不加两个 smoke 覆盖参数：`configs/channel_estimation_validation.toml` 固定训练 256 个独立 realization、development 512 帧/SNR、holdout 3,000 帧/SNR、25/30 dB 和 60 dB/64 帧，两种波形各跑一次，共同发布到同一个 `configs/tap_power_prior/`（按波形和兼容性摘要分子目录，NPZ 本身是各自独立的数值先验）。
 
-BLER 配置可用 `[bler].channel_estimators` 选择多个估计器；仿真按 `channel_estimators × detectors × snr_db` 遍历组合。未设置时沿用单个 `channel_estimator`。网页 SIM 配置 `configs/bler_estimator_matrix.toml` 组合 `dmrs`、`dmrs-lmmse`、`perfect` 与 `soft-mmse-pic`，扫描 25–50 dB 六个 SNR，共 18 个结果点，每点最多 2,000 帧（GPU profile）。运行前需按上面的验证命令生成 `/tmp/channel_estimation_validation.prior.npz`；输出路径不同时更新 `dmrs_tap_power_prior_path`。
+```bash
+# 1) CP-OFDM（configs/pusch_cp_2ue_2layer.toml + configs/cdl_38_901_2tx_4rx.toml）
+nr-pusch-estimator-validation \
+  --tx-config configs/pusch_cp_2ue_2layer.toml \
+  --channel-config configs/cdl_38_901_2tx_4rx.toml \
+  --validation-config configs/channel_estimation_validation.toml \
+  --output outputs/tap-power-prior/cp_2ue_2layer/validation.json \
+  --prior-dir configs/tap_power_prior \
+  --device cuda:0
+
+# 2) DFT-s-OFDM（configs/pusch_4ue.toml + configs/cdl_38_901_4x4.toml）
+nr-pusch-estimator-validation \
+  --tx-config configs/pusch_4ue.toml \
+  --channel-config configs/cdl_38_901_4x4.toml \
+  --validation-config configs/channel_estimation_validation.toml \
+  --output outputs/tap-power-prior/dft_4ue/validation.json \
+  --prior-dir configs/tap_power_prior \
+  --device cuda:0
+```
+
+每次运行写出 `validation.json`、配对帧 `validation.frames.npz` 和诊断用 `validation.prior.npz`；只有门槛通过才把候选按兼容性键原子发布到 `--prior-dir`，并在 `artifacts.published_prior` 记录发布路径。门槛为：holdout 的 25/30 dB 两点 BLER 都至少相对降低 10%、paired frame-cluster bootstrap 的 97.5% 单侧差值上界都小于 0、data-RE CSI NMSE 两点都下降，且 60 dB TB errors 不高于基线；`perfect` 只作同帧上界。
+
+门槛参数写在验证 TOML 的 `[estimator_validation]` 表里，缺省值即上文所写：`min_relative_bler_reduction = 0.10`、`max_paired_bler_difference_97_5pct_upper = 0.0`、`require_strict_upper_bound = true`。需要复现"放宽后"的结论时使用版本化配置而不修改版本 1：`configs/channel_estimation_validation_v2.toml` 仅把这三项改为 `0.09` / `0.0` / `false`，并把 `device` 改为 `cuda:0`、`batch_size` 改为 `20`，其余训练与 holdout 设置与版本 1 完全相同。注意 `batch_size` 会改变信道实现与 AWGN 的抽样顺序（AWGN 种子按批次起点推导），因此版本 2 的数字是一次独立抽样，必须以该次运行的摘要为准，不能与版本 1 的数字互相替代。实际生效的阈值写进 `acceptance_gate.thresholds`，并计入发布标记 `accepted_gate_sha256`，可据此区分结论来源。
+
+查看门槛与已发布先验：
+
+```bash
+python - <<'PY'
+import json, pathlib
+for name in ("cp_2ue_2layer", "dft_4ue"):
+    summary = pathlib.Path("outputs/tap-power-prior") / name / "validation.json"
+    if summary.is_file():
+        data = json.loads(summary.read_text())
+        print(name, data["acceptance_gate"]["passed"], data["artifacts"].get("published_prior"))
+print(sorted(p.name for p in pathlib.Path("configs/tap_power_prior").glob("*/*.npz")))
+PY
+```
+
+重训与覆盖：对同一 TX/CDL/抽头窗组合重复上面的命令即可；只有再次通过门槛才会覆盖同名已发布先验，门槛失败时保留原版本并留下新的诊断 NPZ。改动 TX 几何、CDL、抽头窗、FFT 或采样率都会得到新的兼容性键，需要单独训练，旧先验不会被误用。
+
+实测代价（RTX 3060 Laptop GPU）：版本 1 配置（CPU、batch 2）CP-OFDM 一次 1353 s；DFT-s-OFDM 用 `--device cuda:0`、其余为版本 1 设置时 6426 s（development 981 s、holdout 25 dB 2478 s、holdout 30 dB 2930 s、60 dB 38 s），即约 1 小时 47 分钟。DFT-s-OFDM 单轮超过 1 小时，shell 层不要加 3600 s 之类的截止时间。CP-OFDM 用版本 2（GPU、batch 20）一轮 1626 s。
+
+当前仓库状态（2026-10-03 实测；两次 CP 运行分别用版本 1 与版本 2 门槛配置，seed 与 SNR 点一致，未临时调阈值）：
+
+- **DFT-s-OFDM：PASS**，已发布 `configs/tap_power_prior/dft_s_ofdm/8232bdc01e20cd9ba8437cc27f02f41108c292e551043bdba164e3cfed260b87.npz`（67 taps，256 realization，seed 21260924）。holdout 25 dB 块错误 4412 → 3846（降低 12.83%，bootstrap 上界 −0.0428，NMSE 2.014e−3 → 1.517e−3）；holdout 30 dB 289 → 247（降低 14.53%，上界 −0.00242，NMSE 6.386e−4 → 5.669e−4）；60 dB 0 → 0。
+- **CP-OFDM：版本 1 门槛 FAIL、版本 2 门槛 PASS，已发布** `configs/tap_power_prior/cp_ofdm/d0efae4dad9e11aa39c757814ccada531bcbb2b626381e813bbe99253f4b65a4.npz`（26 taps，256 realization，seed 21260924）。版本 1（CPU、batch 2）结论保持不变：25 dB 与 60 dB 通过（940 → 738，降低 21.49%，上界 −0.0287），30 dB 未过（33 → 30，降低 9.09% < 10%，3000 帧下上界恰为 0.0），诊断候选留在 `outputs/tap-power-prior/cp_2ue_2layer/validation.prior.npz`。版本 2（GPU、batch 20，9% 且上界 ≤ 0）这一轮：25 dB 902 → 691（降低 23.39%，上界 −0.03，NMSE 2.940e−3 → 2.433e−3）；30 dB 59 → 45（降低 23.73%，上界 −0.001，NMSE 9.165e−4 → 8.532e−4）；60 dB 0 → 0。**这一轮的抽样同时满足版本 1 的严格判据**（≥10% 且上界严格小于 0），因此已发布标记里的门槛是版本 2 的 9%/非严格；`batch_size` 改变了信道实现与 AWGN 的抽样，版本 2 的数字是一次独立抽样，不等同于版本 1 的那一次。
+
+因此两种波形的 `dmrs-lmmse` 现在都可以直接用，不需要任何先验路径。DFT-s-OFDM：仓库自带的 `nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38_901_4x4.toml --simulation-config configs/bler_dft_4ue_dmrs_lmmse_smoke.toml` 在已发布先验下 47 s 跑完 25 dB 的 6 个检测器臂；该 profile 每臂只有 1 帧，BLER 0–0.75（`lmmse`/`k-best`/`ep` 3/4 块错误，`lmmse-sic` 0/4），只用于连通性验证，不能当作性能结论；另用临时 profile `/tmp/nr-prior-check/dft_lmmse_only.toml`（`snr_db = [40.0]`、单一 `dmrs-lmmse`×`lmmse` 臂、`--device cuda:0`，未提交到仓库）复测 11 s，0 CRC 失败、0/4 块错误。CP-OFDM：网页实验台在“高级配置”里选 `pusch_cp_2ue_2layer.toml` + `cdl_38_901_2tx_4rx.toml` + `bler_cp_2ue_2layer_dmrs_lmmse_smoke.toml` 后兼容性检查通过并可运行，任务 `fcaf738186c5`（15 个点）在约 12.5 min 内完成，`dmrs-lmmse` 在 20/25/30/35/40 dB 的 BLER 依次为 0.95 / 0.275 / 0.007 / 0.001 / 0，均低于同轮 `dmrs` 基线的 0.975 / 0.3219 / 0.010 / 0.002 / 0；该 profile 每臂最多 500 帧，可作为趋势参考但样本仍远小于验证用的 3000 帧 holdout。CLI 侧另用临时 profile `/tmp/nr-prior-check/cp_lmmse_only.toml`（75 dB 单臂）复测 6 s，0 CRC 失败、0/2 块错误。门槛阈值不得为了让某个波形通过而临时放宽；如需改变 `training_realizations`、SNR 点或门槛本身，应新增一份版本化的验证配置并在摘要 JSON 中记录，再按新配置重跑，原门槛的失败结论保持不变。
+
+常规 `nr-pusch-bler` 的 `[bler]` 只需设置 `channel_estimator = "dmrs-lmmse"`，不再填写先验路径；接收端按 `--channel-config` 的 TX/CDL、抽头窗、FFT 和采样率在共享先验目录中查找匹配项。`nr-pusch-rx` 的 `[receiver]` 同样不再有先验路径，但必须用 `--channel-config` 或 `[receiver].dmrs_tap_power_prior_channel_config_path` 提供该 prior 对应的 CDL TOML。默认目录为信道配置同级的 `tap_power_prior/`，可用 `--prior-dir` 覆盖（`nr-pusch-bler`、`nr-pusch-rx`、`nr-pusch-estimator-validation` 均支持）。prior 缺失、不兼容或未经验收发布都会报错，不会回退到 LS。
+
+BLER 配置可用 `[bler].channel_estimators` 选择多个估计器；仿真按 `channel_estimators × detectors × snr_db` 遍历组合。未设置时沿用单个 `channel_estimator`。网页 SIM 配置 `configs/bler_estimator_matrix.toml` 组合 `dmrs`、`dmrs-lmmse`、`perfect` 与 `soft-mmse-pic`，扫描 25–50 dB 六个 SNR，共 18 个结果点，每点最多 2,000 帧（GPU profile）。运行前需按上面的验证命令产出通过验收的先验；未通过时该矩阵会因找不到匹配 prior 而拒绝启动。
 
 
 DFT-s-OFDM 的上述检测器工作在用户×层总流上；Sionna layer demapper 在逆 DFT 后将每层 LLR 还原为各 UE 的 TB 码字。PIC 按全部层消除干扰；soft-PIC 按码字/层次交换 LDPC 外信息；SIC 只在 CRC 通过后重构 UE 并抵消其完整贡献。K-best 要求接收天线数不少于总流数，搜索路径数和复杂度由 `detector_parameter` 控制。PIC 的该参数表示迭代轮数，EP 中表示迭代次数；BLER 配置仍使用 `detectors` 与 `detector_parameters`。
@@ -297,4 +348,4 @@ NPZ 中 `iq` 的轴顺序为 `[batch, user, tx_antenna, sample]`，`frequency_gr
 - `configs/`：发送与抓包分析配置
 - `src/nr_pusch/`：配置解析、Sionna 发送与 CDL 信道适配、IQ 导出和命令入口
 - `tests/fixtures/`：后续放置 MATLAB H5 参考夹具
-- `docs/`：支持范围、接口和夹具说明
+- `docs/`：支持范围、接口和夹具说明（`docs/dmrs_tap_power_prior.md` 记录 prior 原理与生成规则）

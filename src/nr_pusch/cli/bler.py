@@ -10,6 +10,7 @@ from pathlib import Path
 from nr_pusch.bler import BlerSweep, SkippedPoint, save_bler_results, simulate_detector_comparison
 from nr_pusch.channel_config import ChannelSettings
 from nr_pusch.config import TxSettings
+from nr_pusch.dmrs_prior import default_prior_dir
 from nr_pusch.simulation_config import BlerSettings
 
 
@@ -23,6 +24,10 @@ def main() -> None:
     parser.add_argument(
         "--progress-jsonl", default=None,
         help="Append one JSON object per completed or skipped SNR point",
+    )
+    parser.add_argument(
+        "--prior-dir", default=None,
+        help="共享 DMRS prior 目录，默认使用 --channel-config 同级的 tap_power_prior/",
     )
     args = parser.parse_args()
 
@@ -48,6 +53,10 @@ def main() -> None:
 
     sweep: BlerSweep = simulate_detector_comparison(
         tx_settings, channel_settings, simulation_settings,
+        prior_dir=(
+            Path(args.prior_dir) if args.prior_dir is not None
+            else default_prior_dir(args.channel_config)
+        ),
         device=args.device, on_point=report_point, on_skip=report_skip,
     )
     csv_path, manifest_path = save_bler_results(

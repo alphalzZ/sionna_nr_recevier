@@ -15,4 +15,3 @@ channel_domain = "frequency"
 l_min = -6
 max_delay_spread_s = 3e-6
 stop_at_zero_bler = false
-dmrs_tap_power_prior_path = "../outputs/release-0.1-baseline/estimator-validation/dft_4ue/validation.prior.npz"

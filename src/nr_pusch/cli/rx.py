@@ -12,7 +12,11 @@ import torch
 
 from nr_pusch.channel_config import ChannelSettings
 from nr_pusch.config import TxSettings
-from nr_pusch.dmrs_prior import dmrs_prior_compatibility, load_dmrs_tap_power_prior
+from nr_pusch.dmrs_prior import (
+    default_prior_dir,
+    dmrs_prior_compatibility,
+    resolve_dmrs_tap_power_prior,
+)
 from nr_pusch.iq import read_matlab_rx_reference, read_matlab_scrambling_sequences
 from nr_pusch.receiver import NrPuschRx
 from nr_pusch.transmitter import NrPuschTx
@@ -42,6 +46,11 @@ def main() -> None:
         "--channel-config",
         default=None,
         help="CDL TOML matching the tap-power prior; required for dmrs-lmmse",
+    )
+    parser.add_argument(
+        "--prior-dir",
+        default=None,
+        help="共享 DMRS prior 目录，默认使用信道配置同级的 tap_power_prior/",
     )
     parser.add_argument(
         "--detector",
@@ -196,24 +205,28 @@ def main() -> None:
         parser.error("MATLAB H5 夹具仅支持四用户、单层、单发射天线的固定捕获格式")
     if args.channel_config is not None and channel_estimator != "dmrs-lmmse":
         ChannelSettings.from_toml(args.channel_config).validate_transmitter(settings)
+    if "dmrs_tap_power_prior_path" in receiver_profile:
+        parser.error(
+            "dmrs_tap_power_prior_path 已移除；先验改为按信道配置在共享先验目录中自动查找"
+        )
     dmrs_tap_power_prior = None
-    prior_path_value = receiver_profile.get("dmrs_tap_power_prior_path")
-    if channel_estimator != "dmrs-lmmse" and prior_path_value is not None:
-        parser.error("dmrs_tap_power_prior_path 仅能用于 dmrs-lmmse")
     if channel_estimator == "dmrs-lmmse":
-        if not isinstance(prior_path_value, str) or not prior_path_value:
-            parser.error("dmrs-lmmse 要求 [receiver] dmrs_tap_power_prior_path")
-        prior_path = Path(prior_path_value)
-        if not prior_path.is_absolute():
-            prior_path = Path(args.rx_config).resolve().parent / prior_path
         channel_config_value = args.channel_config or receiver_profile.get(
             "dmrs_tap_power_prior_channel_config_path"
         )
         if not isinstance(channel_config_value, str) or not channel_config_value:
             parser.error("dmrs-lmmse 严格兼容性检查要求 --channel-config")
         channel_config_path = Path(channel_config_value)
-        if not channel_config_path.is_absolute():
+        if (
+            args.channel_config is None
+            and not channel_config_path.is_absolute()
+        ):
             channel_config_path = Path(args.rx_config).resolve().parent / channel_config_path
+        prior_dir = (
+            Path(args.prior_dir)
+            if args.prior_dir is not None
+            else default_prior_dir(channel_config_path)
+        )
         try:
             channel_settings = ChannelSettings.from_toml(channel_config_path)
             channel_settings.validate_transmitter(settings)
@@ -226,8 +239,8 @@ def main() -> None:
                 fft_size=tx_preview._tx_freq.resource_grid.fft_size,
                 sample_rate_hz=tx_preview.sample_rate_hz,
             )
-            dmrs_tap_power_prior, _ = load_dmrs_tap_power_prior(
-                prior_path,
+            dmrs_tap_power_prior, _, _ = resolve_dmrs_tap_power_prior(
+                prior_dir,
                 expected_compatibility=compatibility,
                 device=args.device,
             )

@@ -187,22 +187,29 @@ class StopAtZeroBlerTest(unittest.TestCase):
         settings = _settings(
             snr_db=(10.0, 20.0),
             channel_estimators=("dmrs", "dmrs-lmmse", "perfect"),
-            dmrs_tap_power_prior_path="test-prior.npz",
             detectors=("lmmse", "soft-mmse-pic"),
             stop_at_zero_bler=True,
         )
         clean_point = ("perfect", "soft-mmse-pic", 10.0)
+        resolved: list[tuple] = []
         with _settings_files() as (tx_settings, channel_settings):
             with (
                 _fake_link({clean_point}),
                 mock.patch.object(bler_module, "dmrs_prior_compatibility", return_value={}),
                 mock.patch.object(
-                    bler_module, "load_dmrs_tap_power_prior", return_value=(torch.ones(1), {})
-                ),
+                    bler_module,
+                    "resolve_dmrs_tap_power_prior",
+                    side_effect=lambda prior_dir, **kwargs: (
+                        resolved.append((prior_dir, kwargs))
+                        or (torch.ones(1), Path("prior.npz"), {})
+                    ),
+                ) as resolver,
             ):
                 sweep = bler_module.simulate_detector_comparison(
-                    tx_settings, channel_settings, settings
+                    tx_settings, channel_settings, settings, prior_dir=ROOT / "tap_power_prior"
                 )
+        self.assertEqual([entry[0] for entry in resolved], [ROOT / "tap_power_prior"] * 2)
+        self.assertEqual(resolver.call_count, 2)
         expected = [
             (estimator, detector, snr_db)
             for estimator in settings.channel_estimators_for_sweep
@@ -228,6 +235,12 @@ class StopAtZeroBlerTest(unittest.TestCase):
         }
         self.assertEqual(first_snr_errors[("perfect", "soft-mmse-pic")], 0)
         self.assertEqual(first_snr_errors[("dmrs", "lmmse")], 8)
+
+    def test_lmmse_arm_requires_a_prior_directory(self):
+        settings = _settings(channel_estimators=("dmrs-lmmse",))
+        with _settings_files() as (tx_settings, channel_settings):
+            with self.assertRaisesRegex(ValueError, "必须提供 --prior-dir"):
+                bler_module.simulate_detector_comparison(tx_settings, channel_settings, settings)
 
 
 

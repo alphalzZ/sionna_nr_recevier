@@ -213,17 +213,17 @@ $$
 | 25 dB | 0.36933 (4432/12000) | 0.32308 (3877/12000) | 12.52% | −0.04200 | 0.00201394 → 0.00151686 |
 | 30 dB | 0.02383 (286/12000) | 0.02100 (252/12000) | 11.89% | −0.001833 | 0.00063889 → 0.00056701 |
 
-预注册门槛全部通过；60 dB 两臂均为 0/256 TB error。结果只支持该静态 CDL-A 配置上的显式 opt-in，不证明对其他 CDL 或捕获 IQ 泛化，也不替代 perfect CSI 上界。标准 BLER/RX 使用 candidate 时必须加载元数据与当前 TX/CDL/FFT/采样率匹配的 prior；缺失或不兼容时报错，不回退到 LS。现有默认及 profile 保持不变。
+预注册门槛全部通过；60 dB 两臂均为 0/256 TB error。结果只支持该静态 CDL-A 配置上的显式 opt-in，不证明对其他 CDL 或捕获 IQ 泛化，也不替代 perfect CSI 上界。选择 `dmrs-lmmse` 时，BLER/RX/Web 按信道配置在共享先验目录中按兼容性键查找该 prior，并校验其元数据与当前 TX/CDL/抽头窗/FFT/采样率一致；缺失、不兼容或缺少验收发布标记时报错，不回退到 LS。
 
 正式运行（无 smoke 覆盖）：
 
 ```bash
-nr-pusch-estimator-validation --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38_901_4x4.toml --validation-config configs/channel_estimation_validation.toml --output /tmp/channel_estimation_validation.json --device cuda:0
+nr-pusch-estimator-validation --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38_901_4x4.toml --validation-config configs/channel_estimation_validation.toml --output /tmp/channel_estimation_validation.json --device cuda:0 --prior-dir configs/tap_power_prior
 ```
 
 JSON 同时记录 aggregate/per-UE BLER、CRC failure、BER、data-RE NMSE、运行时间和 perfect-CSI gap。
 
-RTX 3060 Laptop GPU（6 GiB）全量运行耗时约 74 分 56 秒。汇总、逐帧结果和训练 prior 分别保存于 `/tmp/channel_estimation_validation.json`、`/tmp/channel_estimation_validation.frames.npz`、`/tmp/channel_estimation_validation.prior.npz`。连通性 smoke 使用独立输出和缩小帧数，不计入 holdout 结论。
+RTX 3060 Laptop GPU（6 GiB）全量运行耗时约 74 分 56 秒。汇总、逐帧结果和诊断用训练 prior 分别保存于 `/tmp/channel_estimation_validation.json`、`/tmp/channel_estimation_validation.frames.npz`、`/tmp/channel_estimation_validation.prior.npz`；门槛通过时另有带验收标记的副本发布到 `--prior-dir`（默认 `configs/tap_power_prior/`）。连通性 smoke 使用独立输出和缩小帧数，不计入 holdout 结论。
 
 ## 4. 可复现验证与输出读取
 

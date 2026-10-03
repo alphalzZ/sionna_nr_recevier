@@ -20,7 +20,7 @@ from .config import TxSettings
 from .device import use_device
 from .dmrs_prior import (
     dmrs_prior_compatibility,
-    load_dmrs_tap_power_prior,
+    resolve_dmrs_tap_power_prior,
 )
 from .noise import add_awgn, add_awgn_resource_grid
 from .receiver import NrPuschRx, _build_dmrs_frequency_basis
@@ -130,6 +130,7 @@ def simulate_bler(
     channel_settings: ChannelSettings,
     simulation_settings: BlerSettings,
     *,
+    prior_dir: str | Path | None = None,
     device: str | None = None,
     on_point: Callable[[BlerPoint], None] | None = None,
     on_skip: Callable[[SkippedPoint], None] | None = None,
@@ -155,8 +156,8 @@ def simulate_bler(
     )
     dmrs_tap_power_prior = None
     if simulation_settings.channel_estimator == "dmrs-lmmse":
-        if simulation_settings.dmrs_tap_power_prior_path is None:
-            raise ValueError("dmrs-lmmse 配置必须设置 dmrs_tap_power_prior_path")
+        if prior_dir is None:
+            raise ValueError("dmrs-lmmse 必须提供 --prior-dir 以按信道配置查找已通过验证的先验")
         compatibility = dmrs_prior_compatibility(
             tx_settings,
             channel_settings,
@@ -165,10 +166,8 @@ def simulate_bler(
             fft_size=transmitter._tx_freq.resource_grid.fft_size,
             sample_rate_hz=transmitter.sample_rate_hz,
         )
-        dmrs_tap_power_prior, _ = load_dmrs_tap_power_prior(
-            simulation_settings.dmrs_tap_power_prior_path,
-            expected_compatibility=compatibility,
-            device=device,
+        dmrs_tap_power_prior, _, _ = resolve_dmrs_tap_power_prior(
+            prior_dir, expected_compatibility=compatibility, device=device
         )
     rx = NrPuschRx(
         tx_settings,
@@ -293,6 +292,7 @@ def simulate_detector_comparison(
     channel_settings: ChannelSettings,
     simulation_settings: BlerSettings,
     *,
+    prior_dir: str | Path | None = None,
     device: str | None = None,
     on_point: Callable[[BlerPoint], None] | None = None,
     on_skip: Callable[[SkippedPoint], None] | None = None,
@@ -306,16 +306,12 @@ def simulate_detector_comparison(
                 simulation_settings,
                 channel_estimator=channel_estimator,
                 channel_estimators=(channel_estimator,),
-                dmrs_tap_power_prior_path=(
-                    simulation_settings.dmrs_tap_power_prior_path
-                    if channel_estimator == "dmrs-lmmse"
-                    else None
-                ),
                 detector=detector,
                 detectors=(detector,),
             )
             sweep = simulate_bler(
                 tx_settings, channel_settings, run_settings,
+                prior_dir=prior_dir,
                 device=device, on_point=on_point, on_skip=on_skip,
             )
             points.extend(sweep.points)

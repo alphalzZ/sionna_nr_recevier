@@ -12,7 +12,12 @@ import unittest
 
 from nr_pusch.channel_config import ChannelSettings
 from nr_pusch.config import TxSettings
-from nr_pusch.dmrs_prior import dmrs_prior_compatibility, save_dmrs_tap_power_prior
+from nr_pusch.dmrs_prior import (
+    dmrs_prior_compatibility,
+    prior_registry_path,
+    publish_accepted_dmrs_prior,
+    save_dmrs_tap_power_prior,
+)
 from nr_pusch.simulation_config import BlerSettings
 from nr_pusch.transmitter import NrPuschTx
 from nr_pusch.web import ApiError, SimulationWebApp, make_handler
@@ -47,18 +52,21 @@ class WebEstimatorMatrixTest(unittest.TestCase):
                 fft_size=transmitter._tx_freq.resource_grid.fft_size,
                 sample_rate_hz=transmitter.sample_rate_hz,
             )
-            prior_path = config_dir / "matrix.prior.npz"
+            candidate = root / "matrix.prior.npz"
             save_dmrs_tap_power_prior(
-                prior_path,
+                candidate,
                 np.ones(compatibility["l_max"] - compatibility["l_min"] + 1),
                 compatibility=compatibility,
                 training_seed=7,
                 training_realizations=32,
             )
-            simulation_text = SIMULATION_CONFIG.read_text(encoding="utf-8").replace(
-                "/tmp/channel_estimation_validation.prior.npz",
-                "matrix.prior.npz",
+            published = publish_accepted_dmrs_prior(
+                config_dir / "tap_power_prior",
+                candidate,
+                compatibility=compatibility,
+                acceptance_gate={"passed": True},
             )
+            self.assertEqual(published, prior_registry_path(config_dir / "tap_power_prior", compatibility))
 
             app = SimulationWebApp(config_dir, root / "runs")
             worker_entered = Event()
@@ -79,10 +87,7 @@ class WebEstimatorMatrixTest(unittest.TestCase):
                     ("simulation", SIMULATION_CONFIG),
                 ):
                     request_data[f"{kind}_name"] = path.name
-                    request_data[f"{kind}_text"] = (
-                        simulation_text if kind == "simulation"
-                        else app.get_config(kind, path.name)["text"]
-                    )
+                    request_data[f"{kind}_text"] = app.get_config(kind, path.name)["text"]
                 preflight_request = Request(
                     f"{base_url}/api/validate-run",
                     data=json.dumps(request_data).encode(),
@@ -108,21 +113,18 @@ class WebEstimatorMatrixTest(unittest.TestCase):
                     * len(simulation_settings.detectors)
                     * len(simulation_settings.snr_db),
                 )
-                runtime_settings = BlerSettings.from_toml(
-                    root / "runs" / job["id"] / "simulation.toml"
-                )
-                self.assertEqual(
-                    runtime_settings.dmrs_tap_power_prior_path,
-                    str(prior_path.resolve()),
-                )
+                snapshot = (root / "runs" / job["id"] / "simulation.toml").read_text(encoding="utf-8")
+                self.assertNotIn("dmrs_tap_power_prior_path", snapshot)
+                BlerSettings.from_toml(root / "runs" / job["id"] / "simulation.toml")
                 incompatible = dict(request_data)
-                incompatible["simulation_text"] = simulation_text.replace(
+                incompatible["simulation_text"] = request_data["simulation_text"].replace(
                     "l_min = -6", "l_min = -5", 1
                 )
                 preflight = app.validate_run(incompatible)
                 self.assertFalse(preflight["valid"])
                 self.assertTrue(
-                    any("不兼容" in error["message"] for error in preflight["errors"])
+                    any("未找到" in error["message"] for error in preflight["errors"]),
+                    preflight["errors"],
                 )
                 self.assertTrue(worker_entered.wait(5))
             finally:
@@ -294,19 +296,24 @@ class WebEstimatorMatrixTest(unittest.TestCase):
                 fft_size=transmitter._tx_freq.resource_grid.fft_size,
                 sample_rate_hz=transmitter.sample_rate_hz,
             )
-            prior_path = config_dir / "cp-mcs.prior.npz"
+            candidate = config_dir / "cp-mcs.prior.npz"
             tap_count = compatibility["l_max"] - l_min + 1
             save_dmrs_tap_power_prior(
-                prior_path,
+                candidate,
                 np.ones(tap_count),
                 compatibility=compatibility,
                 training_seed=7,
                 training_realizations=32,
             )
+            publish_accepted_dmrs_prior(
+                config_dir / "tap_power_prior",
+                candidate,
+                compatibility=compatibility,
+                acceptance_gate={"passed": True},
+            )
             simulation_text = simulation_profile.read_text(encoding="utf-8").replace(
                 'channel_estimator = "dmrs"',
-                'channel_estimator = "dmrs-lmmse"\n'
-                'dmrs_tap_power_prior_path = "cp-mcs.prior.npz"',
+                'channel_estimator = "dmrs-lmmse"',
                 1,
             )
             app = SimulationWebApp(config_dir, root / "runs")
@@ -328,6 +335,14 @@ class WebEstimatorMatrixTest(unittest.TestCase):
                 )
                 result = app.validate_run(edited)
                 self.assertTrue(result["valid"], result["errors"])
+
+                shutil.rmtree(app.prior_dir)
+                missing = app.validate_run(payload)
+                self.assertFalse(missing["valid"])
+                self.assertTrue(
+                    any("未找到" in error["message"] for error in missing["errors"]),
+                    missing["errors"],
+                )
             finally:
                 app.shutdown()
 

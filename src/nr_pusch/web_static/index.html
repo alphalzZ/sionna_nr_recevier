@@ -165,6 +165,10 @@
                 <label><span>设备</span><select id="rx-device"><option value="cpu">CPU</option><option value="cuda">CUDA</option></select></label>
               </div>
               <div class="field-row">
+                <label><span>信道估计器</span><select id="rx-channel-estimator"><option value="dmrs">DMRS</option><option value="dmrs-lmmse">DMRS-LMMSE（共享先验目录自动查找）</option></select></label>
+                <label title="DMRS-LMMSE 需要信道配置来匹配抽头窗口先验"><span>信道配置（DMRS-LMMSE 必填）</span><select id="rx-channel-select"><option value="">请选择 CDL 配置</option></select></label>
+              </div>
+              <div class="field-row">
                 <label title="H5 参考夹具不含噪声功率元数据；无噪声参考请设为 0"><span>噪声方差</span><input id="rx-noise-variance" type="number" min="0" step="any" value="0" required></label>
                 <label><span id="rx-parameter-label">检测器参数（可选）</span><input id="rx-detector-parameter" type="number" min="1" step="1" placeholder="留空使用默认值"></label>
               </div>
