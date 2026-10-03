@@ -129,7 +129,7 @@ $$
 发布约定：
 
 - 训练产物 `<output-stem>.prior.npz` 永远是**诊断候选**，即使通过也保留。
-- 只有 `acceptance_gate.passed=true` 才复制并打上 `accepted_gate_sha256` 标记，先写同目录临时文件再 `os.replace` 到 `configs/tap_power_prior/<waveform>/<sha256 of canonical compatibility>.npz`，因此只有新通过的结果才覆盖旧发布版本。
+- 只有 `acceptance_gate.passed=true` 才重新序列化候选并打上 `accepted_gate_sha256` 标记，写入 `<prior-dir>/<waveform>/<sha256 of canonical compatibility>.npz`；默认 `<prior-dir>` 是 `--channel-config` 同级的 `tap_power_prior/`，可由 `--prior-dir` 覆盖。先写目标目录下的临时文件再 `os.replace`，只有新通过的结果才覆盖同键旧版本。
 - 未通过时不发布，接收端按缺失处理并**明确报错**，不回退 LS、不合成先验。
 - 由于 `accepted_gate_sha256` 覆盖整个 `acceptance_gate` 字典（其中包含 `thresholds`），同一几何下用不同门槛版本发布的先验标记不同，可据此区分结论来源。
 - 禁止为了让某个波形通过而改阈值、换 seed 或换 SNR 点；确需变更时应新增一份版本化验证配置并在摘要 JSON 记录，原门槛的失败结论保持不变。
@@ -166,12 +166,12 @@ $$
 
 要放宽键，至少需要补齐：目标几何本身可解（1 Rx 目标应换成 1 UE，或换 2 Rx）下的 3000 帧 holdout 对比、至少两种信道模型、以及双向（大小阵列互复用）。在这些证据出现之前，按 §5 的规则逐几何训练是正确的做法。
 
-## 9. 实测状态（2026-10-03，RTX 3060 Laptop GPU，256 realization 训练，holdout 3000 帧/点）
+## 9. 实测状态（2026-10-03，256 realization 训练，holdout 3000 帧/点；耗时为验证 JSON 的 `runtime_s`）
 
-| 波形 | TX / CDL | 结果 | 门槛要点 | 耗时 |
+| 波形 | TX / CDL | 结果 | 门槛要点 | `runtime_s` / device / batch |
 |---|---|---|---|---|
-| DFT-s-OFDM | `pusch_4ue.toml` + `cdl_38_901_4x4.toml` | **PASS**，已发布 | 25 dB 4412→3846（−12.83%，上界 −0.0428）；30 dB 289→247（−14.53%，上界 −0.00242）；60 dB 0→0 | 6426 s |
-| CP-OFDM | `pusch_cp_2ue_2layer.toml` + `cdl_38_901_2tx_4rx.toml` | 版本 1 **FAIL** → 版本 2 **PASS**，已发布 | 版本 1：30 dB 仅 −9.09%（阈值 10%）、上界恰为 0.0。版本 2（9%、上界 ≤ 0、GPU、batch 20）：25 dB 902→691 = −23.39%（上界 −0.03）；30 dB 59→45 = −23.73%（上界 −0.001）；60 dB 0→0 | 1353 s → 1626 s |
+| DFT-s-OFDM | `pusch_4ue.toml` + `cdl_38_901_4x4.toml` | **PASS**，已发布 | 25 dB 4412→3846（−12.83%，上界 −0.0428）；30 dB 289→247（−14.53%，上界 −0.00242）；60 dB 0→0 | 6426.30 s / CPU / 2 |
+| CP-OFDM | `pusch_cp_2ue_2layer.toml` + `cdl_38_901_2tx_4rx.toml` | 版本 1 **FAIL** → 版本 2 **PASS**，已发布 | 版本 1：30 dB 仅 −9.09%（阈值 10%）、上界恰为 0.0。版本 2（9%、上界 ≤ 0）：25 dB 902→691 = −23.39%（上界 −0.03）；30 dB 59→45 = −23.73%（上界 −0.001）；60 dB 0→0 | 1345.37 s / CPU / 2 → 1550.83 s / GPU / 20 |
 
 发布文件：`configs/tap_power_prior/dft_s_ofdm/8232bdc01e20cd9ba8437cc27f02f41108c292e551043bdba164e3cfed260b87.npz`（67 taps）与 `configs/tap_power_prior/cp_ofdm/d0efae4dad9e11aa39c757814ccada531bcbb2b626381e813bbe99253f4b65a4.npz`（26 taps），两份都带 acceptance 标记。CP-OFDM 的标记记录的是版本 2 门槛（`0.09` / 上界非严格）；**这一轮的抽样同时满足版本 1 的严格判据**（≥10%、上界严格小于 0），所以 CP 的版本 1 失败结论属于当时的抽样，不代表 LMMSE 在该几何上无效。版本 1 的诊断候选仍留在 `outputs/tap-power-prior/cp_2ue_2layer/validation.prior.npz`，失败记录保留在 `outputs/tap-power-prior/cp_2ue_2layer/validation.json`，不因版本 2 的发布而改写。版本 2 改变了 `batch_size`，因此其信道实现与 AWGN 抽样与版本 1 不同，两组数字不可互相替代。
 
@@ -182,5 +182,5 @@ $$
 1. 该 profile 的 $(f_s,\ \text{FFT},\ [l_{\min},\,l_{\max}])$ 与信道集合是否与已有先验一致？按 §5 的规则这属于"同一份先验"；但当前实现的键还包含天线几何（§8），**只有键完全相同的 profile 才能自动复用**，跨天线配置共享要先做 §8 的验证。
 2. 不一致则按 `README.md` §"CDL tap-power LMMSE 验证" 的命令训练，`--prior-dir configs/tap_power_prior`，全量参数、不覆盖门槛。
 3. 看 `acceptance_gate.passed`：`true` 才会在共享目录出现新文件；`false` 只有诊断候选，并把失败点（相对降低、上界、NMSE、60 dB 回归）记录到本文 §9。
-4. 全量 DFT-s-OFDM 单轮实测 6426 s（≈1 h 47 min），CP-OFDM 版本 1 1353 s、版本 2 1626 s；运行命令不要加小时级 shell 截止时间。
+4. 表中数值是 `validation.json.runtime_s`：计时覆盖 development/holdout/high-SNR 验证 sweep，不含模型和 prior 训练/设置，不能当作整条 CLI 的 wall time。全量 DFT-s-OFDM 验证 sweep 用时 6426.30 s（≈1 h 47 min）；CP v1/v2 分别为 1345.37 s / 1550.83 s。长时运行不要加小时级 shell 截止时间。
 5. 验收通过后用实际 profile 跑一次 `nr-pusch-bler`（该 profile 的 SNR/帧数）确认自动选中，不要只凭 JSON 判断。

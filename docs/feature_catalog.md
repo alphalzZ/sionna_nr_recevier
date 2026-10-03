@@ -9,11 +9,11 @@ This catalog describes checked-in behavior, not feature intent. Implementation r
 | `nr-pusch-tx` | TOML TX profile; seeded payload generation and batch sizing | NPZ `iq`, `frequency_grid`, `bits` plus JSON settings/version/axis metadata | `src/nr_pusch/cli/tx.py`; `src/nr_pusch/transmitter.py:17-25,28-135`; `src/nr_pusch/artifacts.py:17-47`; `tests/unit/test_tx_topology_config.py`, `tests/integration/test_pusch_transmitter.py`, `tests/integration/test_mimo_transmitter.py` |
 | `nr-pusch-channel` | TX NPZ, CDL TOML; time-IQ or frequency-grid mode | NPZ channel output and JSON sidecar | `src/nr_pusch/cli/channel.py:18-37`; `src/nr_pusch/channel.py:21-39,42-85,176-253`; `tests/unit/test_channel_config.py`, `tests/integration/test_cdl_channel.py`, `tests/integration/test_mimo_channel.py` |
 | `nr-pusch-rx` | Capture NPZ or MATLAB H5; RX/TX-compatible TOML; estimator/detector, domain, noise and optional scrambling/CB-CRC settings | NPZ bits, TB CRC, constellation real/imag plus JSON receiver and reference-comparison metadata | `src/nr_pusch/cli/rx.py:21-75,118-196,251-313`; `src/nr_pusch/receiver.py:1532-1537,1554-1606,1790-1857`; `tests/unit/test_matlab_h5.py`, `tests/unit/test_dmrs_lmmse.py`, `tests/integration/test_pusch_receiver.py`, `tests/integration/test_mimo_receiver.py`, `tests/integration/test_web_rx_import.py` |
-| `nr-pusch-bler` | TX/CDL/BLER TOMLs; estimator, detector, SNR and batch sweeps | CSV point rows, JSON manifest, optional JSONL progress | `src/nr_pusch/cli/bler.py`; `src/nr_pusch/bler.py:31-66,128-288,326-375`; `src/nr_pusch/simulation_config.py:12-43,84-153`; `tests/unit/test_bler_sweep.py`, `tests/integration/test_mimo_bler.py` |
+| `nr-pusch-bler` | TX/CDL/BLER TOMLs; estimator, detector, SNR and batch sweeps | CSV point rows, JSON manifest, optional JSONL progress | `src/nr_pusch/cli/bler.py`; `src/nr_pusch/bler.py:31-66,128-288,322-371`; `src/nr_pusch/simulation_config.py:13-146`; `tests/unit/test_bler_sweep.py`, `tests/integration/test_mimo_bler.py` |
 | `nr-pusch-estimator-validation` | TX/CDL/validation TOMLs; train an exact-setting tap prior, paired DMRS validation and acceptance-gated publication into the shared prior directory | JSON summary, per-frame NPZ, diagnostic prior NPZ, published prior | `src/nr_pusch/cli/estimator_validation.py`; `src/nr_pusch/estimator_validation.py:30-45`; `src/nr_pusch/dmrs_prior.py`; `tests/unit/test_estimator_validation.py`, `tests/integration/test_dmrs_lmmse.py` |
 | `nr-pusch-web` | Local dashboard backed by `configs/scenarios.toml` curated TX/CDL/BLER bundles; advanced independent TOML editing with combination preflight before queueing | Browser dashboard; run/config/RX HTTP APIs; run and decode downloads | `src/nr_pusch/cli/web.py`; `src/nr_pusch/web.py:120-340,482-590,997-1008`; `src/nr_pusch/web_static/`; `tests/integration/test_web_estimator_matrix.py`, `tests/integration/test_web_rx_import.py` |
 
-TX archives store IQ/grid as complex64 and bits as uint8 (`artifacts.py:24-44`). Channel and RX commands also produce NPZ plus JSON sidecars (`cli/channel.py:87-108`, `cli/rx.py:284-313`). BLER saves CSV+JSON (`bler.py:326-375`). Estimator validation saves the summary and frame/prior archives (`estimator_validation.py`). Web routes expose config list/read/save, run list/create/get/cancel, CSV/JSON results, RX config/default information, and RX decode/NPZ/JSON downloads (`web.py:997-1008`).
+TX archives store IQ/grid as complex64 and bits as uint8 (`artifacts.py:24-44`). Channel and RX commands also produce NPZ plus JSON sidecars (`cli/channel.py:87-108`, `cli/rx.py:284-313`). BLER saves CSV+JSON (`bler.py:322-371`). Estimator validation saves the summary and frame/prior archives (`estimator_validation.py`). Web routes expose config list/read/save, run list/create/get/cancel, CSV/JSON results, RX config/default information, and RX decode/NPZ/JSON downloads (`web.py:997-1008`).
 
 ## Implemented coverage
 
@@ -25,7 +25,7 @@ TX archives store IQ/grid as complex64 and bits as uint8 (`artifacts.py:24-44`).
 | Noise | Seeded complex AWGN on time IQ and resource-grid entrypoints; power/variance is measured per receive antenna (time) or per receive/grid stream (frequency) | `noise.py:10-20,22-68`; `tests/unit/test_noise.py`, `tests/integration/test_mimo_bler.py` |
 | RX estimators and decode | Time-IQ and frequency-grid receive paths; perfect CSI, DMRS LS and DMRS-LMMSE prior estimator resolved from the shared prior directory by channel configuration; native TB decode and TB CRC; optional code-block CRC; DMRS bulk-delay estimate; reported bit/CRC/constellation metadata | `receiver.py:1554-1606,1695-1771,1790-1857,1878-1993`; `cli/rx.py:44-54,206-245`; tests `test_dmrs_lmmse.py`, `test_pusch_receiver.py`, `test_mimo_receiver.py`, `test_estimator_validation.py` |
 | RX detector set | LMMSE, strongest-first CRC-gated LMMSE-SIC, K-best, EP, MMSE-PIC and soft-MMSE-PIC. CP-OFDM invokes native per-RE Sionna detectors; CP K-best keeps its Cholesky fast path and falls back to QR for singular channel Gram matrices. DFT-s-OFDM uses project spread-symbol paths | `receiver.py:799-1004,1554-1606,1638-1694`; tests `test_soft_mmse_pic.py`, `test_pusch_receiver.py`, `test_mimo_receiver.py`, `test_mimo_bler.py` |
-| Simulation and validation | SNR-vs-BLER counts CRC or payload mismatches as TB errors, reports frames/TBs/bit errors/BLER/BER/runtime per point, detector batching, optional JSONL callback, and optional stop-at-zero skip records. Paired estimator validation has development/holdout/high-SNR splits and a separate acceptance gate | `bler.py:31-66,128-288,326-375`; `simulation_config.py:12-153`; `estimator_validation.py:26-42,375-500`; tests `test_bler_sweep.py`, `test_estimator_validation.py`, `test_web_estimator_matrix.py` |
+| Simulation and validation | SNR-vs-BLER counts CRC or payload mismatches as TB errors, reports frames/TBs/bit errors/BLER/BER/runtime per point, detector batching, optional JSONL callback, and optional stop-at-zero skip records. Paired estimator validation has development/holdout/high-SNR splits and a separate acceptance gate | `bler.py:31-66,128-288,322-371`; `simulation_config.py:13-146`; `estimator_validation.py:26-42,375-500`; tests `test_bler_sweep.py`, `test_estimator_validation.py`, `test_web_estimator_matrix.py` |
 | MATLAB and capture I/O | MATLAB TX/RX H5 readers, optional separated data/pilot arrays and transmitted bits, optional per-UE scrambling arrays, NPZ IQ/grid decode, H5 reference bit/CRC comparison | `iq/matlab_h5.py:12-23,26-124,155-198`; `cli/rx.py:118-150,184-196,259-282`; tests `test_matlab_h5.py`, `test_web_rx_import.py` |
 | Web/service | Curated scenario bundles; advanced independent profile/TOML editing; preflight checks TX/CDL antenna topology, K-best RX stream count and exact DMRS-LMMSE prior resolution from the shared prior directory before queueing; RX decode exposes a DMRS/DMRS-LMMSE estimator and CDL selector; run progress/results and receive-decode workflows | `web.py:120-340,482-590,997-1008`; `web_static/index.html`, `web_static/app.js`; tests `test_web_estimator_matrix.py`, `test_web_rx_import.py`. Browser smoke is separate from source/test coverage. |
 
@@ -37,7 +37,7 @@ TX archives store IQ/grid as complex64 and bits as uint8 (`artifacts.py:24-44`).
 | TX `pusch_1ue_1tx_4rx.toml` | DFT-s-OFDM, 1 UE × 1 layer/port, 50 RB, MCS 8. Pair with 4-RX CDL. |
 | TX `pusch_1ue_4layer.toml` | DFT-s-OFDM, 1 UE × 4 layers/ports, 50 RB, MCS 8. Pair with 4-TX/8-RX CDL. |
 | TX `pusch_2ue_4layer.toml` | DFT-s-OFDM, 2 UEs × 4 layers/ports each (8 streams), 50 RB, MCS 8, DMRS length 2. Pair with 4-TX/8-RX CDL. |
-| TX `pusch_cp_2ue_2layer.toml` | CP-OFDM, 2 UEs × 2 layers/ports each (4 streams), 12 RB, MCS 8, non-codebook. Pair with 2-TX/4-RX CDL. |
+| TX `pusch_cp_2ue_2layer.toml` | CP-OFDM, 2 UEs × 2 layers/ports each (4 streams), 12 RB, MCS table 1/index 20, non-codebook. Pair with 2-TX/4-RX CDL. |
 | TX `pusch_4ue_4tx_codebook.toml` | Four single-layer DFT-s-OFDM users, 50 RB, 4 antenna ports with codebook precoding. |
 | TX `pusch_4ue_4tx_codebook_cp12.toml` | Four single-layer CP-OFDM users, 12 RB, 4 antenna ports with codebook precoding. |
 | TX `pusch_cp_2ue_2layer_type2.toml` | Two-user/two-layer CP-OFDM (4 streams), DMRS type 2, length 1 and additional position 1. |
@@ -52,13 +52,14 @@ TX archives store IQ/grid as complex64 and bits as uint8 (`artifacts.py:24-44`).
 | BLER `bler_8stream_smoke.toml` | One-frame frequency-domain 8-stream LMMSE diagnostic at 65 dB; CPU. |
 | BLER `bler_cp_smoke.toml` | One-frame frequency-domain CP-OFDM LMMSE diagnostic at 75 dB; CPU, tap window follows the paired CDL channel. |
 | BLER `bler_8stream_mmse_pic_smoke.toml` | One-frame 8-stream MMSE-PIC(4) diagnostic at 65 dB; CUDA. |
-| BLER `bler_dft_4ue_dmrs_lmmse_smoke.toml`, `bler_cp_2ue_2layer_dmrs_lmmse_smoke.toml` | One-frame DMRS-LMMSE detector-matrix smokes at 25 dB; CUDA; resolve their own published prior from the shared prior directory keyed by TX/CDL. |
+| BLER `bler_dft_4ue_dmrs_lmmse_smoke.toml` | One-frame, 25-dB DMRS-LMMSE × six-detector smoke; CUDA; needs a matching published prior. |
+| BLER `bler_cp_2ue_2layer_dmrs_lmmse_smoke.toml` | Five SNRs (20/25/30/35/40 dB), batch 20, up to 500 frames/point; DMRS/DMRS-LMMSE/perfect × K-best(16); CUDA; DMRS-LMMSE needs a matching published prior. |
 | BLER `bler_release_smoke.toml` | One-frame 25-dB LMMSE GPU profile used by web smoke. |
 | BLER `bler_4ue_cdl.toml` | Four-UE CDL simulation; eight SNRs -5…30 dB, 2-frame batches, up to 1000 frames/point, 100 errors, six detectors, CPU. |
-| BLER `bler_4ue_cdl_gpu.toml` | Historical GPU profile; seven SNRs 20…50 dB, base batch 20 and soft-PIC batch 8, up to 1000 frames/point, stop-at-zero enabled. Its comments record K-best CUDA OOM at batch 20; not the new baseline. |
+| BLER `bler_4ue_cdl_gpu.toml` | GPU detector sweep; seven SNRs 20…50 dB, detectors LMMSE/LMMSE-SIC/MMSE-PIC/soft-MMSE-PIC with batches 20/20/20/8, up to 1000 frames/point, stop-at-zero enabled. Comments retain an earlier K-best CUDA OOM at batch 20; K-best is not a current detector arm. |
 | BLER `bler_4ue_cdl_validation.toml` | 8-frame/point three-SNR soft-MMSE-PIC estimator diagnostic; CPU. |
 | BLER `bler_4ue_cdl_validation_offsets.toml` | Same diagnostic with delay estimation enabled. |
-| BLER `bler_estimator_matrix.toml` | Six-SNR soft-MMSE-PIC matrix for DMRS/DMRS-LMMSE/perfect; the DMRS-LMMSE arm needs a matching published prior; CUDA. |
+| BLER `bler_estimator_matrix.toml` | Six-SNR (25…50 dB) K-best(16) matrix for DMRS/DMRS-LMMSE/perfect, batch 20, up to 2000 frames/point, stop-at-zero enabled; the DMRS-LMMSE arm needs a matching published prior; CUDA. |
 | Validation `channel_estimation_validation.toml` | 256 prior realizations, 512 development frames/SNR, 3000 holdout frames/SNR, 10,000 bootstrap replicates, 60-dB/64-frame high-SNR check; CPU as checked in. |
 | Validation `channel_estimation_validation_v2.toml` | Same training/holdout/bootstrap settings as version 1 but runs on GPU with `batch_size = 20` and relaxes the acceptance thresholds (`min_relative_bler_reduction = 0.09`, `require_strict_upper_bound = false`); the different batch size resamples channel and AWGN realizations, so its numbers are an independent draw, and the published CP prior's acceptance marker records the v2 thresholds. |
 
@@ -66,11 +67,22 @@ Shipped-profile parameters are snapshot-specific; the table above does not claim
 
 ### Web scenario bundles
 
-| ID | TX / CDL / BLER profile | Intended use |
-|---|---|---|
-| `dft-4ue-cdl-a` | `pusch_4ue.toml` / `cdl_38_901_4x4.toml` / `bler_smoke.toml` | 4-user DFT-s-OFDM, 4-RX CDL-A diagnostic |
-| `cp-2ue-2layer-cdl-a` | `pusch_cp_2ue_2layer.toml` / `cdl_38_901_2tx_4rx.toml` / `bler_cp_smoke.toml` | 4-stream CP-OFDM, 2-TX/4-RX CDL-A diagnostic |
-| `dft-8stream-cdl-a` | `pusch_2ue_4layer.toml` / `cdl_38_901_4tx_8rx.toml` / `bler_8stream_smoke.toml` | Bounded 8-stream LMMSE diagnostic |
+`configs/scenarios.toml` ships 25 curated `[[scenarios]]` bundles (`id`, `label`, `description`, `tx`, `channel`, `simulation`); `SimulationWebApp.list_scenarios` (`web.py:121-159`) requires a lowercase-dash `id`, a unique value, a label/description and three existing config names. All 25 preflight as complete bundles in `tests/integration/test_web_estimator_matrix.py`, which mirrors the config directory and publishes synthetic accepted priors so the LMMSE bundles do not depend on ignored local artifacts.
+
+| Group | IDs | TX / CDL / BLER profile | Intended use |
+|---|---|---|---|
+| 4-UE DFT-s, channel model | `dft-4ue-cdl-a` … `dft-4ue-cdl-e` | `pusch_4ue.toml` / `cdl_38_901_4x4{,_B,_C,_D,_E}.toml` / `bler_smoke.toml` | CDL-A…E channel-model comparison, 4 users × 1 layer |
+| Doppler | `dft-4ue-cdl-a-doppler` | `pusch_4ue.toml` / `cdl_38_901_4x4_speed.toml` / `bler_smoke.toml` | 3 m/s time-varying channel |
+| Estimator | `dft-4ue-cdl-a-lmmse` | `pusch_4ue.toml` / `cdl_38_901_4x4.toml` / `bler_dft_4ue_dmrs_lmmse_smoke.toml` | DMRS-LMMSE detector smoke (needs published prior) |
+| Estimator | `dft-4ue-cdl-a-estimator-matrix` | `pusch_4ue.toml` / `cdl_38_901_4x4.toml` / `bler_estimator_matrix.toml` | 6 SNR × dmrs / dmrs-lmmse / perfect × k-best(16) (needs published prior) |
+| Detector | `dft-4ue-cdl-a-detector-sweep-gpu` / `-cpu` | `pusch_4ue.toml` / `cdl_38_901_4x4.toml` / `bler_4ue_cdl_gpu.toml`, `bler_4ue_cdl.toml` | Detector sweeps on GPU / CPU |
+| Topology | `dft-1ue-1tx-cdl-a`, `dft-1ue-4layer-cdl-a` | `pusch_1ue_1tx_4rx.toml` / `cdl_38_901_4x4.toml`, `pusch_1ue_4layer.toml` / `cdl_38_901_4tx_8rx.toml` / `bler_smoke.toml` | Single user, 1 layer / 4 layers |
+| Topology | `dft-4ue-4tx-codebook-cdl-a` | `pusch_4ue_4tx_codebook.toml` / `cdl_38_901_4tx_8rx.toml` / `bler_smoke.toml` | 4-port codebook precoding |
+| 8 streams | `dft-8stream-cdl-a` … `-c`, `dft-8stream-mmse-pic` | `pusch_2ue_4layer.toml` / `cdl_38_901_4tx_8rx{,_B,_C}.toml` / `bler_8stream_smoke.toml`, `bler_8stream_mmse_pic_smoke.toml` | 2 users × 4 layers, 8-stream detector checks |
+| 4-stream CP | `cp-2ue-2layer-cdl-a` … `-e` | `pusch_cp_2ue_2layer.toml` / `cdl_38_901_2tx_4rx{,_B,_C,_D,_E}.toml` / `bler_cp_smoke.toml` | CDL-A…E comparison, 2 users × 2 layers |
+| DMRS type | `cp-2ue-2layer-type2-dmrs` | `pusch_cp_2ue_2layer_type2.toml` / `cdl_38_901_2tx_4rx.toml` / `bler_cp_smoke.toml` | type-2 DMRS with `dmrs_additional_position=1` |
+| Estimator | `cp-2ue-2layer-cdl-a-lmmse` | `pusch_cp_2ue_2layer.toml` / `cdl_38_901_2tx_4rx.toml` / `bler_cp_2ue_2layer_dmrs_lmmse_smoke.toml` | CP-OFDM DMRS-LMMSE vs DMRS (needs published prior) |
+| Topology | `cp-4ue-codebook-cp12` | `pusch_4ue_4tx_codebook_cp12.toml` / `cdl_38_901_4tx_8rx.toml` / `bler_cp_smoke.toml` | 4-user CP-OFDM, 12 RB, 4-port codebook |
 
 ## Explicit limits and interpretation
 
@@ -86,7 +98,7 @@ Shipped-profile parameters are snapshot-specific; the table above does not claim
 - K-best dimensional cost rises with stream count; use 8-stream configs only for bounded correctness smokes, not exponential K-best/EP performance sweeps. The shipped GPU profile notes K-best OOM for batch 20 (`configs/bler_4ue_cdl_gpu.toml:3-8`).
 - K-best requires physical RX antennas at least equal to aggregate streams in both waveform implementations (`receiver.py:283-285,888-890`); DFT-s-OFDM K-best additionally requires one BS endpoint (`receiver.py:283-285`).
 - Delay estimation reports a diagnostic bulk delay; it is not capture time alignment. BLER's optional zero-error stop skips all later configured SNR entries after the first zero-error point, so ordered increasing SNR is an assumption (`bler.py:137-141,274-287`).
-- BLER point `runtime_s` covers point work, while model setup and export occur outside it; process wall time must be recorded separately (`bler.py:149-188,197-268,326-375`). Device memory sampled by system telemetry is total GPU use, not PyTorch allocator peak.
+- BLER point `runtime_s` covers point work, while model setup and export occur outside it; process wall time must be recorded separately (`bler.py:149-188,197-268,322-371`). Device memory sampled by system telemetry is total GPU use, not PyTorch allocator peak.
 - Checked-in unit/integration tests are correctness/control evidence only. Low-frame smoke BLER and reduced paired validation are diagnostic, not statistical release acceptance or performance claims.
 
 ## Test map

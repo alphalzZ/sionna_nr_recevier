@@ -28,6 +28,91 @@ CHANNEL_CONFIG = ROOT / "configs" / "cdl_38_901_4x4.toml"
 SIMULATION_CONFIG = ROOT / "configs" / "bler_estimator_matrix.toml"
 
 
+SCENARIO_IDS = (
+    "dft-4ue-cdl-a",
+    "dft-4ue-cdl-b",
+    "dft-4ue-cdl-c",
+    "dft-4ue-cdl-d",
+    "dft-4ue-cdl-e",
+    "dft-4ue-cdl-a-doppler",
+    "dft-4ue-cdl-a-lmmse",
+    "dft-4ue-cdl-a-estimator-matrix",
+    "dft-4ue-cdl-a-detector-sweep-gpu",
+    "dft-4ue-cdl-a-detector-sweep-cpu",
+    "dft-1ue-1tx-cdl-a",
+    "dft-1ue-4layer-cdl-a",
+    "dft-4ue-4tx-codebook-cdl-a",
+    "dft-8stream-cdl-a",
+    "dft-8stream-cdl-b",
+    "dft-8stream-cdl-c",
+    "dft-8stream-mmse-pic",
+    "cp-2ue-2layer-cdl-a",
+    "cp-2ue-2layer-cdl-b",
+    "cp-2ue-2layer-cdl-c",
+    "cp-2ue-2layer-cdl-d",
+    "cp-2ue-2layer-cdl-e",
+    "cp-2ue-2layer-type2-dmrs",
+    "cp-2ue-2layer-cdl-a-lmmse",
+    "cp-4ue-codebook-cp12",
+)
+
+
+def _config_sandbox(root: Path) -> Path:
+    """Mirror the shipped config directory and publish synthetic accepted priors.
+
+    Shipped ``configs/tap_power_prior/*.npz`` are ignored local artifacts, so a
+    clean checkout has none and the DMRS-LMMSE bundles could not preflight.
+    Configs are copied rather than symlinked because ``_profile_path`` resolves
+    each profile and rejects anything outside the configured directory.
+    """
+    config_dir = root / "configs"
+    config_dir.mkdir()
+    for path in sorted((ROOT / "configs").glob("*.toml")):
+        shutil.copyfile(path, config_dir / path.name)
+    prior_dir = config_dir / "tap_power_prior"
+    scratch = root / "scratch"
+    scratch.mkdir()
+    for tx_name, channel_name, simulation_name in (
+        ("pusch_4ue.toml", "cdl_38_901_4x4.toml", "bler_dft_4ue_dmrs_lmmse_smoke.toml"),
+        (
+            "pusch_cp_2ue_2layer.toml",
+            "cdl_38_901_2tx_4rx.toml",
+            "bler_cp_2ue_2layer_dmrs_lmmse_smoke.toml",
+        ),
+    ):
+        source = ROOT / "configs"
+        tx_settings = TxSettings.from_toml(source / tx_name)
+        channel_settings = ChannelSettings.from_toml(source / channel_name)
+        simulation = BlerSettings.from_toml(source / simulation_name)
+        transmitter = NrPuschTx(tx_settings, device="cpu")
+        compatibility = dmrs_prior_compatibility(
+            tx_settings,
+            channel_settings,
+            l_min=simulation.l_min,
+            max_delay_spread_s=(
+                simulation.max_delay_spread_s
+                or channel_settings.channel.max_delay_spread_s
+            ),
+            fft_size=transmitter._tx_freq.resource_grid.fft_size,
+            sample_rate_hz=transmitter.sample_rate_hz,
+        )
+        candidate = scratch / f"{tx_name}.prior.npz"
+        save_dmrs_tap_power_prior(
+            candidate,
+            np.ones(compatibility["l_max"] - compatibility["l_min"] + 1),
+            compatibility=compatibility,
+            training_seed=7,
+            training_realizations=32,
+        )
+        publish_accepted_dmrs_prior(
+            prior_dir,
+            candidate,
+            compatibility=compatibility,
+            acceptance_gate={"passed": True},
+        )
+    return config_dir
+
+
 class WebEstimatorMatrixTest(unittest.TestCase):
     def test_web_lists_matrix_profile_and_counts_all_estimator_detector_snr_points(self):
         with tempfile.TemporaryDirectory(prefix="nr-pusch-web-matrix-") as temporary:
@@ -219,10 +304,12 @@ class WebEstimatorMatrixTest(unittest.TestCase):
     def test_curated_scenarios_preflight_as_complete_bundles(self):
         with tempfile.TemporaryDirectory(prefix="nr-pusch-web-scenarios-") as temporary:
             root = Path(temporary)
-            app = SimulationWebApp(ROOT / "configs", root / "runs")
+            config_dir = _config_sandbox(root)
+            app = SimulationWebApp(config_dir, root / "runs")
             try:
                 scenarios = app.list_scenarios()
-                self.assertEqual(len(scenarios), 3)
+                self.assertEqual([item["id"] for item in scenarios], list(SCENARIO_IDS))
+                self.assertEqual(len(list((config_dir / "tap_power_prior").glob("*/*.npz"))), 2)
                 for scenario in scenarios:
                     payload = {"scenario_id": scenario["id"]}
                     for kind, name in scenario["profiles"].items():

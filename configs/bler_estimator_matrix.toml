@@ -1,22 +1,22 @@
 [bler]
-# Starter web matrix: three channel estimators × soft-MMSE-PIC at two SNRs.
+# Starter web matrix: three channel estimators × k-best(k=16) at six SNRs.
 # DMRS-LMMSE 先验由 nr-pusch-estimator-validation 在 acceptance_gate 通过后发布到
 # configs/tap_power_prior/，本机不提交 NPZ；运行前先完成一次验证。
 snr_db = [25.0, 30.0, 35.0, 40.0, 45.0, 50.0]
-batch_size = 8
+batch_size = 20
 max_frames_per_snr = 2000
 target_block_errors = 100
 seed = 20260924
 num_decoder_iterations = 20
 channel_estimator = "dmrs"
 channel_estimators = ["dmrs", "dmrs-lmmse", "perfect"]
-detector = "soft-mmse-pic"
-detectors = ["soft-mmse-pic"]
-detector_parameters = { "soft-mmse-pic" = 4 }
+detector = "k-best"
+detectors = ["k-best"]
+detector_parameters = { "k-best" = 16 }
 detector_damping = 0.25
 device = "cuda:0"
 channel_domain = "frequency"
 l_min = -6
 max_delay_spread_s = 3e-6
 estimate_delay = false
-stop_at_zero_bler = false
+stop_at_zero_bler = true

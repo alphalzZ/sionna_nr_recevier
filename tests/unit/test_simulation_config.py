@@ -25,7 +25,8 @@ class BlerSettingsTest(unittest.TestCase):
             settings.channel_estimators_for_sweep,
             ("dmrs", "dmrs-lmmse", "perfect"),
         )
-        self.assertEqual(settings.detectors, ("soft-mmse-pic",))
+        self.assertEqual(settings.detectors, ("k-best",))
+        self.assertEqual(settings.detector_parameters, {"k-best": 16})
 
     def test_soft_mmse_pic_runs_with_each_profile_batch_size(self):
         for name, batch_size, feedback_rounds in (

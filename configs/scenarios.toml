@@ -1,3 +1,9 @@
+# 网页预设仿真场景。每个场景把 TX / 信道 / 仿真配置绑成一个不可拆分的整体，
+# 覆盖波形、用户与层数、阵列拓扑、CDL 模型、速度、估计器和检测器。
+# 标记 [需已发布先验] 的场景在 configs/tap_power_prior/ 缺少匹配先验时会拒绝启动，
+# 不回退到 LS；先验生成见 README.md "CDL tap-power LMMSE 验证"。
+
+# ── DFT-s-OFDM · 4 用户单层 · 1-TX/4-RX（CDL-A/B/C/D/E、速度、估计器、检测器）──
 [[scenarios]]
 id = "dft-4ue-cdl-a"
 label = "4 用户 DFT-s-OFDM · CDL-A"
@@ -7,13 +13,103 @@ channel = "cdl_38_901_4x4.toml"
 simulation = "bler_smoke.toml"
 
 [[scenarios]]
-id = "cp-2ue-2layer-cdl-a"
-label = "2 用户 CP-OFDM · 4 流 CDL-A"
-description = "12 RB、2 用户各 2 层、2-TX/4-RX CDL-A；使用单帧诊断配置。"
-tx = "pusch_cp_2ue_2layer.toml"
-channel = "cdl_38_901_2tx_4rx.toml"
-simulation = "bler_cp_smoke.toml"
+id = "dft-4ue-cdl-b"
+label = "4 用户 DFT-s-OFDM · CDL-B"
+description = "同拓扑换用 CDL-B 模型（各模型 profile 的 delay_spread_s 同为 100 ns，差异只来自模型本身）；4 个 SNR 点、每点最多 2 帧。"
+tx = "pusch_4ue.toml"
+channel = "cdl_38_901_4x4_B.toml"
+simulation = "bler_smoke.toml"
 
+[[scenarios]]
+id = "dft-4ue-cdl-c"
+label = "4 用户 DFT-s-OFDM · CDL-C"
+description = "同拓扑换用 CDL-C 模型（delay_spread_s 同为 100 ns）；4 个 SNR 点、每点最多 2 帧。"
+tx = "pusch_4ue.toml"
+channel = "cdl_38_901_4x4_C.toml"
+simulation = "bler_smoke.toml"
+
+[[scenarios]]
+id = "dft-4ue-cdl-d"
+label = "4 用户 DFT-s-OFDM · CDL-D"
+description = "同拓扑换用 CDL-D 模型（delay_spread_s 同为 100 ns）；4 个 SNR 点、每点最多 2 帧。"
+tx = "pusch_4ue.toml"
+channel = "cdl_38_901_4x4_D.toml"
+simulation = "bler_smoke.toml"
+
+[[scenarios]]
+id = "dft-4ue-cdl-e"
+label = "4 用户 DFT-s-OFDM · CDL-E"
+description = "同拓扑换用 CDL-E 模型（delay_spread_s 同为 100 ns）；4 个 SNR 点、每点最多 2 帧。"
+tx = "pusch_4ue.toml"
+channel = "cdl_38_901_4x4_E.toml"
+simulation = "bler_smoke.toml"
+
+[[scenarios]]
+id = "dft-4ue-cdl-a-doppler"
+label = "4 用户 DFT-s-OFDM · CDL-A · 3 m/s"
+description = "与 CDL-A 静态基线同拓扑，仅把速度区间固定为 3 m/s（min=max=3.0），用于观察时变信道影响。"
+tx = "pusch_4ue.toml"
+channel = "cdl_38_901_4x4_speed.toml"
+simulation = "bler_smoke.toml"
+
+[[scenarios]]
+id = "dft-4ue-cdl-a-lmmse"
+label = "4 用户 DFT-s-OFDM · CDL-A · DMRS-LMMSE"
+description = "25 dB、6 个检测器各跑 1 帧的估计器诊断。[需已发布先验] 先验在共享目录自动查找。"
+tx = "pusch_4ue.toml"
+channel = "cdl_38_901_4x4.toml"
+simulation = "bler_dft_4ue_dmrs_lmmse_smoke.toml"
+
+[[scenarios]]
+id = "dft-4ue-cdl-a-estimator-matrix"
+label = "4 用户 DFT-s-OFDM · 三估计器矩阵"
+description = "25–50 dB 六个 SNR × dmrs / dmrs-lmmse / perfect × k-best(k=16)，batch 20、每点最多 2000 帧；GPU 重矩阵，BLER 归零即提前停止。[需已发布先验]"
+tx = "pusch_4ue.toml"
+channel = "cdl_38_901_4x4.toml"
+simulation = "bler_estimator_matrix.toml"
+
+[[scenarios]]
+id = "dft-4ue-cdl-a-detector-sweep-gpu"
+label = "4 用户 DFT-s-OFDM · 检测器扫描（GPU）"
+description = "20–50 dB 七个 SNR × 4 个检测器、每点最多 1000 帧，batch 20；GPU 长时间扫描。"
+tx = "pusch_4ue.toml"
+channel = "cdl_38_901_4x4.toml"
+simulation = "bler_4ue_cdl_gpu.toml"
+
+[[scenarios]]
+id = "dft-4ue-cdl-a-detector-sweep-cpu"
+label = "4 用户 DFT-s-OFDM · 检测器扫描（CPU 低 SNR）"
+description = "-5–30 dB 八个 SNR × 6 个检测器、每点最多 1000 帧，batch 2；覆盖低 SNR 段，CPU 慢。"
+tx = "pusch_4ue.toml"
+channel = "cdl_38_901_4x4.toml"
+simulation = "bler_4ue_cdl.toml"
+
+# ── DFT-s-OFDM · 单用户、单用户 4 层、4 端口码本 ──
+[[scenarios]]
+id = "dft-1ue-1tx-cdl-a"
+label = "1 用户单层 DFT-s-OFDM · CDL-A"
+description = "最简拓扑：1 个单层用户、1-TX/4-RX；4 个 SNR 点、每点最多 2 帧。"
+tx = "pusch_1ue_1tx_4rx.toml"
+channel = "cdl_38_901_4x4.toml"
+simulation = "bler_smoke.toml"
+
+[[scenarios]]
+id = "dft-1ue-4layer-cdl-a"
+label = "1 用户 4 层 DFT-s-OFDM · CDL-A"
+description = "1 个用户 4 层（4 流）、4 端口、8-RX；高层数单用户对照。"
+tx = "pusch_1ue_4layer.toml"
+channel = "cdl_38_901_4tx_8rx.toml"
+simulation = "bler_smoke.toml"
+
+[[scenarios]]
+id = "dft-4ue-4tx-codebook-cdl-a"
+label = "4 用户 DFT-s-OFDM · 4 端口码本 · CDL-A"
+description = "4 用户各 1 层但占用 4 个发射端口（precoding=codebook、tpmi=0），用于端口映射与码本对照。"
+tx = "pusch_4ue_4tx_codebook.toml"
+channel = "cdl_38_901_4tx_8rx.toml"
+simulation = "bler_smoke.toml"
+
+# ── DFT-s-OFDM · 8 流（2 用户各 4 层）· 2x2 TX / 2x4 RX ──
 [[scenarios]]
 id = "dft-8stream-cdl-a"
 label = "8 流 DFT-s-OFDM · CDL-A"
@@ -22,3 +118,92 @@ tx = "pusch_2ue_4layer.toml"
 channel = "cdl_38_901_4tx_8rx.toml"
 simulation = "bler_8stream_smoke.toml"
 
+[[scenarios]]
+id = "dft-8stream-cdl-b"
+label = "8 流 DFT-s-OFDM · CDL-B"
+description = "8 流拓扑换用 CDL-B 模型，单帧高 SNR 诊断。"
+tx = "pusch_2ue_4layer.toml"
+channel = "cdl_38_901_4tx_8rx_B.toml"
+simulation = "bler_8stream_smoke.toml"
+
+[[scenarios]]
+id = "dft-8stream-cdl-c"
+label = "8 流 DFT-s-OFDM · CDL-C"
+description = "8 流拓扑换用 CDL-C 模型，单帧高 SNR 诊断。"
+tx = "pusch_2ue_4layer.toml"
+channel = "cdl_38_901_4tx_8rx_C.toml"
+simulation = "bler_8stream_smoke.toml"
+
+[[scenarios]]
+id = "dft-8stream-mmse-pic"
+label = "8 流 DFT-s-OFDM · MMSE-PIC"
+description = "8 流拓扑下改用 MMSE-PIC 检测器的单帧 GPU 诊断。"
+tx = "pusch_2ue_4layer.toml"
+channel = "cdl_38_901_4tx_8rx.toml"
+simulation = "bler_8stream_mmse_pic_smoke.toml"
+
+# ── CP-OFDM · 2 用户各 2 层（4 流）· 1x2 TX / 2x2 RX ──
+[[scenarios]]
+id = "cp-2ue-2layer-cdl-a"
+label = "2 用户 CP-OFDM · 4 流 CDL-A"
+description = "12 RB、2 用户各 2 层、2-TX/4-RX CDL-A；使用单帧诊断配置。"
+tx = "pusch_cp_2ue_2layer.toml"
+channel = "cdl_38_901_2tx_4rx.toml"
+simulation = "bler_cp_smoke.toml"
+
+[[scenarios]]
+id = "cp-2ue-2layer-cdl-b"
+label = "2 用户 CP-OFDM · 4 流 CDL-B"
+description = "CP-OFDM 4 流拓扑换用 CDL-B 模型，单帧高 SNR 诊断。"
+tx = "pusch_cp_2ue_2layer.toml"
+channel = "cdl_38_901_2tx_4rx_B.toml"
+simulation = "bler_cp_smoke.toml"
+
+[[scenarios]]
+id = "cp-2ue-2layer-cdl-c"
+label = "2 用户 CP-OFDM · 4 流 CDL-C"
+description = "CP-OFDM 4 流拓扑换用 CDL-C 模型，单帧高 SNR 诊断。"
+tx = "pusch_cp_2ue_2layer.toml"
+channel = "cdl_38_901_2tx_4rx_C.toml"
+simulation = "bler_cp_smoke.toml"
+
+[[scenarios]]
+id = "cp-2ue-2layer-cdl-d"
+label = "2 用户 CP-OFDM · 4 流 CDL-D"
+description = "CP-OFDM 4 流拓扑换用 CDL-D 模型，单帧高 SNR 诊断。"
+tx = "pusch_cp_2ue_2layer.toml"
+channel = "cdl_38_901_2tx_4rx_D.toml"
+simulation = "bler_cp_smoke.toml"
+
+[[scenarios]]
+id = "cp-2ue-2layer-cdl-e"
+label = "2 用户 CP-OFDM · 4 流 CDL-E"
+description = "CP-OFDM 4 流拓扑换用 CDL-E 模型，单帧高 SNR 诊断。"
+tx = "pusch_cp_2ue_2layer.toml"
+channel = "cdl_38_901_2tx_4rx_E.toml"
+simulation = "bler_cp_smoke.toml"
+
+[[scenarios]]
+id = "cp-2ue-2layer-type2-dmrs"
+label = "2 用户 CP-OFDM · type-2 DMRS"
+description = "与 CP 4 流基线同拓扑，换成 dmrs_config_type=2 并开 additional_position=1 的导频排布。"
+tx = "pusch_cp_2ue_2layer_type2.toml"
+channel = "cdl_38_901_2tx_4rx.toml"
+simulation = "bler_cp_smoke.toml"
+
+[[scenarios]]
+id = "cp-2ue-2layer-cdl-a-lmmse"
+label = "2 用户 CP-OFDM · 4 流 · DMRS-LMMSE"
+description = "20–40 dB 五个 SNR，dmrs / dmrs-lmmse / perfect 对照，单检测器 k-best，batch 20、每点最多 500 帧；GPU。[需已发布先验]"
+tx = "pusch_cp_2ue_2layer.toml"
+channel = "cdl_38_901_2tx_4rx.toml"
+simulation = "bler_cp_2ue_2layer_dmrs_lmmse_smoke.toml"
+
+# ── CP-OFDM · 4 用户 4 端口码本（normal CP、12 RB）──
+[[scenarios]]
+id = "cp-4ue-codebook-cp12"
+label = "4 用户 CP-OFDM · 4 端口码本 · 12 RB"
+description = "CP-OFDM、12 RB、4 用户各 1 层但占用 4 个发射端口，单帧高 SNR 诊断。"
+tx = "pusch_4ue_4tx_codebook_cp12.toml"
+channel = "cdl_38_901_4tx_8rx.toml"
+simulation = "bler_cp_smoke.toml"

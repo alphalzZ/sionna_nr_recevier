@@ -12,7 +12,7 @@ Three kinds of evidence remain distinct:
 
 Current package metadata is `nr-pusch-lab` 0.1.0, Python `>=3.11`, Sionna 2.0.1 (`pyproject.toml`). Previously observed environment: Python 3.14.4, PyTorch 2.13.0+cu130, NumPy 2.5.2, h5py 3.16.0, RTX 3060 Laptop GPU (6,064,832,512-byte VRAM), driver CUDA 13.2, Ryzen 5 5600H (6C/12T), 16 GiB RAM. These are prior observations, not this run's environment; recapture before freezing. The prior GPU snapshot showed 26% utilization and 870 MiB allocated, so it did not satisfy the idle requirement. Never terminate unrelated GPU processes.
 
-`bler.runtime_s` measures per-SNR simulation work including TX/channel/noise/RX/counters, but not model setup or export (`src/nr_pusch/bler.py:149-188,197-268,326-372`). Report frames/s and TB/s from this point runtime and `/usr/bin/time -v` wall time separately. One-second `nvidia-smi` memory is total device usage, not PyTorch allocator peak.
+`bler.runtime_s` measures each SNR point's simulation work including TX/channel/noise/RX/counters, but excludes model setup and export (`src/nr_pusch/bler.py:149-189,195-270,322-371`). Report frames/s and TB/s from this point runtime and `/usr/bin/time -v` wall time separately. One-second `nvidia-smi` memory is total device usage, not PyTorch allocator peak.
 
 ## Run order and immutable evidence
 
@@ -28,6 +28,8 @@ git diff --binary HEAD -- src pyproject.toml > "$BASE/source.patch"
 ```
 
 If `source.patch` is empty, record that fact and remove only the empty generated patch. Capture `python --version`, relevant package versions (`pip freeze` or exact package versions), `nvidia-smi`, and SHA-256 values for every input profile in the manifest. Copy all TX/CDL/RX/BLER/validation source TOMLs used into `configs/`; do not point measured runs at mutable profiles. Record the exact git revision plus optional patch digest and config digests as the baseline identity.
+
+When a measured `dmrs-lmmse` arm is planned, snapshot the matching, already-published priors from the local `configs/tap_power_prior/` registry under `$BASE/configs/tap_power_prior/`; include their compatibility metadata and SHA-256 values in the manifest. Do not substitute diagnostic candidates. If a compatible accepted prior is unavailable, mark the affected `dmrs-lmmse` rows blocked rather than claiming a complete sweep.
 
 ### 2. GPU idle preflight and telemetry
 
@@ -55,7 +57,7 @@ Capture exit status, exact test count and complete log. Failure blocks release a
 
 ### 4. GPU functional matrix
 
-Run every shipped `configs/pusch_*.toml` profile through `nr-pusch-tx` on `cuda:0`, `--batch-size 1 --seed 13`; save NPZ and JSON sidecar under `functional/tx/`. Check each archive's shapes, dtypes, axes, sample rate and TOML settings against its sidecar. This glob includes all five shipped TX profiles and no RX-only TOML.
+Run every shipped `configs/pusch_*.toml` profile through `nr-pusch-tx` on `cuda:0`, `--batch-size 1 --seed 13`; save NPZ and JSON sidecar under `functional/tx/`. Check each archive's shapes, dtypes, axes, sample rate and TOML settings against its sidecar. This glob includes all eight shipped TX profiles and no RX-only TOML.
 
 Exercise channel coverage with one-frame deterministic TX input on GPU:
 
@@ -90,10 +92,10 @@ nr-pusch-estimator-validation --tx-config <TX-snapshot> \
   --channel-config <CDL-snapshot> --validation-config <validation-snapshot> \
   --output "$BASE/estimator-validation/<profile>/validation.json" \
   --device cuda:0 --prior-realizations 32 --frames-per-snr <cap> \
-  --prior-dir "$BASE/tap_power_prior"
+  --prior-dir "$BASE/estimator-validation/<profile>/prior-store"
 ```
 
-Use `--frames-per-snr 16` unless 8 is selected before any measured performance run; the same choice applies to both profiles. Keep the configured 64-frame high-SNR check. Preserve summary JSON, per-frame NPZ and the diagnostic prior NPZ in each profile directory. Only a passing acceptance gate publishes the candidate into the shared prior directory keyed by its TX/CDL, tap-window, FFT and sample-rate compatibility, so measured profiles need no explicit prior path; changing only MCS table/index does not invalidate the channel tap-power prior, while any other compatibility-field mismatch remains an error. These reduced runs are diagnostic and do not establish the full registered statistical acceptance gate, so they publish nothing; the checked-in full validation profile historically took 74m56 on an RTX 3060.
+Use `--frames-per-snr 16` unless 8 is selected before any measured performance run; the same choice applies to both profiles. Keep the configured 64-frame high-SNR check. Preserve summary JSON, per-frame NPZ and the diagnostic prior NPZ in each profile directory. The CLI publishes a marked prior into `--prior-dir` only when `acceptance_gate.passed` is true, so keep these reduced runs isolated with `--prior-dir "$BASE/estimator-validation/<profile>/prior-store"`; never use that store for the measured sweep. Reduced samples remain diagnostic even if the configured gate passes and a marked file is emitted; they do not establish the planned full 3000-frame acceptance evidence. The performance sweep instead uses the previously accepted prior snapshots captured in step 1, explicitly passed from `$BASE/configs/tap_power_prior/`. Changing only MCS table/index does not invalidate the channel tap-power prior, while any other compatibility-field mismatch remains an error. The checked-in full validation profile historically took 74m56 on an RTX 3060.
 
 ### 7. Frozen workload choice
 
@@ -112,7 +114,7 @@ Workloads:
 | Name | TX / CDL | Topology and fixed profile |
 |---|---|---|
 | `dft_4ue` | `pusch_4ue.toml` + `cdl_38_901_4x4.toml` | DFT-s-OFDM, four single-layer UEs, MCS 20, 50-RB BWP, CDL-A frequency domain. |
-| `cp_2ue_2layer` | `pusch_cp_2ue_2layer.toml` + `cdl_38_901_2tx_4rx.toml` | CP-OFDM, two UEs × two layers, MCS 8, 12-RB BWP, CDL-A frequency domain. |
+| `cp_2ue_2layer` | `pusch_cp_2ue_2layer.toml` + `cdl_38_901_2tx_4rx.toml` | CP-OFDM, two UEs × two layers, MCS 20, 12-RB BWP, CDL-A frequency domain. |
 
 For each workload, create one immutable BLER TOML per seed `[20260924, 20260925, 20260926]`, with:
 
@@ -133,7 +135,7 @@ channel_domain = "frequency"
 l_min = -6
 max_delay_spread_s = 3e-6
 stop_at_zero_bler = false
-# 先验按信道配置在共享目录中自动查找，不要填写 dmrs_tap_power_prior_path
+# 先验由共享 registry 按当前 TX/CDL 兼容性解析；不要在 BLER TOML 中设置先验路径
 ```
 
 Do not add retries, omit detectors, or change settings silently. The low-count matrix is descriptive, not statistically significant. Do not interpret shared seeds as statistically paired BLER observations across detector arms.
@@ -147,7 +149,7 @@ Run all six profile/seed combinations; retain resolved TOML snapshots, raw CSV/J
   --simulation-config "$BASE/performance/<profile>/seed-<seed>/simulation.toml" \
   --output "$BASE/performance/<profile>/seed-<seed>/results.csv" \
   --progress-jsonl "$BASE/performance/<profile>/seed-<seed>/progress.jsonl" \
-  --device cuda:0
+  --device cuda:0 --prior-dir "$BASE/configs/tap_power_prior"
 ```
 
 The DFT and CP profiles are the only throughput baseline. CDL-B–E, moving speed, time-domain channel, alternate topology, DMRS/codebook variants and 8-stream cases are correctness/coverage only; they have no Release 0.1 throughput claim.

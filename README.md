@@ -66,7 +66,7 @@ nr-pusch-tx --config configs/pusch_4ue.toml --output /tmp/pusch_tx.npz --seed 7
 nr-pusch-channel --config configs/cdl_38_901_4x4.toml --input /tmp/pusch_tx.npz --sample-rate-hz 18000000 --output /tmp/pusch_rx.npz
 ```
 
-发送 NPZ 的 `iq` 为 `[batch,user,tx_antenna,sample]`；信道输出 `iq` 为 `[batch,rx_antenna,sample]`、`per_user_iq` 为 `[batch,user,rx_antenna,sample]`、`channel_taps` 为 `[batch,user,rx_antenna,tx_antenna,time,tap]`。频域 CSI 为 `[batch,1,rx_antenna,user,tx_antenna,symbol,fft_bin]`。信道输出包含线性卷积尾部；噪声由独立的 AWGN 步骤加入。
+发送 NPZ 的 `iq` 为 `[batch,user,tx_antenna,sample]`；信道输出 `iq` 为 `[batch,rx_antenna,sample]`、`per_user_iq` 为 `[batch,user,rx_antenna,sample]`、`channel_taps` 为 `[batch,user,rx_antenna,tx_antenna,sample,tap]`（`channel_tap_axes` 中该轴名为 `sample`）。频域 CSI 为 `[batch,1,rx_antenna,user,tx_antenna,symbol,fft_bin]`。信道输出包含线性卷积尾部；噪声由独立的 AWGN 步骤加入。
 
 离线资源网格也可直接应用频域信道；输入使用发送 NPZ 中的 `frequency_grid`，并提供发送 TOML 以取得 FFT/子载波间隔配置：
 
@@ -86,7 +86,7 @@ CP-OFDM 使用原生逐 RE 信道估计和检测路径，不做 DFT 解扩/IDFT�
 EP 使用 double precision；K-best 要求接收天线数不少于总流数。Type-2
 DMRS 与数据共用 OFDM 符号时，估计只使用原生 pilot mask 中的 RE。
 
-DMRS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围：当前为 18 MHz 采样率下的 `-6..60`，共 67 taps，这是时延范围先验，不读取本帧真实信道系数。多个 DMRS occasion 各自拟合 CSI，再按 OFDM 符号位置对相邻估计做复数线性插值；首个/末个 occasion 之外保持最近估计。`err_var` 按插值权重平方传播，假设各 occasion 的估计噪声独立，不包含信道时变造成的插值模型误差；高 Doppler 场景仍需独立验证。
+DMRS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围，窗口长度随几何变化：4 用户 DFT-s-OFDM 基线（18 MHz 采样率）为 `-6..60`、共 67 taps；CP-OFDM 2 用户 2 层基线（4.32 MHz）为 `-6..19`、共 26 taps。这是时延范围先验，不读取本帧真实信道系数。多个 DMRS occasion 各自拟合 CSI，再按 OFDM 符号位置对相邻估计做复数线性插值；首个/末个 occasion 之外保持最近估计。`err_var` 按插值权重平方传播，假设各 occasion 的估计噪声独立，不包含信道时变造成的插值模型误差；高 Doppler 场景仍需独立验证。
 
 ### CDL tap-power LMMSE 验证
 
@@ -142,7 +142,7 @@ PY
 
 重训与覆盖：对同一 TX/CDL/抽头窗组合重复上面的命令即可；只有再次通过门槛才会覆盖同名已发布先验，门槛失败时保留原版本并留下新的诊断 NPZ。改动 TX 几何、CDL、抽头窗、FFT 或采样率都会得到新的兼容性键，需要单独训练，旧先验不会被误用。
 
-实测代价（RTX 3060 Laptop GPU）：版本 1 配置（CPU、batch 2）CP-OFDM 一次 1353 s；DFT-s-OFDM 用 `--device cuda:0`、其余为版本 1 设置时 6426 s（development 981 s、holdout 25 dB 2478 s、holdout 30 dB 2930 s、60 dB 38 s），即约 1 小时 47 分钟。DFT-s-OFDM 单轮超过 1 小时，shell 层不要加 3600 s 之类的截止时间。CP-OFDM 用版本 2（GPU、batch 20）一轮 1626 s。
+实测耗时取各验证摘要的 `runtime_s`（development/holdout/high-SNR sweep，不含模型与 prior 训练/设置，也不是整条命令的 wall time）：版本 1 配置（CPU、batch 2）CP-OFDM 一次 1345 s；DFT-s-OFDM 同为 CPU、batch 2，用时 6426 s（development 981 s、holdout 25 dB 2478 s、holdout 30 dB 2930 s、60 dB 38 s），约 1 小时 47 分钟。CP-OFDM 用版本 2（GPU、batch 20）一轮 1551 s。长时 DFT-s-OFDM 验证不要加 3600 s 之类的 shell 截止时间。
 
 当前仓库状态（2026-10-03 实测；两次 CP 运行分别用版本 1 与版本 2 门槛配置，seed 与 SNR 点一致，未临时调阈值）：
 
@@ -151,9 +151,11 @@ PY
 
 因此两种波形的 `dmrs-lmmse` 现在都可以直接用，不需要任何先验路径。DFT-s-OFDM：仓库自带的 `nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38_901_4x4.toml --simulation-config configs/bler_dft_4ue_dmrs_lmmse_smoke.toml` 在已发布先验下 47 s 跑完 25 dB 的 6 个检测器臂；该 profile 每臂只有 1 帧，BLER 0–0.75（`lmmse`/`k-best`/`ep` 3/4 块错误，`lmmse-sic` 0/4），只用于连通性验证，不能当作性能结论；另用临时 profile `/tmp/nr-prior-check/dft_lmmse_only.toml`（`snr_db = [40.0]`、单一 `dmrs-lmmse`×`lmmse` 臂、`--device cuda:0`，未提交到仓库）复测 11 s，0 CRC 失败、0/4 块错误。CP-OFDM：网页实验台在“高级配置”里选 `pusch_cp_2ue_2layer.toml` + `cdl_38_901_2tx_4rx.toml` + `bler_cp_2ue_2layer_dmrs_lmmse_smoke.toml` 后兼容性检查通过并可运行，任务 `fcaf738186c5`（15 个点）在约 12.5 min 内完成，`dmrs-lmmse` 在 20/25/30/35/40 dB 的 BLER 依次为 0.95 / 0.275 / 0.007 / 0.001 / 0，均低于同轮 `dmrs` 基线的 0.975 / 0.3219 / 0.010 / 0.002 / 0；该 profile 每臂最多 500 帧，可作为趋势参考但样本仍远小于验证用的 3000 帧 holdout。CLI 侧另用临时 profile `/tmp/nr-prior-check/cp_lmmse_only.toml`（75 dB 单臂）复测 6 s，0 CRC 失败、0/2 块错误。门槛阈值不得为了让某个波形通过而临时放宽；如需改变 `training_realizations`、SNR 点或门槛本身，应新增一份版本化的验证配置并在摘要 JSON 中记录，再按新配置重跑，原门槛的失败结论保持不变。
 
+需要注意的是，上述网页任务 `fcaf738186c5` 早于共享先验目录：它的归档快照 `runs/web/fcaf738186c5/simulation.toml:19` 仍带着已移除的 `dmrs_tap_power_prior_path`，指向从未通过验收的诊断候选 `outputs/release-0.1-baseline/estimator-validation/cp_2ue_2layer/validation.prior.npz`。该快照只作为历史记录保留；按当前代码重跑同样组合时不再需要先验路径，而是从 `configs/tap_power_prior/cp_ofdm/` 自动解析。
+
 常规 `nr-pusch-bler` 的 `[bler]` 只需设置 `channel_estimator = "dmrs-lmmse"`，不再填写先验路径；接收端按 `--channel-config` 的 TX/CDL、抽头窗、FFT 和采样率在共享先验目录中查找匹配项。`nr-pusch-rx` 的 `[receiver]` 同样不再有先验路径，但必须用 `--channel-config` 或 `[receiver].dmrs_tap_power_prior_channel_config_path` 提供该 prior 对应的 CDL TOML。默认目录为信道配置同级的 `tap_power_prior/`，可用 `--prior-dir` 覆盖（`nr-pusch-bler`、`nr-pusch-rx`、`nr-pusch-estimator-validation` 均支持）。prior 缺失、不兼容或未经验收发布都会报错，不会回退到 LS。
 
-BLER 配置可用 `[bler].channel_estimators` 选择多个估计器；仿真按 `channel_estimators × detectors × snr_db` 遍历组合。未设置时沿用单个 `channel_estimator`。网页 SIM 配置 `configs/bler_estimator_matrix.toml` 组合 `dmrs`、`dmrs-lmmse`、`perfect` 与 `soft-mmse-pic`，扫描 25–50 dB 六个 SNR，共 18 个结果点，每点最多 2,000 帧（GPU profile）。运行前需按上面的验证命令产出通过验收的先验；未通过时该矩阵会因找不到匹配 prior 而拒绝启动。
+BLER 配置可用 `[bler].channel_estimators` 选择多个估计器；仿真按 `channel_estimators × detectors × snr_db` 遍历组合。未设置时沿用单个 `channel_estimator`。网页 SIM 配置 `configs/bler_estimator_matrix.toml` 组合 `dmrs`、`dmrs-lmmse`、`perfect` 与 `k-best(k=16)`，扫描 25–50 dB 六个 SNR，共 18 个结果点，每点最多 2,000 帧（GPU profile）。运行前需按上面的验证命令产出通过验收的先验；未通过时该矩阵会因找不到匹配 prior 而拒绝启动。
 
 
 DFT-s-OFDM 的上述检测器工作在用户×层总流上；Sionna layer demapper 在逆 DFT 后将每层 LLR 还原为各 UE 的 TB 码字。PIC 按全部层消除干扰；soft-PIC 按码字/层次交换 LDPC 外信息；SIC 只在 CRC 通过后重构 UE 并抵消其完整贡献。K-best 要求接收天线数不少于总流数，搜索路径数和复杂度由 `detector_parameter` 控制。PIC 的该参数表示迭代轮数，EP 中表示迭代次数；BLER 配置仍使用 `detectors` 与 `detector_parameters`。
@@ -168,7 +170,7 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 将 `device` 写为 `cpu`、`cuda:0` 或 `auto` 可从 TOML 控制运算设备；`configs/bler_4ue_cdl_gpu.toml` 提供显式 CUDA 示例。若以 `--device cuda` 覆盖，程序会将其规范化为 Sionna 接受的 `cuda:0`。请求的设备同时会写入 Sionna 的全局 `sionna.phy.config.device`：Sionna 的 PUSCH 导频图案按该全局值分配，而资源网格按显式设备分配，两者不一致时（例如在有 GPU 的机器上跑 `--device cpu`）会在建图阶段报设备不匹配。批大小受 GPU 显存约束；频域信道一般比时域线性卷积更节省显存。
 
-不同检测器可在 `[bler]` 中单独设置批大小；未列出的检测器使用 `batch_size`，每个 SNR 点最后一批仍受 `max_frames_per_snr` 截断。当前 `configs/bler_4ue_cdl_gpu.toml` 使用 `{ lmmse = 26, "lmmse-sic" = 26, "k-best" = 10, "mmse-pic" = 26, ep = 26 }`（`batch_size = 20` 仅作未列出检测器的兜底）。K-best 的路径搜索在显存上最重，batch 必须明显低于其他检测器；本机 6 GiB GPU 上 LMMSE/LMMSE-SIC/MMSE-PIC 在 26 完成了全量扫描。网页的仿真 TOML 编辑器同样支持该字段。不同批大小改变随机数的分组，因此各检测器共享初始 seed 和统计条件，但不保证逐帧使用完全相同的 payload、信道和噪声样本。
+不同检测器可在 `[bler]` 中单独设置批大小；未列出的检测器使用 `batch_size`，每个 SNR 点最后一批仍受 `max_frames_per_snr` 截断。当前 `configs/bler_4ue_cdl_gpu.toml` 使用 `{ lmmse = 20, "lmmse-sic" = 20, "mmse-pic" = 20, "soft-mmse-pic" = 8 }`，`detectors = ["lmmse", "lmmse-sic", "mmse-pic", "soft-mmse-pic"]`（不含 k-best/ep；`batch_size = 20` 为未列出检测器的默认值）。K-best 的路径搜索在显存上最重，batch 必须明显低于其他检测器——本仓库记录过的 K-best 批量扫描是 2026-09-27 任务 `1313e4fe353d` 的归档快照（`k-best = 10`，其余检测器 26），见下文 §当前统一接收链路的全量检测器对照。网页的仿真 TOML 编辑器同样支持该字段。不同批大小改变随机数的分组，因此各检测器共享初始 seed 和统计条件，但不保证逐帧使用完全相同的 payload、信道和噪声样本。
 
 扫描会逐 SNR 点发射随机 transport blocks、通过 CDL、按每个接收天线的测得信号功率注入复 AWGN，再用 CRC 与 payload 比对统计 BLER。CSV 包含 SNR、BLER、CRC fail rate、BER 和样本数，JSON sidecar 保存配置及完整统计；BLER 将 CRC fail 或任何 payload bit 错误都计为 block error。`bler_smoke.toml` 是短时连通性配置，正式仿真应增加 `max_frames_per_snr` 和 `target_block_errors`。
 
@@ -184,6 +186,8 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 ```
 
 浏览器打开 `http://127.0.0.1:8765/`。页面可选择并编辑发送、CDL 信道和 BLER TOML profile；“保存配置”会校验并覆盖所选 `configs/*.toml`，而直接“启动仿真”使用当前编辑器文本创建独立快照，无需先保存。建议先用 `bler_smoke.toml` 熟悉操作，再选择完整扫描配置。运行任务按提交顺序串行执行，避免多个任务同时争用 GPU；页面显示每个检测器和 SNR 点的进度、BLER 曲线、统计表和日志，结果可下载为 CSV/JSON。任务及配置快照保存在被 Git 忽略的 `runs/web/<任务 ID>/`，服务重启后仍可查看已有结果；正在运行的进程因服务中断而结束时，任务会标记为失败。网页只绑定本机回环地址；需要从其他机器访问时请使用 SSH 端口转发。
+
+页面顶部“选择实验方案”提供 `configs/scenarios.toml` 里的 25 个预设组合，选中后自动填入三个 profile 的文本并做兼容性预检；预设的 TX/信道/仿真配置不可再单独拆分修改，需要改参数时用下面的高级编辑。分组覆盖：4 用户 DFT-s-OFDM 的 CDL-A…E、`cdl_38_901_4x4_speed.toml`（3 m/s Doppler）、DMRS-LMMSE 与三估计器矩阵、CPU/GPU 两种检测器扫描；1 用户单层与 1 用户 4 层；4 用户 4 端口码本；8 流的 CDL-A/B/C 与 MMSE-PIC；2 用户 CP-OFDM 4 流的 CDL-A…E、type-2 DMRS（`dmrs_additional_position=1`）、DMRS-LMMSE；以及 4 用户 CP-OFDM 12 RB 4 端口码本。标 `[需已发布先验]` 的三个场景要先按 §"CDL tap-power LMMSE 验证" 生成本机先验，否则预检直接报“未找到与当前 TX/CDL/抽头窗口匹配的已通过验证的 DMRS prior”。
 
 ### 历史 GPU batch 扫描与频域/时域对照
 
@@ -222,7 +226,7 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 
 ### 当前统一接收链路的全量检测器对照
 
-`configs/bler_4ue_cdl_gpu.toml`（SNR 20–50 dB、`max_frames_per_snr = 1000`、`target_block_errors = 100`、seed 20260924、频域信道、DMRS 估计、每检测器 batch 26/26/10/26/26）的一次完整运行，任务 `1313e4fe353d`，共 35 个点、约 55 分钟、结果在 `runs/web/1313e4fe353d/`（该目录被 Git 忽略）：
+`configs/bler_4ue_cdl_gpu.toml` 的一次完整运行，任务 `1313e4fe353d`，共 35 个点、约 55 分钟、结果在 `runs/web/1313e4fe353d/`（该目录被 Git 忽略）。该表的批次与检测器组合取自当次运行的**归档快照** `runs/web/1313e4fe353d/simulation.toml`（`detector_batch_sizes = { lmmse = 26, "lmmse-sic" = 26, "k-best" = 10, "mmse-pic" = 26, ep = 26 }`，`detectors = ["lmmse", "lmmse-sic", "k-best", "mmse-pic", "ep"]`）；当前 `configs/bler_4ue_cdl_gpu.toml` 已是 4 个检测器、20/20/20/8，因此下表是 2026-09-27 那次运行的结果，不是对今天 profile 的描述：
 
 | SNR (dB) | LMMSE | LMMSE-SIC | K-best(16) | MMSE-PIC(4) | EP(10) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -347,5 +351,5 @@ NPZ 中 `iq` 的轴顺序为 `[batch, user, tx_antenna, sample]`，`frequency_gr
 
 - `configs/`：发送与抓包分析配置
 - `src/nr_pusch/`：配置解析、Sionna 发送与 CDL 信道适配、IQ 导出和命令入口
-- `tests/fixtures/`：后续放置 MATLAB H5 参考夹具
+- `tests/fixtures/matlab_h5/`：随仓库提供的 MATLAB H5 参考夹具（RxTestVector 系列、TxTestVector、scrambSeqCase 系列），只读使用
 - `docs/`：支持范围、接口和夹具说明（`docs/dmrs_tap_power_prior.md` 记录 prior 原理与生成规则）
