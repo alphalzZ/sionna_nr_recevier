@@ -368,5 +368,8 @@ def save_bler_results(
             "spatial model; residual frequency variation is approximated as Gaussian covariance."
         ),
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     return output, manifest_path

@@ -208,15 +208,6 @@ class MimoReceiverTest(unittest.TestCase):
             ROOT / "configs" / "cdl_38_901_2tx_4rx.toml"
         )
         channel_settings.validate_transmitter(settings)
-        tap_prior = estimate_dmrs_tap_power_prior(
-            settings,
-            channel_settings,
-            l_min=-2,
-            max_delay_spread_s=0.3e-6,
-            num_realizations=8,
-            seed=4,
-            device="cpu",
-        )
         sionna.phy.config.seed = 4
         tx = NrPuschTx(settings, device="cpu")
         sent = tx.generate(seed=4)
@@ -225,6 +216,23 @@ class MimoReceiverTest(unittest.TestCase):
         )
         noisy = add_awgn_resource_grid(channel.grid, 75, seed=4)
         data_symbols = tx._tx_freq.resource_grid.pilot_pattern.num_data_symbols
+
+        # The DMRS tap window must cover the simulated channel, whose discrete
+        # support is time_lag_discrete_time_channel(fs, max_delay_spread_s).
+        delay_spread_s = channel_settings.channel.max_delay_spread_s
+        sample_rate_hz = int(
+            12 * settings.pusch.n_size_bwp * settings.carrier.subcarrier_spacing_khz * 1e3
+        )
+        l_min, _ = time_lag_discrete_time_channel(sample_rate_hz, delay_spread_s)
+        tap_prior = estimate_dmrs_tap_power_prior(
+            settings,
+            channel_settings,
+            l_min=l_min,
+            max_delay_spread_s=delay_spread_s,
+            num_realizations=8,
+            seed=4,
+            device="cpu",
+        )
 
         for estimator in ("perfect", "dmrs", "dmrs-lmmse"):
             for detector, parameter in (
@@ -240,8 +248,8 @@ class MimoReceiverTest(unittest.TestCase):
                         settings,
                         channel_estimator=estimator,
                         dmrs_tap_power_prior=tap_prior if estimator == "dmrs-lmmse" else None,
-                        l_min=-2,
-                        max_delay_spread_s=0.3e-6,
+                        l_min=l_min,
+                        max_delay_spread_s=delay_spread_s,
                         detector=detector,
                         detector_parameter=parameter,
                         detector_damping=0.25,
@@ -280,6 +288,40 @@ class MimoReceiverTest(unittest.TestCase):
                 channel_frequency_response=channel.channel_frequency_response[:, :, :3],
             )
 
+
+
+    def test_cp_kbest_handles_rank_deficient_perfect_csi(self):
+        settings = TxSettings.from_toml(
+            ROOT / "configs" / "pusch_cp_2ue_2layer.toml"
+        )
+        channel_settings = ChannelSettings.from_toml(
+            ROOT / "configs" / "cdl_38_901_2tx_4rx.toml"
+        )
+        sionna.phy.config.seed = 4
+        tx = NrPuschTx(settings, device="cpu")
+        sent = tx.generate(seed=4)
+        channel = NrPuschCdlChannel(channel_settings, device="cpu").apply_frequency(
+            sent.frequency_grid, tx._tx_freq.resource_grid
+        )
+        noisy = add_awgn_resource_grid(channel.grid, 75, seed=4)
+
+        rank_deficient_csi = channel.channel_frequency_response.clone()
+        rank_deficient_csi[:, :, :, 1] = rank_deficient_csi[:, :, :, 0]
+        rx = NrPuschRx(
+            settings,
+            channel_estimator="perfect",
+            detector="k-best",
+            detector_parameter=8,
+            input_domain="frequency",
+            device="cpu",
+        )
+        rx.receive_frequency_grid(
+            noisy.grid,
+            noisy.noise_variance,
+            channel_frequency_response=rank_deficient_csi,
+        )
+        llr = rx._receiver._mimo_detector.last_llr
+        self.assertTrue(torch.isfinite(llr).all().item())
 
     def test_cp_type2_dmrs_native_ls_and_tap_lmmse_decode_data_sharing_pilot_symbol(self):
         base = TxSettings.from_toml(ROOT / "configs" / "pusch_cp_2ue_2layer.toml")

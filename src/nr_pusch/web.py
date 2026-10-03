@@ -30,10 +30,13 @@ import numpy as np
 from .channel_config import ChannelSettings
 from .config import TxSettings
 from .simulation_config import BlerSettings
+from .dmrs_prior import dmrs_prior_compatibility, load_dmrs_tap_power_prior
+from .transmitter import NrPuschTx
 
 
 _PROFILES = {"tx": "pusch_", "channel": "cdl_", "simulation": "bler_"}
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.toml$")
+_SCENARIO_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _JOB_ID = re.compile(r"^[0-9a-f]{12}$")
 _RX_CONFIG_NAME = re.compile(r"^rx_[A-Za-z0-9][A-Za-z0-9_.-]*\.toml$")
 _DETECTORS = {"lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic"}
@@ -114,6 +117,227 @@ class SimulationWebApp:
         )
         return configs
 
+    def list_scenarios(self) -> list[dict[str, Any]]:
+        catalog = self.config_dir / "scenarios.toml"
+        if not catalog.is_file():
+            return []
+        with catalog.open("rb") as stream:
+            raw = tomllib.load(stream)
+        entries = raw.get("scenarios", [])
+        if not isinstance(entries, list):
+            raise ValueError("scenarios.toml 必须使用 [[scenarios]] 表")
+        scenarios: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("场景条目必须是 TOML 表")
+            scenario_id = entry.get("id")
+            if (
+                not isinstance(scenario_id, str)
+                or not _SCENARIO_ID.fullmatch(scenario_id)
+                or scenario_id in seen
+            ):
+                raise ValueError(f"场景 id 无效或重复: {scenario_id!r}")
+            label, description = entry.get("label"), entry.get("description")
+            profiles = {kind: entry.get(kind) for kind in _PROFILES}
+            if not isinstance(label, str) or not label or not isinstance(description, str):
+                raise ValueError(f"场景 {scenario_id} 缺少 label/description")
+            for kind, name in profiles.items():
+                if not isinstance(name, str):
+                    raise ValueError(f"场景 {scenario_id} 缺少 {kind} 配置")
+                self._profile_path(kind, name)
+            seen.add(scenario_id)
+            scenarios.append(
+                {
+                    "id": scenario_id,
+                    "label": label,
+                    "description": description,
+                    "profiles": profiles,
+                }
+            )
+        return scenarios
+
+    def _scenario(self, scenario_id: str) -> dict[str, Any]:
+        for scenario in self.list_scenarios():
+            if scenario["id"] == scenario_id:
+                return scenario
+        raise ApiError(400, f"未知实验场景: {scenario_id}")
+
+    def _prepare_run(self, data: dict[str, Any]) -> dict[str, Any]:
+        names: dict[str, str] = {}
+        texts: dict[str, str] = {}
+        errors: list[dict[str, str]] = []
+        source_paths: dict[str, Path] = {}
+        for kind in _PROFILES:
+            name = data.get(f"{kind}_name")
+            text = data.get(f"{kind}_text")
+            if not isinstance(name, str) or not isinstance(text, str):
+                errors.append({"kind": kind, "message": f"缺少 {kind} 配置名称或 TOML 文本"})
+                continue
+            try:
+                source_paths[kind] = self._profile_path(kind, name)
+            except ApiError as exc:
+                errors.append({"kind": kind, "message": str(exc)})
+                continue
+            names[kind], texts[kind] = name, text
+
+        scenario_id = data.get("scenario_id") or None
+        if scenario_id is not None:
+            try:
+                scenario = self._scenario(scenario_id)
+                if names != scenario["profiles"]:
+                    errors.append(
+                        {"kind": "scenario", "message": "预设场景的 TX/信道/仿真配置不可拆分修改"}
+                    )
+                for kind, source_path in source_paths.items():
+                    if texts.get(kind) != source_path.read_text(encoding="utf-8"):
+                        errors.append(
+                            {"kind": kind, "message": "预设配置已被修改；请切换到高级配置模式"}
+                        )
+            except (ApiError, OSError, ValueError) as exc:
+                errors.append({"kind": "scenario", "message": str(exc)})
+        if errors:
+            return {
+                "valid": False,
+                "errors": errors,
+                "names": names,
+                "texts": texts,
+                "scenario_id": scenario_id,
+            }
+
+        temporary_paths: dict[str, Path] = {}
+        settings: dict[str, Any] = {}
+        try:
+            for kind, text in texts.items():
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    suffix=".toml",
+                    prefix=".web-preflight-",
+                    dir=self.config_dir,
+                    delete=False,
+                ) as stream:
+                    stream.write(text)
+                    temporary_paths[kind] = Path(stream.name)
+            parsers = [
+                ("tx", TxSettings),
+                ("channel", ChannelSettings),
+                ("simulation", BlerSettings),
+            ]
+            for kind, parser in parsers:
+                try:
+                    settings[kind] = parser.from_toml(temporary_paths[kind])
+                except Exception as exc:
+                    errors.append({"kind": kind, "message": str(exc)})
+            tx_settings = settings.get("tx")
+            channel_settings = settings.get("channel")
+            simulation_settings = settings.get("simulation")
+            if channel_settings is not None:
+                try:
+                    channel_settings.validate_transmitter(tx_settings)
+                except (ValueError, TypeError) as exc:
+                    errors.append({"kind": "channel", "message": str(exc)})
+            if tx_settings is not None and channel_settings is not None and simulation_settings is not None:
+                stream_count = len(tx_settings.users) * tx_settings.pusch.num_layers
+                rx_antennas = (
+                    channel_settings.antennas.rx_num_rows
+                    * channel_settings.antennas.rx_num_cols
+                )
+                if "k-best" in simulation_settings.detectors and rx_antennas < stream_count:
+                    errors.append(
+                        {
+                            "kind": "simulation",
+                            "message": (
+                                f"K-best 要求接收天线数不少于总流数；当前 {rx_antennas} RX / "
+                                f"{stream_count} 流"
+                            ),
+                        }
+                    )
+                if "dmrs-lmmse" in simulation_settings.channel_estimators_for_sweep:
+                    try:
+                        max_delay_spread_s = (
+                            simulation_settings.max_delay_spread_s
+                            if simulation_settings.max_delay_spread_s is not None
+                            else channel_settings.channel.max_delay_spread_s
+                        )
+                        if not simulation_settings.dmrs_tap_power_prior_path:
+                            raise ValueError("DMRS-LMMSE 缺少 tap-power prior")
+                        prior_path = Path(simulation_settings.dmrs_tap_power_prior_path)
+                        if not prior_path.is_file():
+                            raise ValueError(f"DMRS prior 文件不存在: {prior_path}")
+                        transmitter = NrPuschTx(tx_settings, device="cpu")
+                        compatibility = dmrs_prior_compatibility(
+                            tx_settings,
+                            channel_settings,
+                            l_min=simulation_settings.l_min,
+                            max_delay_spread_s=max_delay_spread_s,
+                            fft_size=transmitter._tx_freq.resource_grid.fft_size,
+                            sample_rate_hz=transmitter.sample_rate_hz,
+                        )
+                        load_dmrs_tap_power_prior(
+                            prior_path,
+                            expected_compatibility=compatibility,
+                            device="cpu",
+                        )
+                        texts["simulation"] = self._pin_prior_path(
+                            texts["simulation"], prior_path.resolve()
+                        )
+                    except Exception as exc:
+                        errors.append({"kind": "simulation", "message": str(exc)})
+        finally:
+            for path in temporary_paths.values():
+                path.unlink(missing_ok=True)
+
+        return {
+            "valid": not errors,
+            "errors": errors,
+            "names": names,
+            "texts": texts,
+            "scenario_id": scenario_id,
+            "settings": settings,
+        }
+
+    @staticmethod
+    def _pin_prior_path(text: str, prior_path: Path) -> str:
+        lines = text.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            content = line.rstrip("\r\n")
+            if re.match(r"^\s*dmrs_tap_power_prior_path\s*=", content):
+                newline = line[len(content):]
+                assignment = content.split("=", 1)[0].rstrip()
+                lines[index] = f'{assignment} = {json.dumps(str(prior_path))}{newline}'
+                return "".join(lines)
+        raise ValueError("仿真配置缺少 dmrs_tap_power_prior_path")
+
+    def validate_run(self, data: dict[str, Any]) -> dict[str, Any]:
+        prepared = self._prepare_run(data)
+        return {
+            "valid": prepared["valid"],
+            "errors": prepared["errors"],
+            "scenario_id": prepared["scenario_id"],
+            "profiles": prepared["names"],
+        }
+
+    def compatible_profiles(self, kind: str, data: dict[str, Any]) -> dict[str, Any]:
+        if kind not in _PROFILES:
+            raise ApiError(400, "未知配置类型")
+        results: dict[str, dict[str, Any]] = {}
+        for name in self.list_configs()[kind]:
+            candidate = dict(data)
+            candidate["scenario_id"] = None
+            candidate[f"{kind}_name"] = name
+            candidate[f"{kind}_text"] = (
+                data.get(f"{kind}_text")
+                if name == data.get(f"{kind}_name")
+                else self.get_config(kind, name)["text"]
+            )
+            validation = self.validate_run(candidate)
+            results[name] = {
+                "compatible": validation["valid"],
+                "errors": validation["errors"],
+            }
+        return {"kind": kind, "profiles": results}
+
     def get_config(self, kind: str, name: str) -> dict[str, str]:
         return {"kind": kind, "name": name, "text": self._profile_path(kind, name).read_text(encoding="utf-8")}
 
@@ -155,31 +379,22 @@ class SimulationWebApp:
         os.replace(staging, path)
 
     def create_run(self, data: dict[str, Any]) -> dict[str, Any]:
-        names: dict[str, str] = {}
-        texts: dict[str, str] = {}
-        for kind in _PROFILES:
-            name = data.get(f"{kind}_name")
-            text = data.get(f"{kind}_text")
-            if not isinstance(name, str) or not isinstance(text, str):
-                raise ApiError(400, f"缺少 {kind} 配置名称或 TOML 文本")
-            self._profile_path(kind, name)
-            names[kind], texts[kind] = name, text
-
+        prepared = self._prepare_run(data)
+        if not prepared["valid"]:
+            details = "; ".join(
+                f'{item["kind"]}: {item["message"]}' for item in prepared["errors"]
+            )
+            raise ApiError(400, f"配置组合不兼容: {details}")
+        names = prepared["names"]
+        texts = prepared["texts"]
+        simulation_settings: BlerSettings = prepared["settings"]["simulation"]
         job_id = uuid4().hex[:12]
         directory = self._job_dir(job_id)
         directory.mkdir()
         try:
-            simulation_settings: BlerSettings | None = None
             for kind, text in texts.items():
                 path = directory / f"{kind}.toml"
                 path.write_text(text, encoding="utf-8")
-                self._validate(kind, path)
-                if kind == "simulation":
-                    simulation_settings = BlerSettings.from_toml(path)
-            ChannelSettings.from_toml(directory / "channel.toml").validate_transmitter(
-                TxSettings.from_toml(directory / "tx.toml")
-            )
-            assert simulation_settings is not None
             job = {
                 "id": job_id,
                 "status": "queued",
@@ -187,6 +402,7 @@ class SimulationWebApp:
                 "started_at": None,
                 "finished_at": None,
                 "error": None,
+                "scenario_id": prepared["scenario_id"],
                 "config_names": names,
                 "total_points": (
                     len(simulation_settings.channel_estimators_for_sweep)
@@ -733,6 +949,13 @@ def make_handler(app: SimulationWebApp) -> type[BaseHTTPRequestHandler]:
                     self._send(200, (static_dir / name).read_bytes(), mime)
                 elif method == "GET" and path == "/api/configs":
                     self._json(200, app.list_configs())
+                elif method == "GET" and path == "/api/scenarios":
+                    self._json(200, {"scenarios": app.list_scenarios()})
+                elif method == "POST" and path == "/api/validate-run":
+                    self._json(200, app.validate_run(self._body()))
+                elif method == "POST" and path == "/api/profile-compatibility":
+                    body = self._body()
+                    self._json(200, app.compatible_profiles(body.get("kind"), body))
                 elif method == "GET" and path == "/api/rx/configs":
                     self._json(200, {"configs": app.list_configs()["rx"]})
                 elif method == "GET" and path == "/api/rx/defaults":

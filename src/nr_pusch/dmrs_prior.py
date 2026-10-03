@@ -29,9 +29,13 @@ def dmrs_prior_compatibility(
 ) -> dict[str, Any]:
     """Return the exact run geometry against which a prior was calibrated."""
     _, l_max = time_lag_discrete_time_channel(sample_rate_hz, max_delay_spread_s)
+    tx_pusch = asdict(tx_settings.pusch)
+    # MCS changes transport-block coding, not the channel tap-power prior.
+    tx_pusch.pop("mcs_table")
+    tx_pusch.pop("mcs_index")
     compatibility = {
         "tx_carrier": asdict(tx_settings.carrier),
-        "tx_pusch": asdict(tx_settings.pusch),
+        "tx_pusch": tx_pusch,
         "channel": asdict(channel_settings),
         "l_min": int(l_min),
         "l_max": int(l_max),
@@ -40,6 +44,20 @@ def dmrs_prior_compatibility(
         "sample_rate_hz": int(sample_rate_hz),
     }
     return json.loads(json.dumps(compatibility))
+
+
+def _compatibility_without_mcs(compatibility: Any) -> Any:
+    if not isinstance(compatibility, dict):
+        return compatibility
+    normalized = dict(compatibility)
+    tx_pusch = compatibility.get("tx_pusch")
+    if isinstance(tx_pusch, dict):
+        normalized["tx_pusch"] = {
+            key: value
+            for key, value in tx_pusch.items()
+            if key not in {"mcs_table", "mcs_index"}
+        }
+    return normalized
 
 
 def save_dmrs_tap_power_prior(
@@ -100,7 +118,9 @@ def load_dmrs_tap_power_prior(
     if not isinstance(metadata, dict) or metadata.get("format_version") != _FORMAT_VERSION:
         raise ValueError("DMRS prior 格式版本不支持")
     compatibility = metadata.get("compatibility")
-    if compatibility != expected_compatibility:
+    if _compatibility_without_mcs(compatibility) != _compatibility_without_mcs(
+        expected_compatibility
+    ):
         raise ValueError("DMRS tap-power prior 与当前 TX/CDL/抽头窗口/采样配置不兼容")
     if not isinstance(metadata.get("training_seed"), int):
         raise ValueError("DMRS prior 缺少有效 training_seed")

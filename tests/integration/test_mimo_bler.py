@@ -54,8 +54,6 @@ class MimoBlerTest(unittest.TestCase):
             max_frames_per_snr=2,
             target_block_errors=8,
             seed=4,
-            l_min=-2,
-            max_delay_spread_s=0.3e-6,
         )
         sweep = simulate_bler(tx_settings, channel, multi_snr, device="cpu")
         self.assertEqual(len(sweep.points), 2)

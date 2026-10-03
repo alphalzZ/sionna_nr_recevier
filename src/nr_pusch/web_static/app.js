@@ -5,6 +5,12 @@ const state = {
   selected: { tx: "", channel: "", simulation: "" },
   texts: { tx: "", channel: "", simulation: "" },
   savedTexts: { tx: "", channel: "", simulation: "" },
+  selectedScenario: "",
+  profileCompatibility: { tx: null, channel: null, simulation: null },
+  validation: null,
+  validationTimer: null,
+  validationSerial: 0,
+  runSubmitting: false,
   activeKind: "tx",
   currentJob: null,
   runs: [],
@@ -114,37 +120,190 @@ async function loadConfig(kind, name, force = false) {
 function populateProfileSelect() {
   const select = $("profile-select");
   select.replaceChildren();
-  const names = state.configs[state.activeKind] || [];
+  const kind = state.activeKind;
+  const names = state.configs[kind] || [];
+  const availability = state.profileCompatibility[kind] || {};
   if (!names.length) {
     const option = document.createElement("option");
     option.textContent = "无可用配置";
     option.value = "";
     select.append(option);
     select.disabled = true;
-  } else {
-    names.forEach((name) => {
-      const option = document.createElement("option");
-      option.value = name;
-      option.textContent = name;
-      select.append(option);
-    });
-    select.disabled = false;
-    select.value = state.selected[state.activeKind] || names[0];
+    return;
   }
+  names.forEach((name) => {
+    const option = document.createElement("option");
+    const result = availability[name];
+    option.value = name;
+    option.textContent = result?.compatible === false ? `${name} · 不兼容` : name;
+    option.title = result?.errors?.map((error) => error.message).join("；") || "";
+    option.disabled = result?.compatible === false && name !== state.selected[kind];
+    select.append(option);
+  });
+  select.disabled = false;
+  select.value = state.selected[kind] || names[0];
+}
+
+function currentRunPayload() {
+  return {
+    scenario_id: state.selectedScenario,
+    tx_name: state.selected.tx,
+    channel_name: state.selected.channel,
+    simulation_name: state.selected.simulation,
+    tx_text: state.texts.tx,
+    channel_text: state.texts.channel,
+    simulation_text: state.texts.simulation,
+  };
+}
+
+function populateScenarioSelect() {
+  const select = $("scenario-select");
+  select.replaceChildren();
+  const custom = document.createElement("option");
+  custom.value = "";
+  custom.textContent = "高级自定义组合";
+  select.append(custom);
+  state.scenarios.forEach((scenario) => {
+    const option = document.createElement("option");
+    option.value = scenario.id;
+    option.textContent = scenario.label;
+    select.append(option);
+  });
+  select.value = state.selectedScenario;
+}
+
+function renderCompatibility(result) {
+  const status = $("compatibility-status");
+  const button = $("run-button");
+  status.replaceChildren();
+  if (!result) {
+    status.className = "compatibility-status pending";
+    status.textContent = "正在检查 TX、信道、仿真配置组合…";
+    button.disabled = true;
+    return;
+  }
+  const errors = Array.isArray(result.errors) ? result.errors : [];
+  status.className = `compatibility-status ${result.valid ? "valid" : "invalid"}`;
+  const heading = document.createElement("strong");
+  heading.textContent = result.valid ? "兼容性检查通过" : "当前组合不可运行";
+  status.append(heading);
+  if (errors.length) {
+    const list = document.createElement("ul");
+    const kindNames = {
+      tx: "发射机",
+      channel: "信道",
+      simulation: "仿真",
+      scenario: "场景",
+    };
+    errors.forEach((error) => {
+      const item = document.createElement("li");
+      item.textContent = `${kindNames[error.kind] || error.kind}：${error.message}`;
+      list.append(item);
+    });
+    status.append(list);
+  }
+  button.disabled = !result.valid || state.runSubmitting;
+}
+
+async function validateCurrentRun() {
+  const serial = ++state.validationSerial;
+  state.validation = null;
+  renderCompatibility(null);
+  const result = await api("/api/validate-run", {
+    method: "POST",
+    body: JSON.stringify(currentRunPayload()),
+  });
+  if (serial !== state.validationSerial) return null;
+  state.validation = result;
+  renderCompatibility(result);
+  return result;
+}
+
+async function refreshProfileCompatibility() {
+  if (!$("advanced-config").open) return;
+  const kind = state.activeKind;
+  const result = await api("/api/profile-compatibility", {
+    method: "POST",
+    body: JSON.stringify({ ...currentRunPayload(), scenario_id: "", kind }),
+  });
+  state.profileCompatibility[kind] = result.profiles || {};
+  populateProfileSelect();
+}
+
+function scheduleValidation(refreshProfiles = false) {
+  clearTimeout(state.validationTimer);
+  state.validationTimer = setTimeout(async () => {
+    try {
+      await validateCurrentRun();
+      if (refreshProfiles) await refreshProfileCompatibility();
+    } catch (error) {
+      state.validation = null;
+      renderCompatibility({
+        valid: false,
+        errors: [{ kind: "validation", message: error.message }],
+      });
+    }
+  }, 250);
+}
+
+function hasUnsavedConfigChanges() {
+  return Object.keys(state.texts).some((kind) => state.texts[kind] !== state.savedTexts[kind]);
+}
+
+function profileBundleLabel(profiles) {
+  return `TX ${profiles.tx || "未选择"} · 信道 ${profiles.channel || "未选择"} · 仿真 ${profiles.simulation || "未选择"}`;
+}
+
+function useCustomCombination() {
+  state.selectedScenario = "";
+  populateScenarioSelect();
+  $("scenario-description").textContent = `高级自定义组合；${profileBundleLabel({
+    ...state.selected,
+  })}。更改任何配置后都会重新检查兼容性。`;
+}
+
+async function applyScenario(scenarioId) {
+  const scenario = state.scenarios.find((item) => item.id === scenarioId);
+  if (!scenario) return;
+  if (hasUnsavedConfigChanges() && !window.confirm("切换场景会丢弃未保存的 TOML 修改。继续吗？")) {
+    $("scenario-select").value = state.selectedScenario;
+    return;
+  }
+  state.selectedScenario = scenario.id;
+  state.selected = {
+    tx: scenario.profiles.tx,
+    channel: scenario.profiles.channel,
+    simulation: scenario.profiles.simulation,
+  };
+  state.profileCompatibility = { tx: null, channel: null, simulation: null };
+  $("scenario-description").textContent = `${scenario.description} 配置：${profileBundleLabel(scenario.profiles)}`;
+  populateScenarioSelect();
+  populateProfileSelect();
+  const loads = ["tx", "channel", "simulation"].map((kind) =>
+    loadConfig(kind, state.selected[kind], true),
+  );
+  await Promise.all(loads);
+  editor.value = state.texts[state.activeKind] || "";
+  updateLines();
+  updateDirty();
+  await validateCurrentRun();
+  if ($("advanced-config").open) await refreshProfileCompatibility();
 }
 
 async function initConfigs() {
-  const configs = await api("/api/configs");
+  const [configs, scenarioPayload] = await Promise.all([
+    api("/api/configs"),
+    api("/api/scenarios"),
+  ]);
   ["tx", "channel", "simulation"].forEach((kind) => {
     state.configs[kind] = Array.isArray(configs[kind]) ? configs[kind] : [];
-    state.selected[kind] = kind === "simulation" && state.configs[kind].includes("bler_smoke.toml")
-      ? "bler_smoke.toml" : state.configs[kind][0] || "";
   });
-  populateProfileSelect();
-  await Promise.all(["tx", "channel", "simulation"].map((kind) => loadConfig(kind, state.selected[kind], true)));
-  editor.value = state.texts[state.activeKind];
-  updateLines();
-  updateDirty();
+  state.scenarios = Array.isArray(scenarioPayload.scenarios) ? scenarioPayload.scenarios : [];
+  if (!state.scenarios.length) throw new Error("没有可用的兼容场景；请检查 configs/scenarios.toml");
+  state.selectedScenario = state.scenarios[0].id;
+  populateScenarioSelect();
+  $("run-button").disabled = true;
+  await applyScenario(state.selectedScenario);
 }
 
 async function switchKind(kind) {
@@ -160,6 +319,8 @@ async function switchKind(kind) {
   editor.value = state.texts[kind] || "";
   updateLines();
   updateDirty();
+  await validateCurrentRun();
+  await refreshProfileCompatibility();
 }
 
 async function saveCurrentConfig() {
@@ -175,33 +336,37 @@ async function saveCurrentConfig() {
     editor.value = state.texts[kind];
     updateDirty();
     showAlert(`已保存 ${name}`, false);
+    await validateCurrentRun();
+    await refreshProfileCompatibility();
   } catch (error) { showAlert(error.message); }
   finally { button.disabled = false; }
 }
 
 async function startRun() {
+  if (state.runSubmitting) return;
   state.texts[state.activeKind] = editor.value;
-  if (!state.selected.tx || !state.selected.channel || !state.selected.simulation) return showAlert("请先为三类配置各选择一个文件。", true);
   const button = $("run-button");
+  state.runSubmitting = true;
   button.disabled = true;
   try {
+    const validation = await validateCurrentRun();
+    if (!validation?.valid) {
+      showAlert("配置组合未通过预检；请先按提示修正。", true);
+      return;
+    }
     const job = await api("/api/runs", {
       method: "POST",
-      body: JSON.stringify({
-        tx_name: state.selected.tx,
-        channel_name: state.selected.channel,
-        simulation_name: state.selected.simulation,
-        tx_text: state.texts.tx,
-        channel_text: state.texts.channel,
-        simulation_text: state.texts.simulation,
-      }),
+      body: JSON.stringify(currentRunPayload()),
     });
     state.currentJob = job;
     renderJob(job);
     await loadRuns();
     schedulePoll(250);
   } catch (error) { showAlert(error.message); }
-  finally { button.disabled = false; }
+  finally {
+    state.runSubmitting = false;
+    button.disabled = !state.validation?.valid;
+  }
 }
 
 function renderJob(job) {
@@ -858,10 +1023,18 @@ function drawChart(points) {
   [...groups.entries()].forEach(([name, values], index) => {
     const color = seriesColors[index % seriesColors.length];
     values.sort((a, b) => Number(a.snr_db) - Number(b.snr_db));
-    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2.2; ctx.beginPath();
-    values.forEach((point, i) => { const px = x(Number(point.snr_db)), py = y(plotBler(point)); if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); }); ctx.stroke();
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    values.forEach((point, i) => { const px = x(Number(point.snr_db)), py = y(plotBler(point)); if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); });
+    ctx.stroke();
     values.forEach((point) => { const px = x(Number(point.snr_db)), py = y(plotBler(point)); ctx.beginPath(); ctx.arc(px, py, 3.5, 0, Math.PI * 2); ctx.fillStyle = Number(point.bler) === 0 ? "#fffefa" : color; ctx.fill(); ctx.strokeStyle = color; ctx.lineWidth = 1.4; ctx.stroke(); });
-    const item = document.createElement("span"); const swatch = document.createElement("i"); swatch.style.background = color; const text = document.createElement("b"); text.textContent = name; item.append(swatch, text); legend.append(item);
+    const item = document.createElement("span");
+    const swatch = document.createElement("i");
+    swatch.style.background = color;
+    const text = document.createElement("b");
+    text.textContent = name;
+    item.append(swatch, text);
+    legend.append(item);
   });
 }
 
@@ -923,6 +1096,17 @@ $("rx-detector").addEventListener("change", (event) => {
   }
 });
 $("rx-detector").dispatchEvent(new Event("change"));
+$("scenario-select").addEventListener("change", (event) => {
+  if (event.target.value) {
+    applyScenario(event.target.value).catch((error) => showAlert(error.message));
+  } else if (state.selectedScenario) {
+    useCustomCombination();
+    scheduleValidation(true);
+  }
+});
+$("advanced-config").addEventListener("toggle", () => {
+  if ($("advanced-config").open) refreshProfileCompatibility().catch((error) => showAlert(error.message));
+});
 $("profile-select").addEventListener("change", async (event) => {
   const kind = state.activeKind;
   if (editor.value !== state.savedTexts[kind] && !window.confirm("当前配置尚未保存，切换文件会丢失修改。确定继续吗？")) {
@@ -931,9 +1115,24 @@ $("profile-select").addEventListener("change", async (event) => {
   }
   state.texts[kind] = editor.value;
   state.selected[kind] = event.target.value;
-  try { await loadConfig(kind, event.target.value, true); } catch (error) { showAlert(error.message); }
+  state.profileCompatibility[kind] = null;
+  useCustomCombination();
+  try {
+    await loadConfig(kind, event.target.value, true);
+    await validateCurrentRun();
+    await refreshProfileCompatibility();
+  } catch (error) { showAlert(error.message); }
 });
-editor.addEventListener("input", () => { state.texts[state.activeKind] = editor.value; updateLines(); updateDirty(); });
+editor.addEventListener("input", () => {
+  state.texts[state.activeKind] = editor.value;
+  if (state.selectedScenario) useCustomCombination();
+  updateLines();
+  updateDirty();
+  scheduleValidation();
+});
+editor.addEventListener("blur", () => {
+  if ($("advanced-config").open) refreshProfileCompatibility().catch((error) => showAlert(error.message));
+});
 editor.addEventListener("scroll", () => { $("line-numbers").scrollTop = editor.scrollTop; });
 editor.addEventListener("keydown", (event) => {
   if (event.key === "Tab") { event.preventDefault(); const start = editor.selectionStart, end = editor.selectionEnd; editor.setRangeText("  ", start, end, "end"); editor.dispatchEvent(new Event("input")); }

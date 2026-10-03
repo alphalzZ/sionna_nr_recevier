@@ -142,6 +142,26 @@ class DmrsTapLmmseTest(unittest.TestCase):
             )
             torch.testing.assert_close(loaded, prior)
             self.assertEqual(metadata["training_seed"], 42)
+            legacy_compatibility = {
+                **compatibility,
+                "tx_pusch": {
+                    **compatibility["tx_pusch"],
+                    "mcs_table": self.settings.pusch.mcs_table,
+                    "mcs_index": self.settings.pusch.mcs_index,
+                },
+            }
+            legacy_prior_path = Path(directory) / "legacy_prior.npz"
+            save_dmrs_tap_power_prior(
+                legacy_prior_path,
+                prior,
+                compatibility=legacy_compatibility,
+                training_seed=42,
+                training_realizations=8,
+            )
+            legacy_prior, _ = load_dmrs_tap_power_prior(
+                legacy_prior_path, expected_compatibility=compatibility
+            )
+            torch.testing.assert_close(legacy_prior, prior)
             mismatch = {**compatibility, "l_min": compatibility["l_min"] - 1}
             with self.assertRaisesRegex(ValueError, "不兼容"):
                 load_dmrs_tap_power_prior(

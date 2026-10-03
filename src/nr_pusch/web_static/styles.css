@@ -59,6 +59,21 @@ button { color: inherit; }
 .panel-heading > div:first-child { display: flex; align-items: center; gap: 13px; }.panel-heading h2 { margin: 0; font-size: 19px; letter-spacing: -.025em; }.panel-heading p { color: var(--muted); font-size: 12px; margin: 0; }
 .step { font: 700 10px ui-monospace, monospace; color: #6b7d36; background: #eff8d7; border: 1px solid #d7e8a6; border-radius: 6px; padding: 5px; }
 
+
+.scenario-picker { padding: 20px 24px 12px; display: grid; grid-template-columns: minmax(180px, .45fr) 1fr; gap: 7px 16px; align-items: center; }
+.scenario-picker label { color: var(--muted); font-size: 11px; font-weight: 700; }
+.scenario-picker select { min-width: 0; border: 1px solid #ced5d0; border-radius: 8px; background: white; padding: 11px 12px; color: var(--ink); }
+.scenario-picker p { grid-column: 2; margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.compatibility-status { margin: 0 24px 16px; padding: 12px 15px; border: 1px solid var(--line); border-radius: 9px; font-size: 11px; line-height: 1.55; }
+.compatibility-status.valid { color: #24683b; background: #eff8f1; border-color: #c7e4cf; }
+.compatibility-status.invalid { color: #852d28; background: #fae7e3; border-color: #efb9b3; }
+.compatibility-status.pending { color: var(--muted); background: #f7f7f3; }
+.compatibility-status ul { margin: 6px 0 0; padding-left: 18px; }
+.advanced-config { border-top: 1px solid var(--line); }
+.advanced-config > summary { padding: 15px 24px; color: var(--muted); background: #f8f8f5; cursor: pointer; font-size: 12px; font-weight: 650; }
+.advanced-config[open] > summary { border-bottom: 1px solid var(--line); color: var(--ink); background: #f2f4ee; }
+.advanced-config-body { padding-bottom: 20px; }
+.editor-toolbar select option:disabled { color: #a16e66; }
 .config-tabs { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--line); }
 .config-tab { background: #fafaf7; border: 0; border-right: 1px solid var(--line); padding: 16px; cursor: pointer; color: var(--muted); font-weight: 600; position: relative; }.config-tab:last-child { border-right: 0; }
 .config-tab span { font: 700 10px ui-monospace, monospace; background: #e9ece7; border-radius: 4px; padding: 4px 5px; margin-right: 8px; }
@@ -166,4 +181,11 @@ footer { width: min(1240px, calc(100% - 40px)); margin: 0 auto; padding: 25px 4p
 
 @media (max-width: 760px) {
   .topbar-status span:not(.live-dot) { display: none; }.workspace { width: min(100% - 24px, 1240px); }.workflow-tabs { width: 100%; margin-top: 14px; }.workflow-tab { flex: 1; }.hero { padding: 50px 4px 38px; min-height: 360px; flex-direction: column; align-items: stretch; gap: 30px; }.hero-actions { text-align: left; }.panel-heading { padding: 18px; }.panel-heading > p { display: none; }.config-tab { padding: 13px 8px; font-size: 12px; }.config-tab span { display: none; }.editor-toolbar { flex-wrap: wrap; }.editor-toolbar label { width: 100%; }.editor-toolbar select { min-width: 0; flex: 1; }.editor-toolbar .button-quiet { margin-left: 0; }.editor-shell { height: 390px; }.run-summary { grid-template-columns: 1fr 1fr; padding: 18px; }.run-summary div:nth-child(2) { border: 0; }.canvas-wrap { height: 300px; padding: 7px; }.chart-title { align-items: start; gap: 15px; }.history-item { grid-template-columns: 1fr auto; }.history-item > div:nth-child(n+2):nth-child(-n+4) { display: none; }.rx-hero { min-height: 330px; padding: 45px 4px 35px; flex-direction: column; align-items: stretch; }.rx-hero-badge { min-width: 0; }.rx-form-grid { grid-template-columns: 1fr; padding: 18px; }.field-row { grid-template-columns: 1fr; }.rx-config-block { min-height: 320px; }.rx-submit-bar { align-items: stretch; flex-direction: column; padding: 16px 18px; }.rx-submit-bar .button { width: 100%; }.rx-summary-grid { grid-template-columns: 1fr 1fr; }.rx-summary-grid div:nth-child(2) { border-right: 0; }.rx-summary-grid div:nth-child(-n+2) { border-bottom: 1px solid var(--line); }.rx-result-grid { grid-template-columns: 1fr; }.constellation-grid { grid-template-columns: 1fr; }footer { width: calc(100% - 24px); }
+}
+
+@media (max-width: 760px) {
+  .scenario-picker { grid-template-columns: 1fr; padding: 16px 18px 10px; }
+  .scenario-picker p { grid-column: 1; }
+  .compatibility-status { margin-right: 18px; margin-left: 18px; }
+  .advanced-config > summary { padding-right: 18px; padding-left: 18px; }
 }

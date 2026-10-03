@@ -22,7 +22,7 @@ Current package metadata is `nr-pusch-lab` 0.1.0, Python `>=3.11`, Sionna 2.0.1 
 cd /home/le-lei/workspace/test/sionna_nr_recevier
 export PYTHONPATH=src
 BASE=outputs/release-0.1-baseline
-mkdir -p "$BASE"/{configs,telemetry,logs,functional/{tx,channel,rx,web-runs},performance/{dft_4ue,cp_2ue_2layer},estimator-validation/{dft_4ue,cp_2ue_2layer},web-configs}
+mkdir -p "$BASE"/{configs,telemetry,logs,functional/{tx,channel,rx,web-runs},performance/{dft_4ue,cp_2ue_2layer},estimator-validation/{dft_4ue,cp_2ue_2layer}}
 git rev-parse HEAD > "$BASE/source_revision.txt"
 git diff --binary HEAD -- src pyproject.toml > "$BASE/source.patch"
 ```
@@ -72,11 +72,11 @@ Exercise RX and detector coverage on GPU:
 
 ### 5. Live web surface
 
-Copy `pusch_4ue.toml`, `cdl_38_901_4x4.toml` and `rx_pusch_4ue.toml` into `web-configs/`; create a copied `bler_release_smoke.toml` with one SNR `[25.0]`, `device="cuda:0"`, `batch_size=1`, `max_frames_per_snr=1`, `target_block_errors=1000000`, and `stop_at_zero_bler=false`. Start:
+Use the existing root `configs/` profiles directly; `configs/bler_release_smoke.toml` supplies the one-SNR GPU browser smoke parameters. Start:
 
 ```bash
 nr-pusch-web --host 127.0.0.1 --port 8765 \
-  --config-dir "$BASE/web-configs" --runs-dir "$BASE/functional/web-runs"
+  --config-dir configs --runs-dir "$BASE/functional/web-runs"
 ```
 
 Use a real Chromium browser session on the dashboard (not API-only evidence): load dashboard; list/read/save a temporary copied profile; submit a one-frame GPU BLER run; poll to completion; download and validate its CSV and JSON; decode the H5 fixture through the RX endpoint with `device="cuda:0"`; download and inspect decoded NPZ and JSON. Capture browser-visible proof, server logs and download artifacts under `functional/web/`. Stop only the server launched for this test after capturing logs.
@@ -92,7 +92,7 @@ nr-pusch-estimator-validation --tx-config <TX-snapshot> \
   --device cuda:0 --prior-realizations 32 --frames-per-snr <cap>
 ```
 
-Use `--frames-per-snr 16` unless 8 is selected before any measured performance run; the same choice applies to both profiles. Keep the configured 64-frame high-SNR check. Preserve summary JSON, per-frame NPZ and prior NPZ in each profile directory. Point each measured profile only at its own generated prior; do not reuse a prior across TX/CDL/window/FFT/sample-rate changes. Run the strict prior compatibility path before the BLER matrix. These reduced runs are diagnostic and do not establish the full registered statistical acceptance gate; the checked-in full validation profile historically took 74m56 on an RTX 3060.
+Use `--frames-per-snr 16` unless 8 is selected before any measured performance run; the same choice applies to both profiles. Keep the configured 64-frame high-SNR check. Preserve summary JSON, per-frame NPZ and prior NPZ in each profile directory. Point each measured profile at a prior calibrated for its TX/CDL, tap-window, FFT and sample-rate compatibility settings; changing only MCS table/index does not invalidate the channel tap-power prior, while any other compatibility-field mismatch remains an error. Run the strict prior compatibility path before the BLER matrix. These reduced runs are diagnostic and do not establish the full registered statistical acceptance gate; the checked-in full validation profile historically took 74m56 on an RTX 3060.
 
 ### 7. Frozen workload choice
 

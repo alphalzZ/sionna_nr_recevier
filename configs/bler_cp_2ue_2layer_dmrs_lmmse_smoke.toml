@@ -1,0 +1,19 @@
+[bler]
+snr_db = [20,25,30,35,40]
+batch_size = 20
+max_frames_per_snr = 500
+target_block_errors = 100
+seed = 20260924
+num_decoder_iterations = 20
+channel_estimator = "dmrs-lmmse"
+channel_estimators = ["dmrs", "dmrs-lmmse", "perfect"]
+detector = "lmmse"
+detectors = ["k-best"]
+detector_parameters = { "k-best" = 16, "ep" = 10, "mmse-pic" = 4, "soft-mmse-pic" = 4 }
+detector_damping = 0.25
+device = "cuda:0"
+channel_domain = "frequency"
+l_min = -6
+max_delay_spread_s = 3e-6
+stop_at_zero_bler = false
+dmrs_tap_power_prior_path = "../outputs/release-0.1-baseline/estimator-validation/cp_2ue_2layer/validation.prior.npz"

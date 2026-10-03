@@ -2,6 +2,7 @@
 
 from http.server import ThreadingHTTPServer
 import json
+import numpy as np
 from pathlib import Path
 import shutil
 import tempfile
@@ -9,10 +10,12 @@ from threading import Event, Thread
 from urllib.request import Request, urlopen
 import unittest
 
+from nr_pusch.channel_config import ChannelSettings
 from nr_pusch.config import TxSettings
+from nr_pusch.dmrs_prior import dmrs_prior_compatibility, save_dmrs_tap_power_prior
 from nr_pusch.simulation_config import BlerSettings
-from nr_pusch.web import SimulationWebApp, make_handler
-
+from nr_pusch.transmitter import NrPuschTx
+from nr_pusch.web import ApiError, SimulationWebApp, make_handler
 
 ROOT = Path(__file__).parents[2]
 TX_CONFIG = ROOT / "configs" / "pusch_4ue.toml"
@@ -28,6 +31,34 @@ class WebEstimatorMatrixTest(unittest.TestCase):
             config_dir.mkdir()
             for path in (TX_CONFIG, CHANNEL_CONFIG, SIMULATION_CONFIG):
                 shutil.copyfile(path, config_dir / path.name)
+            tx_settings = TxSettings.from_toml(TX_CONFIG)
+            channel_settings = ChannelSettings.from_toml(CHANNEL_CONFIG)
+            original_simulation = BlerSettings.from_toml(SIMULATION_CONFIG)
+            transmitter = NrPuschTx(tx_settings, device="cpu")
+            max_delay_spread_s = (
+                original_simulation.max_delay_spread_s
+                or channel_settings.channel.max_delay_spread_s
+            )
+            compatibility = dmrs_prior_compatibility(
+                tx_settings,
+                channel_settings,
+                l_min=original_simulation.l_min,
+                max_delay_spread_s=max_delay_spread_s,
+                fft_size=transmitter._tx_freq.resource_grid.fft_size,
+                sample_rate_hz=transmitter.sample_rate_hz,
+            )
+            prior_path = config_dir / "matrix.prior.npz"
+            save_dmrs_tap_power_prior(
+                prior_path,
+                np.ones(compatibility["l_max"] - compatibility["l_min"] + 1),
+                compatibility=compatibility,
+                training_seed=7,
+                training_realizations=32,
+            )
+            simulation_text = SIMULATION_CONFIG.read_text(encoding="utf-8").replace(
+                "/tmp/channel_estimation_validation.prior.npz",
+                "matrix.prior.npz",
+            )
 
             app = SimulationWebApp(config_dir, root / "runs")
             worker_entered = Event()
@@ -48,7 +79,20 @@ class WebEstimatorMatrixTest(unittest.TestCase):
                     ("simulation", SIMULATION_CONFIG),
                 ):
                     request_data[f"{kind}_name"] = path.name
-                    request_data[f"{kind}_text"] = app.get_config(kind, path.name)["text"]
+                    request_data[f"{kind}_text"] = (
+                        simulation_text if kind == "simulation"
+                        else app.get_config(kind, path.name)["text"]
+                    )
+                preflight_request = Request(
+                    f"{base_url}/api/validate-run",
+                    data=json.dumps(request_data).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(preflight_request, timeout=5) as response:
+                    preflight = json.loads(response.read())
+                self.assertTrue(preflight["valid"], preflight["errors"])
+
                 request = Request(
                     f"{base_url}/api/runs",
                     data=json.dumps(request_data).encode(),
@@ -63,6 +107,22 @@ class WebEstimatorMatrixTest(unittest.TestCase):
                     len(simulation_settings.channel_estimators_for_sweep)
                     * len(simulation_settings.detectors)
                     * len(simulation_settings.snr_db),
+                )
+                runtime_settings = BlerSettings.from_toml(
+                    root / "runs" / job["id"] / "simulation.toml"
+                )
+                self.assertEqual(
+                    runtime_settings.dmrs_tap_power_prior_path,
+                    str(prior_path.resolve()),
+                )
+                incompatible = dict(request_data)
+                incompatible["simulation_text"] = simulation_text.replace(
+                    "l_min = -6", "l_min = -5", 1
+                )
+                preflight = app.validate_run(incompatible)
+                self.assertFalse(preflight["valid"])
+                self.assertTrue(
+                    any("不兼容" in error["message"] for error in preflight["errors"])
                 )
                 self.assertTrue(worker_entered.wait(5))
             finally:
@@ -152,6 +212,125 @@ class WebEstimatorMatrixTest(unittest.TestCase):
                 self.assertEqual((config_dir / source.name).read_text(encoding="utf-8"), text)
             finally:
                 app.shutdown()
+
+
+    def test_curated_scenarios_preflight_as_complete_bundles(self):
+        with tempfile.TemporaryDirectory(prefix="nr-pusch-web-scenarios-") as temporary:
+            root = Path(temporary)
+            app = SimulationWebApp(ROOT / "configs", root / "runs")
+            try:
+                scenarios = app.list_scenarios()
+                self.assertEqual(len(scenarios), 3)
+                for scenario in scenarios:
+                    payload = {"scenario_id": scenario["id"]}
+                    for kind, name in scenario["profiles"].items():
+                        payload[f"{kind}_name"] = name
+                        payload[f"{kind}_text"] = app.get_config(kind, name)["text"]
+                    result = app.validate_run(payload)
+                    self.assertTrue(result["valid"], (scenario["id"], result["errors"]))
+                    self.assertEqual(result["scenario_id"], scenario["id"])
+            finally:
+                app.shutdown()
+
+    def test_invalid_channel_pair_is_filtered_and_rejected_before_queueing(self):
+        with tempfile.TemporaryDirectory(prefix="nr-pusch-web-compatibility-") as temporary:
+            root = Path(temporary)
+            config_dir = root / "configs"
+            config_dir.mkdir()
+            for path in (
+                TX_CONFIG,
+                CHANNEL_CONFIG,
+                ROOT / "configs" / "cdl_38_901_2tx_4rx.toml",
+                ROOT / "configs" / "bler_smoke.toml",
+            ):
+                shutil.copyfile(path, config_dir / path.name)
+            app = SimulationWebApp(config_dir, root / "runs")
+            try:
+                payload = {}
+                for kind, path in (
+                    ("tx", TX_CONFIG),
+                    ("channel", ROOT / "configs" / "cdl_38_901_2tx_4rx.toml"),
+                    ("simulation", ROOT / "configs" / "bler_smoke.toml"),
+                ):
+                    payload[f"{kind}_name"] = path.name
+                    payload[f"{kind}_text"] = app.get_config(kind, path.name)["text"]
+                result = app.validate_run(payload)
+                self.assertFalse(result["valid"])
+                self.assertIn("必须等于 PUSCH", result["errors"][0]["message"])
+
+                options = app.compatible_profiles("channel", payload)["profiles"]
+                self.assertTrue(options[CHANNEL_CONFIG.name]["compatible"])
+                self.assertFalse(options["cdl_38_901_2tx_4rx.toml"]["compatible"])
+                with self.assertRaises(ApiError):
+                    app.create_run(payload)
+                self.assertEqual(list((root / "runs").iterdir()), [])
+            finally:
+                app.shutdown()
+
+    def test_mcs_index_change_keeps_cp_dmrs_prior_compatible(self):
+        tx_profile = ROOT / "configs" / "pusch_cp_2ue_2layer.toml"
+        channel_profile = ROOT / "configs" / "cdl_38_901_2tx_4rx.toml"
+        simulation_profile = ROOT / "configs" / "bler_cp_smoke.toml"
+        with tempfile.TemporaryDirectory(prefix="nr-pusch-web-mcs-prior-") as temporary:
+            root = Path(temporary)
+            config_dir = root / "configs"
+            config_dir.mkdir()
+            for path in (tx_profile, channel_profile, simulation_profile):
+                shutil.copyfile(path, config_dir / path.name)
+            tx_settings = TxSettings.from_toml(tx_profile)
+            channel_settings = ChannelSettings.from_toml(channel_profile)
+            transmitter = NrPuschTx(tx_settings, device="cpu")
+            simulation_settings = BlerSettings.from_toml(simulation_profile)
+            l_min = simulation_settings.l_min
+            max_delay_spread_s = (
+                simulation_settings.max_delay_spread_s
+                or channel_settings.channel.max_delay_spread_s
+            )
+            compatibility = dmrs_prior_compatibility(
+                tx_settings,
+                channel_settings,
+                l_min=l_min,
+                max_delay_spread_s=max_delay_spread_s,
+                fft_size=transmitter._tx_freq.resource_grid.fft_size,
+                sample_rate_hz=transmitter.sample_rate_hz,
+            )
+            prior_path = config_dir / "cp-mcs.prior.npz"
+            tap_count = compatibility["l_max"] - l_min + 1
+            save_dmrs_tap_power_prior(
+                prior_path,
+                np.ones(tap_count),
+                compatibility=compatibility,
+                training_seed=7,
+                training_realizations=32,
+            )
+            simulation_text = simulation_profile.read_text(encoding="utf-8").replace(
+                'channel_estimator = "dmrs"',
+                'channel_estimator = "dmrs-lmmse"\n'
+                'dmrs_tap_power_prior_path = "cp-mcs.prior.npz"',
+                1,
+            )
+            app = SimulationWebApp(config_dir, root / "runs")
+            try:
+                payload = {
+                    "tx_name": tx_profile.name,
+                    "tx_text": app.get_config("tx", tx_profile.name)["text"],
+                    "channel_name": channel_profile.name,
+                    "channel_text": app.get_config("channel", channel_profile.name)["text"],
+                    "simulation_name": simulation_profile.name,
+                    "simulation_text": simulation_text,
+                }
+                initial = app.validate_run(payload)
+                self.assertTrue(initial["valid"], initial["errors"])
+
+                edited = dict(payload)
+                edited["tx_text"] = payload["tx_text"].replace(
+                    "mcs_index = 8", "mcs_index = 20", 1
+                )
+                result = app.validate_run(edited)
+                self.assertTrue(result["valid"], result["errors"])
+            finally:
+                app.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

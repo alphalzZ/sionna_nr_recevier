@@ -32,34 +32,45 @@
         <p class="hero-copy">配置 PUSCH、信道与扫频策略，比较不同信道估计器和 MIMO 检测器组合的误块率表现。</p>
       </div>
       <div class="hero-actions">
-        <button class="button button-primary" id="run-button" type="button">
+        <button class="button button-primary" id="run-button" type="button" disabled>
           <span class="play" aria-hidden="true"></span>启动 BLER 仿真
         </button>
-        <p id="run-hint">将使用当前三个编辑器中的配置</p>
+        <p id="run-hint">先选择场景并通过兼容性检查</p>
       </div>
     </section>
 
     <section class="panel config-panel">
       <div class="panel-heading">
         <div><span class="step">01</span><h2>实验配置</h2></div>
-        <p>选择已有配置，按需修改后保存</p>
+        <p>先选兼容的场景套餐；需要自定义时展开高级配置</p>
       </div>
-      <div class="config-tabs" role="tablist" aria-label="配置类型">
-        <button class="config-tab active" type="button" data-kind="tx" role="tab" aria-selected="true"><span>TX</span>发射机</button>
-        <button class="config-tab" type="button" data-kind="channel" role="tab" aria-selected="false"><span>CH</span>信道</button>
-        <button class="config-tab" type="button" data-kind="simulation" role="tab" aria-selected="false"><span>SIM</span>仿真</button>
+      <div class="scenario-picker">
+        <label for="scenario-select">实验方案</label>
+        <select id="scenario-select" aria-label="选择实验方案"></select>
+        <p id="scenario-description">正在加载兼容场景…</p>
       </div>
-      <div class="editor-toolbar">
-        <label for="profile-select">配置文件</label>
-        <select id="profile-select" aria-label="选择配置文件"></select>
-        <span class="dirty-indicator hidden" id="dirty-indicator">未保存</span>
-        <button class="button button-quiet" type="button" id="reload-button">重新载入</button>
-        <button class="button button-dark" type="button" id="save-button">保存配置</button>
-      </div>
-      <div class="editor-shell">
-        <div class="line-numbers" id="line-numbers" aria-hidden="true">1</div>
-        <textarea id="config-editor" spellcheck="false" aria-label="TOML 配置编辑器" placeholder="正在加载配置…"></textarea>
-      </div>
+      <div id="compatibility-status" class="compatibility-status pending" role="status" aria-live="polite">正在检查配置组合…</div>
+      <details id="advanced-config" class="advanced-config">
+        <summary>高级配置：独立选择文件或编辑 TOML</summary>
+        <div class="advanced-config-body">
+          <div class="config-tabs" role="tablist" aria-label="配置类型">
+            <button class="config-tab active" type="button" data-kind="tx" role="tab" aria-selected="true"><span>TX</span>发射机</button>
+            <button class="config-tab" type="button" data-kind="channel" role="tab" aria-selected="false"><span>CH</span>信道</button>
+            <button class="config-tab" type="button" data-kind="simulation" role="tab" aria-selected="false"><span>SIM</span>仿真</button>
+          </div>
+          <div class="editor-toolbar">
+            <label for="profile-select">配置文件</label>
+            <select id="profile-select" aria-label="选择配置文件"></select>
+            <span class="dirty-indicator hidden" id="dirty-indicator">未保存</span>
+            <button class="button button-quiet" type="button" id="reload-button">重新载入</button>
+            <button class="button button-dark" type="button" id="save-button">保存配置</button>
+          </div>
+          <div class="editor-shell">
+            <div class="line-numbers" id="line-numbers" aria-hidden="true">1</div>
+            <textarea id="config-editor" spellcheck="false" aria-label="TOML 配置编辑器" placeholder="正在加载配置…"></textarea>
+          </div>
+        </div>
+      </details>
     </section>
 
     <section class="panel run-panel">

@@ -17,14 +17,20 @@ from sionna.phy.channel import time_lag_discrete_time_channel
 from sionna.phy.fec.scrambling import Descrambler, Scrambler
 from sionna.phy.fec.ldpc import LDPC5GDecoder
 from sionna.phy.mimo import KBestDetector as FlatKBestDetector
-from sionna.phy.mimo import List2LLRSimple, StreamManagement, lmmse_matrix, whiten_channel
+from sionna.phy.mimo import (
+    List2LLRSimple,
+    StreamManagement,
+    complex2real_channel,
+    lmmse_matrix,
+    whiten_channel,
+)
 from sionna.phy.nr import LayerDemapper, PUSCHReceiver, PUSCHTransmitter, TBDecoder
 from sionna.phy.ofdm import (
     EPDetector,
-    KBestDetector,
     LMMSEEqualizer,
     LinearDetector,
     MMSEPICDetector,
+    OFDMDetector,
 )
 
 from .config import TxSettings
@@ -790,6 +796,72 @@ class _EagerList2LLRSimple(List2LLRSimple):
         return (path_inds == symbols).any(dim=-2)
 
 
+
+class _RankRobustFlatKBestDetector(FlatKBestDetector):
+    """Keep Sionna's Cholesky fast path, falling back to QR for singular channels."""
+
+    def _preprocessing(
+        self,
+        y: torch.Tensor,
+        h: torch.Tensor,
+        s: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._use_real_rep:
+            y, h, s = complex2real_channel(y, h, s)
+        y, h = whiten_channel(y, h, s, return_s=False)
+
+        h_norm = (h.abs() ** 2).sum(dim=-2)
+        column_order = h_norm.argsort(dim=-1, descending=True)
+        h = torch.gather(h, -1, column_order.unsqueeze(-2).expand_as(h))
+        gram = h.mH @ h
+        hty = (h.mH @ y.unsqueeze(-1)).squeeze(-1)
+        try:
+            lower = torch.linalg.cholesky(gram)
+        except torch.linalg.LinAlgError:
+            q, r = torch.linalg.qr(h, mode="reduced")
+            projected_y = (q.mH @ y.unsqueeze(-1)).squeeze(-1)
+            return projected_y, r, column_order
+
+        projected_y = torch.linalg.solve_triangular(
+            lower, hty.unsqueeze(-1), upper=False
+        ).squeeze(-1)
+        return projected_y, lower.mH, column_order
+
+
+class _RankRobustOfdmKBestDetector(OFDMDetector):
+    """OFDM wrapper that injects the rank-robust flat K-best detector."""
+
+    def __init__(
+        self,
+        output: str,
+        num_streams: int,
+        k: int,
+        *,
+        resource_grid: Any,
+        stream_management: StreamManagement,
+        constellation_type: str,
+        num_bits_per_symbol: int,
+        list2llr: List2LLRSimple,
+        device: str | None = None,
+    ) -> None:
+        detector = _RankRobustFlatKBestDetector(
+            output=output,
+            num_streams=num_streams,
+            k=k,
+            constellation_type=constellation_type,
+            num_bits_per_symbol=num_bits_per_symbol,
+            list2llr=list2llr,
+            device=device,
+        )
+        super().__init__(
+            detector=detector,
+            output=output,
+            resource_grid=resource_grid,
+            stream_management=stream_management,
+            device=device,
+        )
+
+
 class CpOfdmMimoDetector(torch.nn.Module):
     """Run native OFDM per-resource-element detection for CP-OFDM PUSCH."""
 
@@ -829,7 +901,7 @@ class CpOfdmMimoDetector(torch.nn.Module):
             "device": transmitter.device,
         }
         if detector == "k-best":
-            self._detector = KBestDetector(
+            self._detector = _RankRobustOfdmKBestDetector(
                 "bit",
                 num_streams=self._num_streams,
                 k=64 if parameter is None else parameter,

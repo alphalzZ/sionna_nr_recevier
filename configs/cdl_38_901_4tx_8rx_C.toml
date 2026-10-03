@@ -1,0 +1,19 @@
+[channel]
+model = "C"
+direction = "uplink"
+carrier_frequency_hz = 3500000000.0
+delay_spread_s = 100e-9
+max_delay_spread_s = 3e-6
+min_speed_mps = 0.0
+max_speed_mps = 0.0
+normalize_delays = true
+normalize_channel = false
+
+[antennas]
+tx_num_rows = 2
+tx_num_cols = 2
+rx_num_rows = 2
+rx_num_cols = 4
+antenna_pattern = "omni"
+polarization = "single"
+polarization_type = "V"

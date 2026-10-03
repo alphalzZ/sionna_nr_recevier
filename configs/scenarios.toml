@@ -1,0 +1,24 @@
+[[scenarios]]
+id = "dft-4ue-cdl-a"
+label = "4 用户 DFT-s-OFDM · CDL-A"
+description = "50 RB、4 个单层用户、4-RX CDL-A；使用低帧数 BLER 诊断配置。"
+tx = "pusch_4ue.toml"
+channel = "cdl_38_901_4x4.toml"
+simulation = "bler_smoke.toml"
+
+[[scenarios]]
+id = "cp-2ue-2layer-cdl-a"
+label = "2 用户 CP-OFDM · 4 流 CDL-A"
+description = "12 RB、2 用户各 2 层、2-TX/4-RX CDL-A；使用单帧诊断配置。"
+tx = "pusch_cp_2ue_2layer.toml"
+channel = "cdl_38_901_2tx_4rx.toml"
+simulation = "bler_cp_smoke.toml"
+
+[[scenarios]]
+id = "dft-8stream-cdl-a"
+label = "8 流 DFT-s-OFDM · CDL-A"
+description = "2 用户各 4 层、4-TX/8-RX CDL-A；仅用于有界单帧 LMMSE 诊断。"
+tx = "pusch_2ue_4layer.toml"
+channel = "cdl_38_901_4tx_8rx.toml"
+simulation = "bler_8stream_smoke.toml"
+

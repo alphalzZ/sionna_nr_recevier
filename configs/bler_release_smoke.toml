@@ -1,0 +1,14 @@
+# Saved from the release browser smoke
+[bler]
+snr_db = [25.0]
+batch_size = 1
+max_frames_per_snr = 1
+target_block_errors = 1000000
+seed = 20260924
+num_decoder_iterations = 20
+channel_estimator = "dmrs"
+detector = "lmmse"
+detectors = ["lmmse"]
+device = "cuda:0"
+channel_domain = "frequency"
+stop_at_zero_bler = false

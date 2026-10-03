@@ -1,0 +1,8 @@
+---
+name: use-lean-ctx-for-repo-reads
+description: "Read repository files through lean-ctx instead of the native read tool"
+condition: "\"path\":\"(?:src/|tests/|configs/|docs/|space_proj\\.md|/home/le-lei/workspace/test/sionna_nr_recevier/)"
+scope: "tool:read(*)"
+---
+
+For repository source, tests, configs, and docs, use lean-ctx: call `ctx_compose` first to locate relevant code, then `ctx_read` for targeted ranges. Reserve native `read` for tool instructions and non-repository resources.
