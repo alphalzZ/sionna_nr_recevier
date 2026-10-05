@@ -61,9 +61,12 @@ class ResolvedValidationTomlTest(unittest.TestCase):
         rt = tomllib.loads(rt_settings.to_toml())
         bler = tomllib.loads(_bler_settings_toml(simulation_settings))["bler"]
 
-        self.assertEqual(rt["rt"]["samples_per_src"], 100_000)
-        self.assertEqual([user["name"] for user in rt["users"]], ["ue0", "ue1", "ue2", "ue3"])
-        self.assertEqual(bler["max_frames_per_snr"], 2)
+        self.assertEqual(rt["rt"]["samples_per_src"], rt_settings.rt.samples_per_src)
+        self.assertEqual(
+            [user["name"] for user in rt["users"]],
+            [user.name for user in rt_settings.users],
+        )
+        self.assertEqual(bler["max_frames_per_snr"], simulation_settings.max_frames_per_snr)
         self.assertEqual(bler["detectors"], list(simulation_settings.detectors))
 
 

@@ -45,6 +45,7 @@ from .rt_scene_assets import (
     resolve_scene_assets,
     builtin_scene_catalog,
 )
+from .rt_scene_preview import render_rt_scene_preview
 from .simulation_config import BlerSettings
 from .transmitter import NrPuschTx
 
@@ -526,6 +527,37 @@ class SimulationWebApp:
             return None, bundle
         return resolve_builtin_scene_assets(settings.rt.scene), None
 
+    def rt_scene_preview(self, data: dict[str, Any]) -> bytes:
+        unknown = set(data).difference({"rt_settings", "scene_id", "view"})
+        if unknown:
+            raise ApiError(400, f"场景预览包含未知字段: {sorted(unknown)}")
+        raw_settings = data.get("rt_settings")
+        if not isinstance(raw_settings, dict):
+            raise ApiError(400, "rt_settings 必须是 RT 配置对象")
+        scene_id = data.get("scene_id")
+        if scene_id is not None and not isinstance(scene_id, str):
+            raise ApiError(400, "scene_id 必须是字符串")
+        view = data.get("view", "oblique")
+        if not isinstance(view, str) or view not in {"oblique", "top"}:
+            raise ApiError(400, "view 必须是 oblique 或 top")
+
+        settings = RtBeamSettings.from_dict(raw_settings)
+        try:
+            assets, bundle = self._resolve_rt_scene(settings, scene_id)
+            if bundle is not None:
+                with tempfile.TemporaryDirectory(prefix="nr-pusch-rt-preview-") as temporary:
+                    assets = persist_scene_bundle(
+                        bundle,
+                        Path(temporary) / "scene",
+                        source="parameterized",
+                    )
+                    return render_rt_scene_preview(assets, settings, view=view)
+            if assets is None:
+                raise ValueError("RT scene assets were not resolved")
+            return render_rt_scene_preview(assets, settings, view=view)
+        except (OSError, ValueError, TypeError) as exc:
+            raise ApiError(400, f"RT 场景预览无效: {exc}") from exc
+
     @staticmethod
     def _persist_job_scene(
         directory: Path,
@@ -980,8 +1012,8 @@ class SimulationWebApp:
 
     def _execute(self, job_id: str) -> None:
         with self._lock:
-            job = self._jobs[job_id]
-            if job["status"] != "queued":
+            job = self._jobs.get(job_id)
+            if job is None or job["status"] != "queued":
                 return
             job["status"] = "running"
             job["started_at"] = _now()
@@ -1358,6 +1390,47 @@ class SimulationWebApp:
         with self._lock:
             ids = sorted(self._jobs, key=lambda key: self._jobs[key]["created_at"], reverse=True)
         return {"runs": [self.get_run(job_id) for job_id in ids]}
+
+    def delete_runs(self, job_ids: Any) -> dict[str, Any]:
+        """Delete terminal run records and their per-job result artifacts."""
+        if not isinstance(job_ids, list) or not job_ids:
+            raise ApiError(400, "ids 必须是非空运行 ID 数组")
+        if any(not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id) for job_id in job_ids):
+            raise ApiError(400, "ids 包含无效运行 ID")
+        if len(set(job_ids)) != len(job_ids):
+            raise ApiError(400, "ids 不能包含重复运行 ID")
+
+        archive_root = self.outputs_dir / "rt_runs"
+        with self._lock:
+            missing = [job_id for job_id in job_ids if job_id not in self._jobs]
+            if missing:
+                raise ApiError(404, f"运行不存在: {', '.join(missing)}")
+            active = [
+                job_id for job_id in job_ids
+                if self._jobs[job_id].get("status") not in {"completed", "failed", "cancelled"}
+            ]
+            if active:
+                raise ApiError(409, f"运行尚未结束，不能删除: {', '.join(active)}")
+            if self.outputs_dir.is_symlink() or archive_root.is_symlink():
+                raise ApiError(409, "RT 结果归档路径无效，拒绝删除")
+
+            paths = {
+                job_id: (self._job_dir(job_id), archive_root / job_id)
+                for job_id in job_ids
+            }
+            for job_id, job_paths in paths.items():
+                for path in job_paths:
+                    if path.is_symlink():
+                        raise ApiError(409, f"运行 {job_id} 的数据路径是符号链接，拒绝删除")
+                    if path.exists() and not path.is_dir():
+                        raise ApiError(409, f"运行 {job_id} 的数据路径不是目录，拒绝删除")
+            for job_id in job_ids:
+                for path in paths[job_id]:
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                self._jobs.pop(job_id)
+        return {"deleted_ids": job_ids, "deleted_count": len(job_ids)}
+
 
     def _make_reproducibility_zip(self, job_id: str) -> Path:
         directory = self._job_dir(job_id)
@@ -1886,6 +1959,12 @@ def make_handler(app: SimulationWebApp) -> type[BaseHTTPRequestHandler]:
                     self._json(200, app.rt_options())
                 elif method == "POST" and path == "/api/rt/config":
                     self._json(200, app.rt_config(self._body()))
+                elif method == "POST" and path == "/api/rt/scene-preview":
+                    self._send(
+                        200,
+                        app.rt_scene_preview(self._body()),
+                        "image/png",
+                    )
                 elif method == "GET" and path == "/api/rt/scene-template.zip":
                     self._send(
                         200,
@@ -1917,6 +1996,8 @@ def make_handler(app: SimulationWebApp) -> type[BaseHTTPRequestHandler]:
                     self._json(200, app.list_runs())
                 elif path == "/api/runs" and method == "POST":
                     self._json(HTTPStatus.CREATED, app.create_run(self._body()))
+                elif path == "/api/runs" and method == "DELETE":
+                    self._json(200, app.delete_runs(self._body().get("ids")))
                 elif path == "/api/rx/decode" and method == "POST":
                     self._json(200, app.decode_external(self._body(max_bytes=18 * 1024 * 1024)))
                 elif len(parts) == 5 and parts[:3] == ["api", "rx", "decode"] and method == "GET":
@@ -1925,6 +2006,8 @@ def make_handler(app: SimulationWebApp) -> type[BaseHTTPRequestHandler]:
                     self._send_file(200, file, mime, download_name=file.name)
                 elif len(parts) == 3 and parts[:2] == ["api", "runs"] and method == "GET":
                     self._json(200, app.get_run(parts[2]))
+                elif len(parts) == 3 and parts[:2] == ["api", "runs"] and method == "DELETE":
+                    self._json(200, app.delete_runs([parts[2]]))
                 elif len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "cancel" and method == "POST":
                     self._json(200, app.cancel_run(parts[2]))
                 elif len(parts) == 4 and parts[:2] == ["api", "runs"] and method == "GET":
@@ -1957,6 +2040,9 @@ def make_handler(app: SimulationWebApp) -> type[BaseHTTPRequestHandler]:
 
         def do_PUT(self) -> None:
             self._handle("PUT")
+
+        def do_DELETE(self) -> None:
+            self._handle("DELETE")
 
     return Handler
 

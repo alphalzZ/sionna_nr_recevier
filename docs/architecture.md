@@ -33,6 +33,7 @@ The static RT experiment is an isolated path, not a replacement for the CDL regr
 6. The RT Web FIFO worker reuses only a hash/version-matching channel snapshot; on cache miss, the internal prepare child traces one, then applies the same Web acceptance gate and doubled-sample mesh convergence check on both hit and miss. BLER always reruns against the validated fixed snapshot.
 7. Successful RT Web jobs are atomically archived with configs, scene copy, snapshot, validation, CSV/JSON, progress/log/job metadata under `outputs/rt_runs/<job-id>/`. Failed/cancelled jobs are not archived; CDL job storage remains unchanged.
 8. Web acceptance requires FD/TD relative RMS≤0.001, CP/window and direct-CFR truncation≤1%, plus doubled-sample convergence for meshes. The existing strict `1e-5` result remains separate and visible; every Web BLER is labeled conditional on one static geometry/snapshot, not strict time-domain equivalence or a statistical city benchmark.
+9. The RT Web scene-preview endpoint reuses the validated built-in, parameterized or imported scene assets; `rt_scene_preview.py` adds display-only BS/UE markers at the configured XYZ coordinates and renders 640×400, 16-sample oblique/top PNGs. The endpoint performs no propagation-path tracing; the browser keeps the XY view and lists full coordinates alongside the color legend.
 
 RT uses Sionna/Sionna RT 2.2.0 and package-owned or explicitly validated scene assets; it never falls back to CDL or the CDL tap-power prior. CDL profiles remain available as the default Web backend and keep their existing workflow.
 
@@ -42,4 +43,10 @@ profiles use the generic layer-domain MIMO DMRS estimator.
 The regression profile remains four single-layer UEs on one physical TX port
 each and four RX antennas. MATLAB fixture files and their specialized readers
 are not generalized or regenerated.
+
+## Web history and BLER chart
+
+`DELETE /api/runs/{id}` removes one terminal run; `DELETE /api/runs` accepts `{"ids":[...]}` for a selected batch. Queued/running jobs are rejected before any batch deletion. Removing a job deletes its `runs_dir/<id>` and per-job `outputs/rt_runs/<id>` archive, but leaves shared `outputs/rt_snapshots/` intact.
+
+History controls disable deletion for active rows and require confirmation; deleting the selected current job clears its result view. BLER legend checkboxes independently hide/show estimator/detector curves, “显示全部” restores all curves, and the measurement table is not filtered.
 

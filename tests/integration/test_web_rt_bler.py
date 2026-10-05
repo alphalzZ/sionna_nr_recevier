@@ -9,6 +9,7 @@ import subprocess
 import random
 import shutil
 import string
+import struct
 import tempfile
 import threading
 import time
@@ -19,6 +20,9 @@ from urllib.request import Request, urlopen
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 import unittest
+
+import numpy as np
+from PIL import Image
 
 from nr_pusch.rt_config import RtBeamSettings
 from nr_pusch.rt_scene_assets import copy_scene_assets, resolve_builtin_scene_assets
@@ -113,6 +117,153 @@ class WebRtBlerTest(unittest.TestCase):
                 "simple_street_canyon_with_cars", "simple_wedge", "triple_reflector",
             },
         )
+
+    def test_scene_preview_renders_builtin_geometry_and_devices_as_png(self):
+        settings = RtBeamSettings.from_toml(CONFIGS / "rt_beam_los.toml").to_dict()
+        settings["rt"]["scene"] = "simple_street_canyon"
+        with self.assertRaises(ApiError):
+            self.app.rt_scene_preview({"rt_settings": settings, "view": []})
+        status, headers, image = self._request(
+            "/api/rt/scene-preview",
+            {"rt_settings": settings, "view": "oblique"},
+            method="POST",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get_content_type(), "image/png")
+        self.assertTrue(image.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(struct.unpack_from(">II", image, 16), (640, 400))
+        pixels = np.asarray(Image.open(BytesIO(image)).convert("RGBA"))
+        self.assertGreater(np.count_nonzero(pixels[:, :, 3]), 1_000)
+        rgb = pixels[:, :, :3].astype(np.float32)
+        ue_color_counts = [
+            np.count_nonzero((rgb[:, :, 2] > 1.5 * rgb[:, :, 0]) & (rgb[:, :, 2] > 1.2 * rgb[:, :, 1])),
+            np.count_nonzero((rgb[:, :, 0] > 1.2 * rgb[:, :, 1]) & (rgb[:, :, 1] > 1.2 * rgb[:, :, 2])),
+            np.count_nonzero((rgb[:, :, 2] > 1.1 * rgb[:, :, 0]) & (rgb[:, :, 0] > 1.15 * rgb[:, :, 1])),
+            np.count_nonzero((rgb[:, :, 1] > 1.2 * rgb[:, :, 0]) & (rgb[:, :, 1] > 1.1 * rgb[:, :, 2])),
+        ]
+        self.assertTrue(all(count >= 5 for count in ue_color_counts))
+        top_status, _, top_image = self._request(
+            "/api/rt/scene-preview",
+            {"rt_settings": settings, "view": "top"},
+            method="POST",
+        )
+        self.assertEqual(top_status, 200)
+        self.assertNotEqual(top_image, image)
+
+    def test_osm_scene_zip_upload_renders_geometry_and_devices(self):
+        archive_path = ROOT / "blender_scene" / "test_scene" / "sionna_rt_export.zip"
+        upload = self._json(
+            "/api/rt/scenes",
+            {
+                "filename": archive_path.name,
+                "content_base64": base64.b64encode(archive_path.read_bytes()).decode("ascii"),
+            },
+            method="POST",
+        )
+        self.assertEqual(upload["mesh_summary"]["meshes/buildings.ply"]["vertex_count"], 3348)
+        self.assertEqual(upload["mesh_summary"]["meshes/buildings.ply"]["face_count"], 4768)
+        self.assertEqual(upload["mesh_summary"]["meshes/ground.ply"]["vertex_count"], 4)
+
+        settings = RtBeamSettings.from_toml(CONFIGS / "rt_beam_los.toml").to_dict()
+        settings["rt"]["scene"] = "custom"
+        settings["rt"]["scene_file"] = "scene.xml"
+        images = []
+        for view in ("oblique", "top"):
+            status, headers, image = self._request(
+                "/api/rt/scene-preview",
+                {"rt_settings": settings, "scene_id": upload["scene_id"], "view": view},
+                method="POST",
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get_content_type(), "image/png")
+            self.assertTrue(image.startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertEqual(struct.unpack_from(">II", image, 16), (640, 400))
+            pixels = np.asarray(Image.open(BytesIO(image)).convert("RGBA"))
+            self.assertGreater(np.count_nonzero(pixels[:, :, 3]), 10_000)
+            images.append(image)
+            if view == "oblique":
+                rgb = pixels[:, :, :3].astype(np.float32)
+                ue_color_counts = [
+                    np.count_nonzero((rgb[:, :, 2] > 1.5 * rgb[:, :, 0]) & (rgb[:, :, 2] > 1.2 * rgb[:, :, 1])),
+                    np.count_nonzero((rgb[:, :, 0] > 1.2 * rgb[:, :, 1]) & (rgb[:, :, 1] > 1.2 * rgb[:, :, 2])),
+                    np.count_nonzero((rgb[:, :, 2] > 1.1 * rgb[:, :, 0]) & (rgb[:, :, 0] > 1.15 * rgb[:, :, 1])),
+                    np.count_nonzero((rgb[:, :, 1] > 1.2 * rgb[:, :, 0]) & (rgb[:, :, 1] > 1.1 * rgb[:, :, 2])),
+                ]
+                self.assertTrue(all(count >= 5 for count in ue_color_counts))
+        self.assertNotEqual(images[0], images[1])
+
+    def _seed_history_job(self, job_id: str, status: str) -> Path:
+        directory = self.runs_dir / job_id
+        directory.mkdir()
+        job = {
+            "id": job_id,
+            "status": status,
+            "created_at": "2026-10-05T00:00:00+00:00",
+            "channel_backend": "rt",
+            "config_names": {"tx": "pusch_4ue.toml", "rt": "rt_beam_los.toml"},
+        }
+        (directory / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        self.app._jobs[job_id] = job
+        return directory
+
+    def test_delete_history_single_and_batch_removes_job_archives_only(self):
+        run_ids = ("a1b2c3d4e5f6", "b2c3d4e5f6a1", "c3d4e5f6a1b2")
+        for job_id in run_ids:
+            self._seed_history_job(job_id, "completed")
+            archive = self.outputs_dir / "rt_runs" / job_id
+            archive.mkdir(parents=True)
+            (archive / "results.csv").write_text("snr_db,bler\n", encoding="utf-8")
+        shared_cache = self.outputs_dir / "rt_snapshots" / "shared-key"
+        shared_cache.mkdir(parents=True)
+        (shared_cache / "cache.json").write_text("{}", encoding="utf-8")
+
+        single = self._json(f"/api/runs/{run_ids[0]}", method="DELETE")
+        self.assertEqual(single, {"deleted_ids": [run_ids[0]], "deleted_count": 1})
+        self.assertFalse((self.runs_dir / run_ids[0]).exists())
+        self.assertFalse((self.outputs_dir / "rt_runs" / run_ids[0]).exists())
+
+        batch_ids = list(run_ids[1:])
+        batch = self._json("/api/runs", {"ids": batch_ids}, method="DELETE")
+        self.assertEqual(batch, {"deleted_ids": batch_ids, "deleted_count": 2})
+        for job_id in batch_ids:
+            self.assertFalse((self.runs_dir / job_id).exists())
+            self.assertFalse((self.outputs_dir / "rt_runs" / job_id).exists())
+        self.assertTrue((shared_cache / "cache.json").is_file())
+        self.assertEqual(self._json("/api/runs")["runs"], [])
+
+        with self.assertRaises(HTTPError) as missing:
+            self._request(f"/api/runs/{run_ids[0]}")
+        self.assertEqual(missing.exception.code, 404)
+        missing.exception.close()
+
+    def test_delete_history_rejects_active_batch_and_skips_removed_queue_item(self):
+        completed_id, running_id, queued_id, cancelled_id = (
+            "c3d4e5f6a1b2", "d4e5f6a1b2c3", "f6a1b2c3d4e5", "e5f6a1b2c3d4",
+        )
+        completed_dir = self._seed_history_job(completed_id, "completed")
+        running_dir = self._seed_history_job(running_id, "running")
+        queued_dir = self._seed_history_job(queued_id, "queued")
+        cancelled_dir = self._seed_history_job(cancelled_id, "cancelled")
+        with self.assertRaises(HTTPError) as active:
+            self._request(
+                "/api/runs",
+                {"ids": [completed_id, running_id, queued_id]},
+                method="DELETE",
+            )
+        self.assertEqual(active.exception.code, 409)
+        active.exception.close()
+        self.assertTrue(completed_dir.is_dir())
+        self.assertTrue(running_dir.is_dir())
+        self.assertTrue(queued_dir.is_dir())
+        self.assertIn(completed_id, self.app._jobs)
+        self.assertIn(running_id, self.app._jobs)
+        self.assertIn(queued_id, self.app._jobs)
+
+        self._json(f"/api/runs/{cancelled_id}", method="DELETE")
+        self.assertFalse(cancelled_dir.exists())
+        self.app._execute(cancelled_id)
+        self.assertNotIn(cancelled_id, self.app._jobs)
+
 
     def _scene_payload(self, scenario_id: str) -> dict[str, str]:
         listed = next(

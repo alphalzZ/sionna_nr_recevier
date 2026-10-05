@@ -14,8 +14,13 @@ const state = {
   runSubmitting: false,
   activeKind: "tx",
   backend: "cdl",
-  currentJob: null,
   runs: [],
+  historySelection: new Set(),
+  historyDeletePending: false,
+  chartHiddenSeries: new Set(),
+  chartJobId: null,
+  chartPoints: [],
+  chartIsRt: false,
   pollTimer: null,
   rtInitialized: false,
   rtOptions: null,
@@ -33,6 +38,14 @@ const state = {
   rtSceneFilename: "",
   rtSceneBundleHash: "",
   rtMeshSummary: null,
+  rtPreviewView: "oblique",
+  rtPreviewTimer: null,
+  rtPreviewSerial: 0,
+  rtPreviewRequestKey: "",
+  rtPreviewRenderedKey: "",
+  rtPreviewInFlight: false,
+  rtPreviewNeedsRefresh: false,
+  rtPreviewObjectUrl: "",
   rtWaveform: "dft",
   rtBudget: "quick",
   rtDirty: false,
@@ -615,6 +628,10 @@ function renderRtValidationInfo(job) {
 
 function renderJob(job) {
   if (!job) return;
+  if (state.chartJobId !== job.id) {
+    state.chartJobId = job.id;
+    state.chartHiddenSeries.clear();
+  }
   state.currentJob = job;
   const backend = job.channel_backend || job.backend || (job.config_names?.rt ? "rt" : "cdl");
   state.resultBackend = backend;
@@ -703,6 +720,8 @@ async function loadRuns() {
   try {
     const payload = await api("/api/runs");
     state.runs = Array.isArray(payload.runs) ? payload.runs : [];
+    const deletableIds = new Set(state.runs.filter(isTerminalRun).map((run) => run.id));
+    state.historySelection = new Set([...state.historySelection].filter((id) => deletableIds.has(id)));
     renderHistory();
     updateActiveCount();
     if (!state.currentJob) {
@@ -711,14 +730,102 @@ async function loadRuns() {
         const job = await api(`/api/runs/${encodeURIComponent(first.id)}`);
         renderJob(job);
         if (job.status === "queued" || job.status === "running") schedulePoll(2000);
+      } else {
+        clearRunView();
       }
     }
   } catch (error) { showAlert(error.message); }
 }
 
+function isTerminalRun(run) {
+  return ["completed", "failed", "cancelled"].includes(run?.status);
+}
+
+function updateHistoryActions() {
+  const deletable = state.runs.filter(isTerminalRun);
+  const selectedCount = state.historySelection.size;
+  const selectedAll = deletable.length > 0 && deletable.every((run) => state.historySelection.has(run.id));
+  const selectAll = $("history-select-all");
+  selectAll.checked = selectedAll;
+  selectAll.indeterminate = selectedCount > 0 && !selectedAll;
+  selectAll.disabled = state.historyDeletePending || deletable.length === 0;
+  $("history-selected-count").textContent = `已选 ${selectedCount} 项`;
+  const deleteButton = $("delete-selected-runs");
+  deleteButton.textContent = selectedCount ? `删除选中 (${selectedCount})` : "删除选中";
+  deleteButton.disabled = state.historyDeletePending || selectedCount === 0;
+}
+
+async function deleteHistoryRuns(ids) {
+  if (!ids.length || state.historyDeletePending) return;
+  const subject = ids.length === 1 ? `运行 ${ids[0]}` : `${ids.length} 条运行记录`;
+  if (!window.confirm(`确定删除${subject}及其每任务结果文件？共享 RT 静态快照缓存会保留。`)) return;
+  state.historyDeletePending = true;
+  renderHistory();
+  try {
+    const result = ids.length === 1
+      ? await api(`/api/runs/${encodeURIComponent(ids[0])}`, { method: "DELETE" })
+      : await api("/api/runs", { method: "DELETE", body: JSON.stringify({ ids }) });
+    const deletedIds = Array.isArray(result.deleted_ids) ? result.deleted_ids : ids;
+    deletedIds.forEach((id) => state.historySelection.delete(id));
+    if (deletedIds.includes(state.currentJob?.id)) {
+      clearTimeout(state.pollTimer);
+      state.currentJob = null;
+    }
+    await loadRuns();
+  } catch (error) {
+    showAlert(error.message);
+    await loadRuns();
+  } finally {
+    state.historyDeletePending = false;
+    renderHistory();
+  }
+}
+
+function clearRunView() {
+  clearTimeout(state.pollTimer);
+  state.currentJob = null;
+  state.resultBackend = "cdl";
+  state.chartJobId = null;
+  state.chartHiddenSeries.clear();
+  state.chartPoints = [];
+  state.chartIsRt = false;
+  state.rtResultUser = "all";
+  state.rtValidationSelectedJobId = null;
+  state.rtValidationReportSerial = (state.rtValidationReportSerial || 0) + 1;
+  $("status-pill").textContent = "等待任务";
+  $("status-pill").className = "status-pill idle";
+  $("cancel-button").classList.add("hidden");
+  $("cancel-button").disabled = false;
+  $("job-id").textContent = "—";
+  $("job-created").textContent = "—";
+  $("job-duration").textContent = "—";
+  $("job-points").textContent = "0";
+  $("progress-bar").style.width = "0";
+  $("log-view").textContent = "尚未启动仿真。";
+  for (const id of ["download-csv", "download-json", "download-validation", "download-snapshot", "download-snapshot-json", "download-repro"]) {
+    $(id).classList.add("hidden");
+    $(id).removeAttribute("href");
+  }
+  $("rt-result-summary").classList.add("hidden");
+  $("rt-validation-details").replaceChildren();
+  $("rt-strict-warning").classList.add("hidden");
+  $("rt-user-filter-wrap").classList.add("hidden");
+  $("rt-user-filter").value = "all";
+  $("results-empty").classList.remove("hidden");
+  $("results-content").classList.add("hidden");
+  $("result-subtitle").textContent = "完成仿真后将在此显示结果";
+  $("table-count").textContent = "0 条记录";
+  $("metrics-body").replaceChildren();
+  $("chart-legend").replaceChildren();
+  $("chart-show-all").disabled = true;
+  const canvas = $("bler-chart");
+  canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+}
+
 function renderHistory() {
   const container = $("history-list");
   container.replaceChildren();
+  updateHistoryActions();
   if (!state.runs.length) {
     const empty = document.createElement("p");
     empty.className = "muted";
@@ -727,28 +834,46 @@ function renderHistory() {
     return;
   }
   state.runs.forEach((run) => {
+    const deletable = isTerminalRun(run);
     const row = document.createElement("div");
     row.className = "history-item";
-    row.tabIndex = 0;
-    row.setAttribute("role", "button");
+    const selectionCell = document.createElement("div");
+    selectionCell.className = "history-select-cell";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.historySelection.has(run.id);
+    checkbox.disabled = !deletable || state.historyDeletePending;
+    checkbox.setAttribute("aria-label", `选择运行 ${run.id} 删除`);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) state.historySelection.add(run.id);
+      else state.historySelection.delete(run.id);
+      updateHistoryActions();
+    });
+    selectionCell.append(checkbox);
+    row.append(selectionCell);
     const validation = run.validation_summary || run.web_validation || run.validation || run.metadata?.web_validation || {};
     const isRt = run.channel_backend === "rt" || run.backend === "rt" || Boolean(run.config_names?.rt);
     const strict = validation.strict_fd_td_passed ?? run.strict_fd_td_passed ?? run.metadata?.strict_fd_td_passed;
     const qualityWarning = isRt && strict === false ? "严格 FD/TD 未通过；固定快照条件 BLER" : "";
     const cells = [
-      ["任务", run.id || "—", "history-id"],
-      ["状态", statusLabels[run.status] || run.status || "—"],
-      ["创建时间", formatTime(run.created_at)],
-      ["配置", summarizeConfigs(run.config_names), "history-config", qualityWarning],
+      ["任务", run.id || "—", "history-id", "", "history-cell-task"],
+      ["状态", statusLabels[run.status] || run.status || "—", "history-value", "", "history-cell-status"],
+      ["创建时间", formatTime(run.created_at), "history-value", "", "history-cell-created"],
+      ["配置", summarizeConfigs(run.config_names), "history-config", qualityWarning, "history-cell-config"],
     ];
-    cells.forEach(([label, value, className, warning]) => {
+    cells.forEach(([label, value, className, warning, cellClass]) => {
       const cell = document.createElement("div");
+      cell.className = `history-cell ${cellClass}`;
       const labelEl = document.createElement("span");
       labelEl.className = "history-label";
       labelEl.textContent = label;
-      const valueEl = document.createElement("span");
-      valueEl.className = className || "history-value";
+      const valueEl = className === "history-id" ? document.createElement("button") : document.createElement("span");
+      valueEl.className = className === "history-id" ? "history-id history-open" : className;
       valueEl.textContent = value;
+      if (className === "history-id") {
+        valueEl.type = "button";
+        valueEl.addEventListener("click", () => openRun(run.id));
+      }
       cell.append(labelEl, valueEl);
       if (warning) {
         const warningEl = document.createElement("small");
@@ -758,15 +883,22 @@ function renderHistory() {
       }
       row.append(cell);
     });
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "button button-danger history-delete";
+    deleteButton.textContent = "删除";
+    deleteButton.disabled = !deletable || state.historyDeletePending;
+    deleteButton.setAttribute("aria-label", `删除运行 ${run.id}`);
+    if (!deletable) deleteButton.title = "排队中或运行中的任务不能删除";
+    deleteButton.addEventListener("click", () => deleteHistoryRuns([run.id]));
+    row.append(deleteButton);
     const arrow = document.createElement("span");
     arrow.className = "history-arrow";
     arrow.textContent = "›";
     row.append(arrow);
-    const open = () => openRun(run.id);
-    row.addEventListener("click", open);
-    row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });
     container.append(row);
   });
+  updateHistoryActions();
 }
 
 function summarizeConfigs(names) {
@@ -1215,7 +1347,9 @@ function renderRtSettings() {
   updateRtSceneStatus();
   updateRtBudgetAvailability();
   updateRtSummary();
+  renderRtDevicePositions(settings);
   drawRtPreview();
+  scheduleRtScenePreview();
 }
 
 function updateRtSceneStatus() {
@@ -1383,6 +1517,165 @@ function drawRtPreview() {
   ctx.fillStyle = "#19251f"; ctx.fillRect(px(Number(bs[0]) || 0) - 5, py(Number(bs[1]) || 0) - 5, 10, 10);
   ctx.fillStyle = "#19251f"; ctx.textAlign = "left"; ctx.fillText("BS", px(Number(bs[0]) || 0) + 7, py(Number(bs[1]) || 0) + 12);
 }
+
+
+function renderRtDevicePositions(settings) {
+  const legend = $("rt-device-legend");
+  const coordinates = $("rt-device-positions");
+  if (!legend || !coordinates) return;
+  const devices = [
+    {
+      name: `BS${settings.receiver?.name ? ` (${settings.receiver.name})` : ""}`,
+      position: settings.receiver?.position_m,
+      color: "#19251f",
+    },
+    ...(Array.isArray(settings.users) ? settings.users : []).map((user, index) => ({
+      name: user.name || `ue${index}`,
+      position: user.position_m,
+      color: seriesColors[index % seriesColors.length],
+    })),
+  ];
+  const legendFragment = document.createDocumentFragment();
+  const coordinateFragment = document.createDocumentFragment();
+  devices.forEach((device) => {
+    const item = document.createElement("span");
+    const swatch = document.createElement("i");
+    swatch.className = "rt-device-swatch";
+    swatch.style.backgroundColor = device.color;
+    const label = document.createElement("span");
+    label.textContent = device.name;
+    item.append(swatch, label);
+    legendFragment.append(item);
+
+    const row = document.createElement("div");
+    row.className = "rt-device-position";
+    const name = document.createElement("span");
+    name.textContent = device.name;
+    const value = document.createElement("code");
+    const vector = Array.isArray(device.position) ? device.position.slice(0, 3) : [];
+    value.textContent = vector.length === 3
+      ? `[${vector.map((part) => {
+        const number = Number(part);
+        return Number.isFinite(number) ? String(number) : "—";
+      }).join(", ")}] m`
+      : "坐标不可用";
+    row.append(name, value);
+    coordinateFragment.append(row);
+  });
+  legend.replaceChildren(legendFragment);
+  coordinates.replaceChildren(coordinateFragment);
+}
+
+
+function scheduleRtScenePreview(force = false) {
+  const settings = state.rtDraftSettings || state.rtSettings;
+  if (!settings || state.backend !== "rt") return;
+  const request = {
+    rt_settings: settings,
+    scene_id: state.rtSceneId,
+    view: state.rtPreviewView,
+  };
+  const requestKey = JSON.stringify({
+    scene: settings.rt?.scene,
+    scene_file: settings.rt?.scene_file || null,
+    geometry: settings.geometry || null,
+    scene_id: state.rtSceneId,
+    view: state.rtPreviewView,
+    receiver_position_m: settings.receiver?.position_m,
+    user_positions_m: Array.isArray(settings.users) ? settings.users.map((user) => user.position_m) : [],
+  });
+  if (!force && (
+    requestKey === state.rtPreviewRequestKey
+    || requestKey === state.rtPreviewRenderedKey
+  )) return;
+
+  clearTimeout(state.rtPreviewTimer);
+  state.rtPreviewTimer = null;
+  state.rtPreviewRequestKey = requestKey;
+  state.rtPreviewRenderedKey = "";
+  const serial = ++state.rtPreviewSerial;
+  const image = $("rt-scene-render");
+  const placeholder = $("rt-scene-render-placeholder");
+  const status = $("rt-scene-preview-status");
+  image.classList.add("hidden");
+  placeholder.classList.remove("hidden");
+  placeholder.textContent = "正在用 Sionna RT 渲染实际场景几何…";
+  status.textContent = "准备预览";
+  if (state.rtPreviewObjectUrl) URL.revokeObjectURL(state.rtPreviewObjectUrl);
+  state.rtPreviewObjectUrl = "";
+
+  state.rtPreviewTimer = setTimeout(async () => {
+    state.rtPreviewTimer = null;
+    if (state.rtPreviewInFlight) {
+      state.rtPreviewNeedsRefresh = true;
+      return;
+    }
+    state.rtPreviewInFlight = true;
+    try {
+      const response = await fetch("/api/rt/scene-preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      if (serial !== state.rtPreviewSerial) return;
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(result.error || `HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      if (blob.type !== "image/png") throw new Error("服务器未返回 PNG 图像");
+      const objectUrl = URL.createObjectURL(blob);
+      if (serial !== state.rtPreviewSerial) {
+        URL.revokeObjectURL(objectUrl);
+        return;
+      }
+      image.onload = () => {
+        if (serial !== state.rtPreviewSerial) {
+          URL.revokeObjectURL(objectUrl);
+          return;
+        }
+        state.rtPreviewObjectUrl = objectUrl;
+        state.rtPreviewRenderedKey = requestKey;
+        image.classList.remove("hidden");
+        placeholder.classList.add("hidden");
+        status.textContent = "Sionna RT 几何与设备位置已渲染；未计算传播路径。";
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        if (serial !== state.rtPreviewSerial) return;
+        image.classList.add("hidden");
+        placeholder.classList.remove("hidden");
+        placeholder.textContent = "图像解码失败；可重新渲染。";
+        status.textContent = "场景预览图像无效";
+      };
+      image.src = objectUrl;
+    } catch (error) {
+      if (serial !== state.rtPreviewSerial) return;
+      placeholder.textContent = `场景预览失败：${error.message}`;
+      status.textContent = "Sionna RT 无法渲染当前场景";
+    } finally {
+      state.rtPreviewInFlight = false;
+      if (state.rtPreviewNeedsRefresh) {
+        state.rtPreviewNeedsRefresh = false;
+        scheduleRtScenePreview(true);
+      }
+    }
+  }, 350);
+}
+
+
+function onRtPreviewRefresh() {
+  state.rtPreviewRequestKey = "";
+  scheduleRtScenePreview(true);
+}
+
+
+function onRtPreviewViewChange(event) {
+  state.rtPreviewView = event.target.value;
+  onRtPreviewRefresh();
+}
+
+
 
 
 function parseRtError(error) {
@@ -1820,6 +2113,8 @@ function wireRtUi() {
   });
   $("rt-scene-source").addEventListener("change", onRtSceneSourceChange);
   $("rt-scene-kind").addEventListener("change", onRtSceneKindChange);
+  $("rt-preview-view").addEventListener("change", onRtPreviewViewChange);
+  $("rt-preview-refresh").addEventListener("click", onRtPreviewRefresh);
   $("rt-profile-select").addEventListener("change", (event) => changeRtSourceProfile("rt", event).catch((error) => showAlert(error.message)));
   $("rt-tx-profile-select").addEventListener("change", (event) => changeRtSourceProfile("tx", event).catch((error) => showAlert(error.message)));
   $("rt-simulation-profile-select").addEventListener("change", (event) => changeRtSourceProfile("simulation", event).catch((error) => showAlert(error.message)));
@@ -2434,9 +2729,11 @@ function renderResults(allPoints, job = state.currentJob) {
   });
   $("table-count").textContent = `${visibleRows.length} 条记录`;
   $("chart-description").textContent = rt
-    ? "对数刻度；0 错误只显示 95% 上界箭头，不作为 BLER=1/TB 的观测值。"
-    : "对数刻度；零误块以统计上界标记，不绘制伪观测值。";
-  requestAnimationFrame(() => drawChart(measuredPoints, rt));
+    ? "对数刻度；0 错误只显示 95% 上界箭头，不作为 BLER=1/TB 的观测值。勾选图例筛选曲线，不影响明细表。"
+    : "对数刻度；零误块以统计上界标记，不绘制伪观测值。勾选图例筛选曲线，不影响明细表。";
+  state.chartPoints = measuredPoints;
+  state.chartIsRt = rt;
+  requestAnimationFrame(() => drawChart(state.chartPoints, state.chartIsRt));
 }
 
 function drawChart(points, isRt = false) {
@@ -2465,11 +2762,21 @@ function drawChart(points, isRt = false) {
   ctx.clearRect(0, 0, width, height);
   const legend = $("chart-legend");
   legend.replaceChildren();
+  const showAll = $("chart-show-all");
+  showAll.disabled = state.chartHiddenSeries.size === 0;
   if (!prepared.length) return;
-  const snrs = prepared.map((item) => item.snr);
+  const groups = new Map();
+  prepared.forEach((item) => {
+    const name = comboLabel(item.point);
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(item);
+  });
+  const selectedPoints = prepared.filter((item) => !state.chartHiddenSeries.has(comboLabel(item.point)));
+  const scalePoints = selectedPoints.length ? selectedPoints : prepared;
+  const snrs = scalePoints.map((item) => item.snr);
   let xMin = Math.min(...snrs), xMax = Math.max(...snrs);
   if (xMin === xMax) { xMin -= 1; xMax += 1; }
-  const yMinLog = Math.floor(Math.log10(Math.min(...prepared.map((item) => item.plotBler), .001)));
+  const yMinLog = Math.floor(Math.log10(Math.min(...scalePoints.map((item) => item.plotBler), .001)));
   const yMaxLog = 0;
   const x = (value) => pad.left + ((value - xMin) / (xMax - xMin)) * plotW;
   const y = (value) => pad.top + ((yMaxLog - Math.log10(Math.max(value, 10 ** yMinLog))) / (yMaxLog - yMinLog || 1)) * plotH;
@@ -2491,14 +2798,26 @@ function drawChart(points, isRt = false) {
   }
   ctx.fillStyle = "#52605a"; ctx.font = "11px sans-serif"; ctx.fillText(isRt ? "参考 SNR (dB)" : "SNR (dB)", pad.left + plotW / 2, height - 16);
   ctx.save(); ctx.translate(15, pad.top + plotH / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = "center"; ctx.fillText("BLER", 0, 0); ctx.restore();
-  const groups = new Map();
-  prepared.forEach((item) => {
-    const name = comboLabel(item.point);
-    if (!groups.has(name)) groups.set(name, []);
-    groups.get(name).push(item);
-  });
   [...groups.entries()].forEach(([name, values], index) => {
     const color = seriesColors[index % seriesColors.length];
+    const visible = !state.chartHiddenSeries.has(name);
+    const item = document.createElement("label");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = visible;
+    checkbox.setAttribute("aria-label", `显示 ${name} 曲线`);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) state.chartHiddenSeries.delete(name);
+      else state.chartHiddenSeries.add(name);
+      drawChart(state.chartPoints, state.chartIsRt);
+    });
+    const swatch = document.createElement("i");
+    swatch.style.background = color;
+    const text = document.createElement("span");
+    text.textContent = name;
+    item.append(checkbox, swatch, text);
+    legend.append(item);
+    if (!visible) return;
     values.sort((a, b) => a.snr - b.snr);
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
@@ -2536,13 +2855,6 @@ function drawChart(points, isRt = false) {
         ctx.beginPath(); ctx.arc(px, py, 3.5, 0, Math.PI * 2); ctx.fill();
       }
     });
-    const item = document.createElement("span");
-    const swatch = document.createElement("i");
-    swatch.style.background = color;
-    const text = document.createElement("b");
-    text.textContent = name;
-    item.append(swatch, text);
-    legend.append(item);
   });
 }
 
@@ -2656,6 +2968,18 @@ $("reload-button").addEventListener("click", () => {
 $("run-button").addEventListener("click", startRun);
 $("cancel-button").addEventListener("click", cancelRun);
 $("refresh-history").addEventListener("click", loadRuns);
+$("history-select-all").addEventListener("change", (event) => {
+  const selectable = state.runs.filter(isTerminalRun);
+  state.historySelection = event.target.checked
+    ? new Set(selectable.map((run) => run.id))
+    : new Set();
+  renderHistory();
+});
+$("delete-selected-runs").addEventListener("click", () => deleteHistoryRuns([...state.historySelection]));
+$("chart-show-all").addEventListener("click", () => {
+  state.chartHiddenSeries.clear();
+  drawChart(state.chartPoints, state.chartIsRt);
+});
 $("alert-close").addEventListener("click", () => $("global-alert").classList.add("hidden"));
 $("log-toggle").addEventListener("click", () => { const hidden = $("log-view").classList.toggle("hidden"); $("log-toggle").textContent = hidden ? "展开" : "收起"; });
 window.addEventListener("resize", () => {

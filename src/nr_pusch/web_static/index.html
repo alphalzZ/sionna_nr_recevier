@@ -101,7 +101,7 @@
         <div class="rt-summary-grid" id="rt-summary" aria-live="polite"></div>
         <div class="rt-scene-layout">
           <section class="rt-scene-card" aria-labelledby="rt-scene-title">
-            <div class="rt-card-heading"><div><h3 id="rt-scene-title">场景资源</h3><p>仅接受受限 Sionna scene v2.1.0 XML＋ASCII PLY ZIP</p></div></div>
+            <div class="rt-card-heading"><div><h3 id="rt-scene-title">场景资源与三维预览</h3><p>使用 Sionna RT 渲染实际场景几何；导入场景仍仅接受受限 XML＋ASCII PLY ZIP。</p></div></div>
             <div class="rt-upload-actions">
               <a class="button button-quiet" id="rt-template-link" href="/api/rt/scene-template.zip" download="rt-scene-template.zip">下载场景模板</a>
               <button class="button button-dark" id="rt-upload-trigger" type="button">选择场景 ZIP</button>
@@ -109,10 +109,26 @@
             </div>
             <p class="rt-scene-status" id="rt-scene-status" role="status">内置场景：LoS</p>
             <p class="rt-mesh-summary" id="rt-mesh-summary"></p>
-            <div class="rt-preview-wrap">
-              <canvas id="rt-scene-preview" role="img" aria-label="RT 场景 XY 俯视预览"></canvas>
+            <div class="rt-preview-toolbar">
+              <label for="rt-preview-view">3D 视角
+                <select id="rt-preview-view" aria-label="选择场景预览视角">
+                  <option value="oblique">斜视</option>
+                  <option value="top">顶视</option>
+                </select>
+              </label>
+              <button class="button button-quiet" id="rt-preview-refresh" type="button">重新渲染</button>
+              <span id="rt-scene-preview-status" role="status" aria-live="polite">切换到 RT 后生成场景渲染。</span>
             </div>
-              <p class="rt-preview-note">XY 俯视示意（米）：设备、参数化地面/墙线或导入 mesh 包围盒；Sionna RT 内置 PLY 几何不在此 2D 画布中渲染；不显示传播路径，也不是 3D 可视化。</p>
+            <div class="rt-render-stage">
+              <img id="rt-scene-render" class="hidden" alt="Sionna RT 场景几何与 BS、UE 位置三维预览">
+              <div id="rt-scene-render-placeholder" role="status">Sionna RT 三维场景预览将显示在这里。</div>
+            </div>
+            <div id="rt-device-legend" class="rt-device-legend" aria-label="场景设备图例"></div>
+            <div id="rt-device-positions" class="rt-device-positions" aria-label="基站与用户坐标"></div>
+            <div class="rt-preview-wrap">
+              <canvas id="rt-scene-preview" role="img" aria-label="RT 场景 XY 位置俯视图"></canvas>
+            </div>
+            <p class="rt-preview-note">上方为 Sionna RT 实际网格的三维斜视/顶视渲染，标出 BS 与 UE；下方 XY 图给出米制坐标参考。仅可视化，不计算传播路径。</p>
           </section>
           <section class="rt-scene-card rt-quick-facts">
             <div class="rt-card-heading"><div><h3>固定网页约束</h3><p>载频阵列相位近似，不建模 beam squint。</p></div></div>
@@ -294,7 +310,7 @@
       </div>
       <div class="results-content hidden" id="results-content">
         <div class="chart-card">
-          <div class="chart-title"><div><h3>SNR vs. BLER</h3><p id="chart-description">对数刻度；零误块以统计上界标记，不绘制伪观测值。</p></div><div class="chart-tools"><label id="rt-user-filter-wrap" class="rt-user-filter hidden">用户<select id="rt-user-filter" aria-label="筛选 RT 结果用户"><option value="all">all</option><option value="ue0">ue0</option><option value="ue1">ue1</option><option value="ue2">ue2</option><option value="ue3">ue3</option></select></label><div class="legend" id="chart-legend"></div></div></div>
+          <div class="chart-title"><div><h3>SNR vs. BLER</h3><p id="chart-description">对数刻度；零误块以统计上界标记，不绘制伪观测值。</p></div><div class="chart-tools"><label id="rt-user-filter-wrap" class="rt-user-filter hidden">用户<select id="rt-user-filter" aria-label="筛选 RT 结果用户"><option value="all">all</option><option value="ue0">ue0</option><option value="ue1">ue1</option><option value="ue2">ue2</option><option value="ue3">ue3</option></select></label><button class="button button-quiet chart-show-all" id="chart-show-all" type="button" disabled>显示全部</button><div class="legend" id="chart-legend"></div></div></div>
           <div class="canvas-wrap"><canvas id="bler-chart" role="img" aria-label="SNR 与 BLER 曲线图"></canvas></div>
         </div>
         <div class="table-card">
@@ -307,7 +323,12 @@
     <section class="panel history-panel">
       <div class="panel-heading">
         <div><span class="step">04</span><h2>运行历史</h2></div>
-        <button class="button button-quiet" id="refresh-history" type="button">刷新</button>
+        <div class="history-actions">
+          <label class="history-select-all" for="history-select-all"><input id="history-select-all" type="checkbox">全选可删除记录</label>
+          <span class="history-selected-count" id="history-selected-count">0 项</span>
+          <button class="button button-danger" id="delete-selected-runs" type="button" disabled>删除选中</button>
+          <button class="button button-quiet" id="refresh-history" type="button">刷新</button>
+        </div>
       </div>
       <div class="history-list" id="history-list"><p class="muted">正在加载历史记录…</p></div>
     </section>

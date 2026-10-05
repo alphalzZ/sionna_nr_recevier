@@ -46,3 +46,47 @@ Recent history uses short imperative messages, sometimes with prefixes such as `
 ## Configuration and Artifacts
 
 Do not silently change the active profile in `configs/pusch_4ue.toml`; explain parameter changes against the MATLAB fixture or target MCS. Preserve user-provided IQ/H5 files. Store generated NPZ, JSON manifests, and temporary captures under `/tmp` or a dedicated ignored output directory.
+
+## Blender MCP (Oh My Pi)
+
+This repository uses the project-scoped `dcc-mcp-blender` connection; do not add it to the global `~/.omp/agent/mcp.json` and do not install a Codex plugin.
+
+- Blender: 4.5.14 LTS at `/home/le-lei/.local/opt/blender-4.5.14-linux-x64/blender`.
+- Adapter runtime: `dcc-mcp-blender` 0.2.14, `dcc-mcp-core` 0.20.41, and `dcc-mcp-server` 0.20.41 in Blender's bundled Python 3.11.15. The repository venv is not used for the adapter.
+- OMP project config: `.omp/mcp.json`. It registers `blender` as an HTTP MCP server at `http://127.0.0.1:9765/mcp`. Keep this entry project-local; `~/.omp/agent/mcp.json` intentionally has no Blender server.
+- The local MCP gateway is loopback-only. Do not expose port 9765 outside the host.
+- The adapter's Python packages remain in Blender's embedded runtime, but the global Blender startup hook was removed. The server does not auto-start in unrelated Blender sessions.
+
+### Start the project-scoped Blender host
+
+From the repository root, run the official headless bootstrap and leave it running while using Blender MCP:
+
+```sh
+mkdir -p /tmp/dcc-mcp-empty-user-scripts
+BLENDER_USER_SCRIPTS=/tmp/dcc-mcp-empty-user-scripts \
+  /home/le-lei/.local/opt/blender-4.5.14-linux-x64/blender \
+  --background \
+  --python /home/le-lei/.local/opt/blender-4.5.14-linux-x64/4.5/python/lib/python3.11/site-packages/dcc_mcp_blender/blender_bootstrap.py
+```
+
+The empty user-scripts override prevents unrelated global startup scripts from enabling the adapter. The bootstrap runs Blender headlessly and blocks while serving MCP requests; stop it with Ctrl+C. OMP's project config only applies when OMP is started with this repository as its working directory.
+
+### Use and verify through OMP
+
+Start OMP from this repository root and request typed Blender operations in the conversation, for example:
+
+```text
+Use the Blender MCP server to list the current scene objects and return their names.
+```
+
+Project-scoped smoke command:
+
+```sh
+omp --cwd /home/le-lei/workspace/test/sionna_nr_recevier \
+  --no-session --max-time 120 -p \
+  'Use the Blender MCP server configured for this project, not shell or Python. Call the scene object-list tool and report the names and count.'
+```
+
+Verified on Blender 4.5.14: OMP called Blender's scene object-list tool and returned `Camera`, `Cube`, `Light` (3 objects). Re-run this check after changing `.omp/mcp.json` or upgrading Blender/adapter versions. The `dcc-mcp-blender verify` lifecycle command requires its global install receipt; this project intentionally removes that receipt to avoid global auto-start, so verify the live OMP connection instead.
+
+Prefer typed scene/object tools. The adapter also exposes arbitrary Python execution; treat it as a high-risk escape hatch and use it only when no typed tool can perform the requested operation.

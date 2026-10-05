@@ -81,7 +81,7 @@ nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /tmp/pusch_rx_grid.npz --
 
 RT 实验使用独立于 CDL 的链路：`nr-pusch-rt-channel` 生成静态阵元/波束快照，`nr-pusch-beam-bler` 在固定传播快照上运行编码 PUSCH。RT 不调用 CDL 信道或 CDL tap-power prior；结果是指定几何和固定信道条件下的 BLER，不代表动态无线信道或真实城区 benchmark。模型只含静态单频载波 LoS/镜面多径，不含移动、多普勒/ICI 或 RF 链互串。
 
-网页场景选择器提供 3 个项目内置场景（LoS、地面、地面＋墙面）和 `sionna-rt==2.2.0` 随包的 15 个场景；Sionna PLY 仅复制 XML 引用的网格，参数化几何仍只适用于项目地面/墙面。所有内置场景共用当前 RT 配置中的 BS/UE/阵列位置；2D 预览不绘制这些 PLY，城区场景的追踪和内存开销较高。
+网页场景选择器提供 3 个项目内置场景（LoS、地面、地面＋墙面）和 `sionna-rt==2.2.0` 随包的 15 个场景；Sionna RT 会为内置、参数化和已验证导入场景渲染 640×400、16 samples 的斜视或顶视 PNG，标出 BS/UE，并列出完整 XYZ 坐标；原 XY 位置图继续保留。预览仅显示场景几何与设备，不计算传播路径；所有内置场景共用当前 RT 配置中的 BS/UE/阵列位置，城区场景耗时和内存需求较高。
 
 `nr-pusch-rt-channel` 默认将可验证的静态快照按输入指纹缓存在 `outputs/rt_snapshots/`，重复输入显示 cache hit 并复用 NPZ/JSON 快照。RT Web BLER 仍会重新运行；只有成功完成的 Web RT job 才原子归档到 `outputs/rt_runs/<job-id>/`，其中保留配置、场景副本、快照、准入报告、CSV/JSON、进度、日志和最终 job 状态。缓存/归档均位于 gitignored `outputs/`；CDL jobs 不写入该 RT 归档。
 
@@ -118,7 +118,7 @@ done
 | `configs/rt_beam_ground.toml` | 相同几何，ground 场景、追踪深度 1。 |
 | `configs/rt_beam_ground_wall.toml` | 相同几何，ground+wall 场景、追踪深度 2。 |
 | `configs/pusch_rt_4ue_cp.toml` | CP-OFDM 接口/正确性对照；四 UE 单层、50 RB、MCS table 1/index 20、30-kHz SCS。统计主 profile 仍是 `configs/pusch_4ue.toml`。 |
-| `configs/bler_rt_beam_smoke.toml` | CPU、60/80 dB、最多 2 帧/点，覆盖 `perfect`/`dmrs` 和两种新检测器加既有六种 detector；仅连通性检查。 |
+| `configs/bler_rt_beam_smoke.toml` | CUDA:0 诊断配置：SNR 10–15 dB（1 dB 步进）、batch 20、每 SNR 最多 100 帧、target 100 errors、perfect/DMRS × 八种检测器、stop-at-zero 开启（最多 96 arm×SNR 点）。文件名不代表两帧 smoke，不是统计 BLER benchmark。 |
 | `configs/bler_rt_beam.toml` | CUDA:0、15–50 dB 每 5 dB、batch 20、最多 2,000 帧/SNR、target 200 errors、perfect/DMRS × 三个 detector、`stop_at_zero_bler=true`；最多 48 个 arm×SNR 点，Web gate 通过后才运行。这是配置预算，不是已测统计结果。 |
 | `configs/bler_rt_beam_web_quick.toml` | 当前 CPU profile：10/15/17/20 dB、batch 16、最多 2,000 帧/SNR、target 100 errors、DMRS × 三个 detector、`stop_at_zero_bler=false`；12 个 arm×SNR 点。文件名虽含 quick，该当前工作量并非两帧 smoke，也不是统计基准。 |
 
@@ -249,17 +249,17 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 /home/le-lei/workspace/test/.venv/bin/nr-pusch-web --host 127.0.0.1 --port 8765
 ```
 
-浏览器打开 `http://127.0.0.1:8765/`。CDL 页沿用原三个配置编辑器、保存/预检和串行任务；接收分析页仍使用原 RX 流程。运行任务按提交顺序串行执行，进度、图表、历史、日志与结果下载仍归属各自持久 job。该服务按 local-only 工具设计；绑定非 loopback 地址前必须在外部提供认证和访问控制，不能直接作为公网服务。
+浏览器打开 `http://127.0.0.1:8765/`。CDL 页沿用原三个配置编辑器、保存/预检和串行任务；接收分析页仍使用原 RX 流程。SNR vs. BLER 图例复选框可筛选估计器/检测器折线，“显示全部”恢复全线；测量明细不受图表筛选影响。运行任务按提交顺序串行执行，进度、图表、历史、日志与结果下载仍归属各自持久 job。运行历史支持单条和批量删除已完成/失败/取消的 job 及每任务输出；排队中/运行中任务不能删除，删除不影响共享 RT 快照缓存。该服务按 local-only 工具设计；绑定非 loopback 地址前必须在外部提供认证和访问控制，不能直接作为公网服务。
 
 CDL 仍有 25 个原预设；Sionna RT 有 `rt-los-quick`、`rt-ground-quick`、`rt-ground-wall-quick`、`rt-cp-los-quick` 四个一键仿真组合，以及 18 个场景选择项（3 个项目场景＋15 个 Sionna RT 2.2.0 随包场景）。选中随包场景后沿用当前 RT 配置中的 BS/UE 位置；城区场景网格较多、耗时和内存需求较高。选择场景、DFT/CP 波形和预算后一次运行会自动完成 tracing、Web gate 和 BLER；CP 通过 TX profile 派生为自定义组合。当前 quick profile 见上表，包含最多 2,000 帧/SNR；其名称不代表低工作量。Long profile 是 CUDA:0、8 SNR、batch 20、最多 2,000 帧/SNR、target 200、perfect/DMRS × 三个 detector，并可在首个零错误点后按每个 estimator/detector arm 跳过更高 SNR；跳过行标记为 skipped、BLER/CI 为空、计入进度但不算作 BLER=0。Web RT 限制由 `/api/rt/options` 返回；输入超限会显示具体字段/数值/上限的弹窗并保持运行禁用，不自动缩小或改设备。
 
-高级配置可编辑 BS/UE、阵列、功率、波束、噪声、参数化地面/墙面、追踪预算及 RT/TX/BLER TOML。导入仅接受根 `scene.xml` 与受限 ASCII 三角网格 `meshes/*.ply`；PLY 顶点采用世界 XYZ、单位米，需在导入前完成定位，不支持 Mitsuba transform 或单位转换；预览只显示 XY 包围盒，不显示传播路径。JSON 请求体限 12 MiB、ZIP 限 8 MiB、解压内容总量限 32 MiB。该接口不是任意 Mitsuba 工程或 3D 拖放建模器。`GET /api/rt/options` 查询设备/限制，`GET /api/rt/scene-template.zip` 下载模板，`POST /api/rt/scenes` 导入包，`POST /api/rt/config` 解析 RT 参数。每个 job 复制场景和配置，可下载 validation report、NPZ/JSON snapshot 与无主机绝对路径的 `reproducibility.zip`。配置超限时弹窗列出所有超限字段、当前值与允许范围；profile 不会被自动改写。
+高级配置可编辑 BS/UE、阵列、功率、波束、噪声、参数化地面/墙面、追踪预算及 RT/TX/BLER TOML。导入仅接受根 `scene.xml` 与受限 ASCII 三角网格 `meshes/*.ply`；PLY 顶点采用世界 XYZ、单位米，需在导入前完成定位，不支持 Mitsuba transform 或单位转换。仓库 OSM 示例 `blender_scene/test_scene/sionna_rt_export.zip` 在现有限制下导入成功：2 个 shape；`buildings.ply` 为 3,348 顶点/4,768 面，`ground.ply` 为 4 顶点/2 面，因此无需提高 shape/mesh 上限。场景尺度超过 5 km 时，预览使用 95° 视场并限制摄像机距离以适配 Sionna RT 的 10 km 相机上限。Sionna RT 预览以 640×400、16 samples 渲染实际几何，支持斜视/顶视，提供 BS/UE 颜色图例、完整 XYZ 坐标和原 XY 图；预览不计算传播路径。JSON 请求体限 12 MiB、ZIP 限 8 MiB、解压内容总量限 32 MiB。该接口不是任意 Mitsuba 工程或 3D 拖放建模器。`GET /api/rt/options` 查询设备/限制，`GET /api/rt/scene-template.zip` 下载模板，`POST /api/rt/scenes` 导入包，`POST /api/rt/config` 解析 RT 参数，`POST /api/rt/scene-preview` 返回仅用于显示的 PNG；`DELETE /api/runs/{id}` 删除一条已结束运行，`DELETE /api/runs` 使用 JSON `{"ids":["a1b2c3d4e5f6","b2c3d4e5f6a1"]}` 批量删除。每个 job 复制场景和配置，可下载 validation report、NPZ/JSON snapshot 与无主机绝对路径的 `reproducibility.zip`。配置超限时弹窗列出所有超限字段、当前值与允许范围；profile 不会被自动改写。
 
 每个成功完成的 RT Web job 另存于 `outputs/rt_runs/<job-id>/`；API job 记录和状态面板显示归档相对路径及本次静态快照 cache hit/miss。快照缓存位于 `outputs/rt_snapshots/<SHA-256>/`，指纹包含 RT/TX 资源网格与 DMRS 几何、场景 bundle hash、软件版本、Mitsuba variant 和快照实现指纹；影响该指纹的输入变化会重新追踪，不复用 BLER 结果。网格场景 cache hit 仍重新执行 doubled-sample Web 收敛 gate。
 
 RT 网页 gate `web-frequency-v1` 要求 native FD/TD 相对 RMS ≤ 0.001、tap-window/CP 外有效能量与直接 CFR 截断误差各 ≤ 1%，mesh 场景还需同 seed 的双采样路径收敛。原严格 FD/TD `1e-5` 结果保留为独立质量标记，不影响此有界 Web gate：2026-10-04 ground-wall 实测 RMS `0.0003351521`、CFR 截断误差 `0.00922528199`、CP 52 samples；Web gate 通过、strict gate 仍失败。页面持续标注固定场景/静态快照条件 BLER 和 strict warning；这项放宽不表示 strict 时域等价，也不构成城市信道或统计 benchmark。
 实际 ground-wall 浏览器 job `7a69bd0a2ea4` 使用当时的 quick profile、seed 13、噪声比 0.001、CPU PHY，9/9 点 complete；20 dB beam-independent 为 8/8 aggregate TB errors，ZF/LMMSE 观察到 0/8 errors（Bonferroni 95% 上界 0.920943）。它是旧 profile 的条件诊断，不是当前 quick profile 的结果，也不是统计 BLER 或零错误保证。
-2026-10-05 full regression：`PYTHONPATH=src /home/le-lei/workspace/test/.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v` 通过 182 tests；unittest 报告运行时间 602.470 s（shell wall time 607.12 s）。这是代码回归证据，不是 BLER/统计性能证据。
+2026-10-06 full regression：`PYTHONPATH=src /home/le-lei/workspace/test/.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v` 通过 186 tests；unittest 报告运行时间 574.491 s（shell wall time 579.22 s）。这是代码回归证据，不是 BLER/统计性能证据。
 
 ### 历史 GPU batch 扫描与频域/时域对照
 

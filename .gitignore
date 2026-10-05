@@ -14,7 +14,7 @@ dist/
 .venv/
 venv/
 runs/
-
+blender_scene/
 # Generated simulation outputs
 outputs/
 *.npz

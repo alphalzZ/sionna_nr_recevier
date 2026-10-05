@@ -14,4 +14,4 @@ device = "cpu"
 channel_domain = "frequency"
 l_min = -6
 max_delay_spread_s = 3e-6
-stop_at_zero_bler = false
+stop_at_zero_bler = true

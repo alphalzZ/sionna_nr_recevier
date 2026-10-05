@@ -83,7 +83,13 @@ nr-pusch-web --host 127.0.0.1 --port 8765 \
 
 Use a real Chromium browser session on the dashboard (not API-only evidence): load dashboard; list/read/save a temporary copied profile; submit a one-frame GPU BLER run; poll to completion; download and validate its CSV and JSON; decode the H5 fixture through the RX endpoint with `device="cuda:0"`; download and inspect decoded NPZ and JSON. Capture browser-visible proof, server logs and download artifacts under `functional/web/`. Stop only the server launched for this test after capturing logs.
 
-RT 的 Web 验收是另一条功能/正确性 smoke，不替代以上 CDL/RX 浏览器回归：在隔离的 loopback 服务和临时 runs 目录中，实测 LoS、ground+wall 与 CP-LoS quick presets、参数化/受限 ZIP 场景、取消、history 和结果下载；保存 Web validation report、场景包和固定快照 replay。Quick 每点最多2帧，只作诊断，不运行500帧统计配置。Web job 仅在 `web-frequency-v1` 通过后启动 BLER；ground+wall 可在 Web RMS≤0.001 下运行，但必须持续显示 strict FD/TD `1e-5` 未通过的 warning。非 loopback 部署仍需外部认证和访问控制。
+Run-history acceptance also deletes disposable terminal jobs singly and in batches, verifies queued/running jobs reject deletion without partial batch removal, confirms per-job output archives disappear while shared RT snapshots remain, and checks a deleted current job no longer remains displayed.
+
+For chart filtering, open a completed multi-series run, uncheck all but one estimator/detector line, confirm only that curve remains while the measured-row count is unchanged, then use “显示全部” to restore every line.
+
+RT 的 Web 验收是另一条功能/正确性 smoke，不替代以上 CDL/RX 浏览器回归：在隔离的 loopback 服务和临时 runs 目录中，实测 LoS、ground+wall 与 CP-LoS quick presets、参数化/受限 ZIP 场景、取消、history 和结果下载；保存 Web validation report、场景包和固定快照 replay。浏览器验收使用临时 quick profile、每点最多2帧，仅作诊断，不运行统计 profile。Web job 仅在 `web-frequency-v1` 通过后启动 BLER；ground+wall 可在 Web RMS≤0.001 下运行，但必须持续显示 strict FD/TD `1e-5` 未通过的 warning。另须通过真实浏览器验证至少一个 Sionna 随包场景在斜视/顶视下的 640×400、16-sample 几何预览，检查 BS/UE 图例、完整 XYZ 坐标、原 XY 参考和无传播路径计算；非 loopback 部署仍需外部认证和访问控制。
+
+The checked-in `blender_scene/test_scene/sionna_rt_export.zip` is also a required imported-scene smoke: retain the existing upload limits, import its two ASCII PLY shapes, verify the 3,348/4,768 building mesh and 4/2 ground mesh, and inspect the 640×400 oblique/top previews with all four UE markers and the BS position. Do not run propagation or BLER as part of the visual-only preview.
 
 ### 6. Reduced paired estimator validation and exact priors
 
