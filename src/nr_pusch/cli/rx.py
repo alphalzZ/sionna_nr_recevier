@@ -54,7 +54,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--detector",
-        choices=("lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic"),
+        choices=("lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic", "zf", "beam-independent"),
         default=None,
     )
     parser.add_argument("--detector-parameter", type=int, default=None)
@@ -105,7 +105,7 @@ def main() -> None:
         args.detector_parameter
         if args.detector_parameter is not None
         else None
-        if detector_overridden and detector == "soft-mmse-pic"
+        if detector_overridden and detector in {"soft-mmse-pic", "zf", "beam-independent"}
         else receiver_profile.get("detector_parameter")
     )
     detector_damping = (

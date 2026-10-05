@@ -307,17 +307,36 @@ class WebEstimatorMatrixTest(unittest.TestCase):
             config_dir = _config_sandbox(root)
             app = SimulationWebApp(config_dir, root / "runs")
             try:
-                scenarios = app.list_scenarios()
+                catalog = app.list_scenarios()
+                scenarios = [item for item in catalog if item["channel_backend"] == "cdl"]
+                rt_scenarios = [item for item in catalog if item["channel_backend"] == "rt"]
                 self.assertEqual([item["id"] for item in scenarios], list(SCENARIO_IDS))
+                self.assertEqual(
+                    [item["id"] for item in rt_scenarios],
+                    ["rt-los-quick", "rt-ground-quick", "rt-ground-wall-quick", "rt-cp-los-quick"],
+                )
                 self.assertEqual(len(list((config_dir / "tap_power_prior").glob("*/*.npz"))), 2)
-                for scenario in scenarios:
-                    payload = {"scenario_id": scenario["id"]}
+                for scenario in (*scenarios, *rt_scenarios):
+                    payload = {
+                        "scenario_id": scenario["id"],
+                        "channel_backend": scenario["channel_backend"],
+                    }
                     for kind, name in scenario["profiles"].items():
                         payload[f"{kind}_name"] = name
                         payload[f"{kind}_text"] = app.get_config(kind, name)["text"]
                     result = app.validate_run(payload)
                     self.assertTrue(result["valid"], (scenario["id"], result["errors"]))
                     self.assertEqual(result["scenario_id"], scenario["id"])
+                    if scenario["channel_backend"] == "rt":
+                        simulation = BlerSettings.from_toml(
+                            config_dir / scenario["profiles"]["simulation"]
+                        )
+                        self.assertEqual(
+                            result["total_points"],
+                            len(simulation.channel_estimators_for_sweep)
+                            * len(simulation.detectors)
+                            * len(simulation.snr_db),
+                        )
             finally:
                 app.shutdown()
 
@@ -352,7 +371,10 @@ class WebEstimatorMatrixTest(unittest.TestCase):
                 self.assertFalse(options["cdl_38_901_2tx_4rx.toml"]["compatible"])
                 with self.assertRaises(ApiError):
                     app.create_run(payload)
-                self.assertEqual(list((root / "runs").iterdir()), [])
+                self.assertEqual(
+                    {path.name for path in (root / "runs").iterdir()}, {"_rt_scenes"}
+                )
+                self.assertEqual(list((root / "runs" / "_rt_scenes").iterdir()), [])
             finally:
                 app.shutdown()
 

@@ -39,7 +39,10 @@ class BlerSettings:
 
 
     _SUPPORTED_DETECTORS = frozenset(
-        {"lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic"}
+        {
+            "lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic",
+            "zf", "beam-independent",
+        }
     )
 
     @classmethod
@@ -105,6 +108,13 @@ class BlerSettings:
         allowed = self._SUPPORTED_DETECTORS
         if self.detector not in allowed or not self.detectors or any(x not in allowed for x in self.detectors):
             raise ValueError(f"detector(s) 必须属于 {sorted(allowed)}")
+        if self.detector_parameter is not None and (
+            self.detector in {"zf", "beam-independent"}
+            or any(name in {"zf", "beam-independent"} for name in self.detectors)
+        ):
+            raise ValueError("detector_parameter 不适用于 zf 或 beam-independent")
+        if any(name in self.detector_parameters for name in {"zf", "beam-independent"}):
+            raise ValueError("detector_parameters 不适用于 zf 或 beam-independent")
         if self.detector_parameter is not None and self.detector_parameter < 1:
             raise ValueError("detector_parameter 必须大于 0")
         if any(key not in allowed or value < 1 for key, value in self.detector_parameters.items()):

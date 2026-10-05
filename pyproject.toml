@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Small Sionna-based NR PUSCH waveform and IQ analysis toolkit"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["sionna==2.0.1", "h5py>=3.8"]
+dependencies = ["sionna==2.2.0", "sionna-rt==2.2.0", "h5py>=3.8"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
@@ -19,10 +19,13 @@ nr-pusch-channel = "nr_pusch.cli.channel:main"
 nr-pusch-bler = "nr_pusch.cli.bler:main"
 nr-pusch-rx = "nr_pusch.cli.rx:main"
 nr-pusch-estimator-validation = "nr_pusch.cli.estimator_validation:main"
+nr-pusch-rt-channel = "nr_pusch.cli.rt_channel:main"
+nr-pusch-beam-bler = "nr_pusch.cli.beam_bler:main"
+nr-pusch-beam-validate = "nr_pusch.cli.beam_validate:main"
 nr-pusch-web = "nr_pusch.cli.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-nr_pusch = ["web_static/*.html", "web_static/*.css", "web_static/*.js"]
+nr_pusch = ["web_static/*.html", "web_static/*.css", "web_static/*.js", "rt_scenes/*.xml", "rt_scenes/meshes/*.ply"]

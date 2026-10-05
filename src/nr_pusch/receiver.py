@@ -31,7 +31,10 @@ from sionna.phy.ofdm import (
     LinearDetector,
     MMSEPICDetector,
     OFDMDetector,
+    OFDMEqualizer,
+    ZFEqualizer,
 )
+
 
 from .config import TxSettings
 from .device import use_device
@@ -153,6 +156,57 @@ class _LdpcSoftFeedback(torch.nn.Module):
 
 
 
+_BEAM_INDEPENDENT_DIMENSION_ERROR = (
+    "beam-independent 要求每用户单层且接收观测端口数等于总流数"
+)
+
+
+def beam_independent_equalizer(
+    y: torch.Tensor, h: torch.Tensor, s: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Equalize each receive port independently, treating other streams as noise."""
+    if (
+        not isinstance(y, torch.Tensor)
+        or not isinstance(h, torch.Tensor)
+        or not isinstance(s, torch.Tensor)
+        or y.ndim < 1
+        or h.ndim != y.ndim + 1
+        or s.ndim != y.ndim + 1
+        or not y.is_complex()
+        or not h.is_complex()
+        or not s.is_complex()
+    ):
+        raise ValueError(_BEAM_INDEPENDENT_DIMENSION_ERROR)
+    num_rx = y.shape[-1]
+    if (
+        h.shape[:-1] != y.shape
+        or h.shape[-2:] != (num_rx, num_rx)
+        or s.shape[:-2] != y.shape[:-1]
+        or s.shape[-2:] != (num_rx, num_rx)
+    ):
+        raise ValueError(_BEAM_INDEPENDENT_DIMENSION_ERROR)
+
+    diagonal = h.diagonal(dim1=-2, dim2=-1)
+    desired_power = diagonal.abs().square()
+    valid = desired_power > 0
+    safe_diagonal = torch.where(valid, diagonal, torch.ones_like(diagonal))
+    x_hat = torch.where(valid, y / safe_diagonal, torch.zeros_like(y))
+    interference_power = (
+        h.abs().square().sum(dim=-1) - desired_power
+    ).clamp_min(0.0)
+    noise_power = s.diagonal(dim1=-2, dim2=-1).real
+    safe_power = torch.where(valid, desired_power, torch.ones_like(desired_power))
+    no_eff = (interference_power + noise_power) / safe_power
+    no_eff = torch.where(valid, no_eff, torch.full_like(no_eff, float("inf")))
+    return x_hat, no_eff
+
+
+def _validate_beam_independent_rx_axis(settings: TxSettings, num_rx: int) -> None:
+    num_streams = len(settings.users) * settings.pusch.num_layers
+    if settings.pusch.num_layers != 1 or num_rx != num_streams:
+        raise ValueError(_BEAM_INDEPENDENT_DIMENSION_ERROR)
+
+
 class DftSOfdmMimoDetector(torch.nn.Module):
     """Detect spread symbols, undo DFT spreading, then produce QAM LLRs."""
 
@@ -168,6 +222,17 @@ class DftSOfdmMimoDetector(torch.nn.Module):
         if method == "lmmse":
             self._detector = LMMSEEqualizer(
                 self._resource_grid, stream_management, device=transmitter.device
+            )
+        elif method == "zf":
+            self._detector = ZFEqualizer(
+                self._resource_grid, stream_management, device=transmitter.device
+            )
+        elif method == "beam-independent":
+            self._detector = OFDMEqualizer(
+                equalizer=beam_independent_equalizer,
+                resource_grid=self._resource_grid,
+                stream_management=stream_management,
+                device=transmitter.device,
             )
         else:
             raise ValueError(f"不支持的 MIMO detector: {method}")
@@ -219,7 +284,7 @@ class DftSOfdmMimoDetector(torch.nn.Module):
         err_var: torch.Tensor,
         no: torch.Tensor,
     ) -> torch.Tensor:
-        if self.method == "lmmse":
+        if self.method in {"lmmse", "zf", "beam-independent"}:
             x_hat, no_eff = self._detector(y, h_hat, err_var, no)
         else:
             x_hat = self._detector(y, h_hat, err_var, no)
@@ -236,7 +301,7 @@ class DftSOfdmMimoDetector(torch.nn.Module):
             x_hat = x_hat.reshape(batch, num_tx, num_streams,
                                   self._num_spread_symbols, self._fft_size)
             x_hat = torch.fft.ifft(x_hat, dim=-1, norm="ortho")
-            if self.method == "lmmse":
+            if self.method in {"lmmse", "zf", "beam-independent"}:
                 no_eff = no_eff.reshape_as(x_hat.real).mean(dim=-1, keepdim=True).expand_as(x_hat.real)
             else:
                 no_eff = torch.as_tensor(no, dtype=x_hat.real.dtype, device=x_hat.device)
@@ -1650,6 +1715,8 @@ class NrPuschRx:
         scrambling_sequences: torch.Tensor | None = None,
     ) -> None:
         settings.validate()
+        if detector == "beam-independent" and settings.pusch.num_layers != 1:
+            raise ValueError(_BEAM_INDEPENDENT_DIMENSION_ERROR)
         if settings.pusch.waveform not in {"dft_s_ofdm", "cp_ofdm"}:
             raise ValueError("不支持的 PUSCH 波形")
         if channel_estimator not in {"perfect", "dmrs", "dmrs-lmmse"}:
@@ -1667,7 +1734,8 @@ class NrPuschRx:
         if not 0.0 < detector_damping <= 1.0:
             raise ValueError("detector_damping 必须位于 (0, 1]")
         if detector not in {
-            "lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic"
+            "lmmse", "lmmse-sic", "k-best", "ep", "mmse-pic", "soft-mmse-pic",
+            "zf", "beam-independent",
         }:
             raise ValueError(f"不支持的 MIMO detector: {detector}")
         if detector_parameter is not None and (
@@ -1676,6 +1744,8 @@ class NrPuschRx:
             or detector_parameter < 1
         ):
             raise ValueError("detector_parameter 必须为正整数")
+        if detector in {"zf", "beam-independent"} and detector_parameter is not None:
+            raise ValueError("detector_parameter 不适用于 zf 或 beam-independent")
         self.settings = settings
         device = use_device(device)
         self.device = device
@@ -1871,6 +1941,8 @@ class NrPuschRx:
             raise ValueError("该接收机使用 frequency 输入；请调用 receive_frequency_grid")
         if iq.ndim != 3 or iq.shape[1] < 1 or not iq.is_complex():
             raise ValueError("iq 形状必须为复数 [batch, rx_antennas, samples]")
+        if self.detector == "beam-independent":
+            _validate_beam_independent_rx_axis(self.settings, iq.shape[1])
         if self.channel_estimator == "perfect":
             if channel_taps is None:
                 raise ValueError("perfect CSI 模式要求提供 CDL channel_taps")
@@ -1911,6 +1983,8 @@ class NrPuschRx:
             raise ValueError(
                 "grid 形状必须为复数 [batch, 1, rx_antennas, configured_symbols, fft_size]"
             )
+        if self.detector == "beam-independent":
+            _validate_beam_independent_rx_axis(self.settings, grid.shape[2])
         if self.channel_estimator == "perfect":
             expected = (
                 grid.shape[0], 1, grid.shape[2], len(self.settings.users),
@@ -2003,6 +2077,11 @@ class NrPuschRx:
                 if self.detector == "soft-mmse-pic" else None
             ),
             "detector_note": (
+                "Per-beam scalar equalization; off-diagonal UE power is modeled as Gaussian interference."
+                if self.detector == "beam-independent"
+                else "Per-RE zero-forcing equalization with effective noise propagated through the inverse."
+                if self.detector == "zf"
+                else
                 "Strongest-first LMMSE-SIC; cancel only after the user's TB CRC passes."
                 if self.detector == "lmmse-sic"
                 else "Native CP-OFDM per-RE Sionna K-best detector."

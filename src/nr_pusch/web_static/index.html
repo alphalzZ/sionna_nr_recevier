@@ -44,6 +44,12 @@
         <div><span class="step">01</span><h2>实验配置</h2></div>
         <p>先选兼容的场景套餐；需要自定义时展开高级配置</p>
       </div>
+      <div class="backend-switch" role="group" aria-label="信道后端">
+        <button class="backend-choice active" id="backend-cdl-button" type="button" aria-pressed="true">CDL 信道</button>
+        <button class="backend-choice" id="backend-rt-button" type="button" aria-pressed="false">Sionna RT</button>
+      </div>
+      <p class="backend-note" id="backend-note">CDL 工作流保持原有配置与接收分析行为。</p>
+      <div id="cdl-config">
       <div class="scenario-picker">
         <label for="scenario-select">实验方案</label>
         <select id="scenario-select" aria-label="选择实验方案"></select>
@@ -71,6 +77,180 @@
           </div>
         </div>
       </details>
+      </div>
+      <div id="rt-config" class="rt-config hidden">
+        <div class="rt-simple-controls">
+          <label>RT 预设
+            <select id="rt-preset-select" aria-label="选择 RT 预设"></select>
+          </label>
+          <label>波形
+            <select id="rt-waveform" aria-label="选择波形">
+              <option value="dft">DFT-s-OFDM</option>
+              <option value="cp">CP-OFDM</option>
+            </select>
+          </label>
+          <label>仿真预算
+            <select id="rt-budget" aria-label="选择 RT 仿真预算">
+              <option value="quick">快速诊断</option>
+              <option value="long">较长统计</option>
+            </select>
+          </label>
+          <button class="button button-quiet" id="rt-reset-preset" type="button">恢复预设</button>
+        </div>
+        <p class="rt-guidance" id="rt-budget-guidance">固定几何、静态快照的条件 BLER；不代表严格时域等价或真实城区 benchmark。</p>
+        <div class="rt-summary-grid" id="rt-summary" aria-live="polite"></div>
+        <div class="rt-scene-layout">
+          <section class="rt-scene-card" aria-labelledby="rt-scene-title">
+            <div class="rt-card-heading"><div><h3 id="rt-scene-title">场景资源</h3><p>仅接受受限 Sionna scene v2.1.0 XML＋ASCII PLY ZIP</p></div></div>
+            <div class="rt-upload-actions">
+              <a class="button button-quiet" id="rt-template-link" href="/api/rt/scene-template.zip" download="rt-scene-template.zip">下载场景模板</a>
+              <button class="button button-dark" id="rt-upload-trigger" type="button">选择场景 ZIP</button>
+              <input id="rt-scene-zip" type="file" accept=".zip,application/zip" hidden>
+            </div>
+            <p class="rt-scene-status" id="rt-scene-status" role="status">内置场景：LoS</p>
+            <p class="rt-mesh-summary" id="rt-mesh-summary"></p>
+            <div class="rt-preview-wrap">
+              <canvas id="rt-scene-preview" role="img" aria-label="RT 场景 XY 俯视预览"></canvas>
+            </div>
+            <p class="rt-preview-note">XY 俯视示意（米）：设备、参数化地面/墙线或导入 mesh 包围盒；不显示传播路径，也不是 3D 可视化。</p>
+          </section>
+          <section class="rt-scene-card rt-quick-facts">
+            <div class="rt-card-heading"><div><h3>固定网页约束</h3><p>载频阵列相位近似，不建模 beam squint。</p></div></div>
+            <ul>
+              <li>四 UE、单层、单 TX 端口；固定 synthetic array。</li>
+              <li>方向图 iso / V、散射系数 0、无折射/散射/衍射/多普勒。</li>
+              <li>参考 SNR 以 UE0 / beam0 标定；每 UE 实际 SNR 可不同。</li>
+              <li>高级配置仅编辑设备、波束、噪声、受限场景和追踪预算。</li>
+            </ul>
+          </section>
+        </div>
+        <details id="rt-advanced" class="rt-advanced">
+          <summary>高级配置：设备、UE、波束、噪声、场景几何与追踪预算</summary>
+          <div id="rt-fields" class="rt-advanced-body">
+            <div class="rt-field-section">
+              <h3>基站与阵列</h3>
+              <div class="rt-field-grid">
+                <label>BS x (m)<input type="number" step="any" data-rt-path="receiver.position_m.0"></label>
+                <label>BS y (m)<input type="number" step="any" data-rt-path="receiver.position_m.1"></label>
+                <label>BS z (m)<input type="number" step="any" data-rt-path="receiver.position_m.2"></label>
+                <label>BS 朝向 yaw (°)<input type="number" step="any" data-rt-path="receiver.orientation_deg.0"></label>
+                <label>BS 朝向 pitch (°)<input type="number" step="any" data-rt-path="receiver.orientation_deg.1"></label>
+                <label>BS 朝向 roll (°)<input type="number" step="any" data-rt-path="receiver.orientation_deg.2"></label>
+                <label>阵列行数<input type="number" min="1" max="64" step="1" data-rt-path="receiver.num_rows"></label>
+                <label>阵列列数<input type="number" min="1" max="64" step="1" data-rt-path="receiver.num_cols"></label>
+                <label>垂直间距 (λ)<input type="number" min="0" max="2" step="any" data-rt-path="receiver.vertical_spacing_wavelengths"></label>
+                <label>水平间距 (λ)<input type="number" min="0" max="2" step="any" data-rt-path="receiver.horizontal_spacing_wavelengths"></label>
+              </div>
+              <p class="rt-fixed-note">固定：接收端 bs、方向图 iso、极化 V、l_min = -6、最大时延扩展 3 μs、synthetic_array = true。</p>
+            </div>
+            <div class="rt-field-section">
+              <h3>四 UE（固定顺序 ue0 → ue3）</h3>
+              <div class="rt-user-grid">
+                <div class="rt-user-heading"><span>UE</span><span>x (m)</span><span>y (m)</span><span>z (m)</span><span>yaw (°)</span><span>pitch (°)</span><span>roll (°)</span><span>功率 (dB)</span></div>
+                <div class="rt-user-row" data-user-index="0"><strong>ue0</strong><input type="number" step="any" data-rt-path="users.0.position_m.0" aria-label="ue0 x 坐标"><input type="number" step="any" data-rt-path="users.0.position_m.1" aria-label="ue0 y 坐标"><input type="number" step="any" data-rt-path="users.0.position_m.2" aria-label="ue0 z 坐标"><input type="number" step="any" data-rt-path="users.0.orientation_deg.0" aria-label="ue0 yaw"><input type="number" step="any" data-rt-path="users.0.orientation_deg.1" aria-label="ue0 pitch"><input type="number" step="any" data-rt-path="users.0.orientation_deg.2" aria-label="ue0 roll"><input type="number" value="0" readonly aria-label="ue0 功率固定为 0 dB"></div>
+                <div class="rt-user-row" data-user-index="1"><strong>ue1</strong><input type="number" step="any" data-rt-path="users.1.position_m.0" aria-label="ue1 x 坐标"><input type="number" step="any" data-rt-path="users.1.position_m.1" aria-label="ue1 y 坐标"><input type="number" step="any" data-rt-path="users.1.position_m.2" aria-label="ue1 z 坐标"><input type="number" step="any" data-rt-path="users.1.orientation_deg.0" aria-label="ue1 yaw"><input type="number" step="any" data-rt-path="users.1.orientation_deg.1" aria-label="ue1 pitch"><input type="number" step="any" data-rt-path="users.1.orientation_deg.2" aria-label="ue1 roll"><input type="number" step="any" data-rt-path="users.1.power_scale_db" aria-label="ue1 功率 dB"></div>
+                <div class="rt-user-row" data-user-index="2"><strong>ue2</strong><input type="number" step="any" data-rt-path="users.2.position_m.0" aria-label="ue2 x 坐标"><input type="number" step="any" data-rt-path="users.2.position_m.1" aria-label="ue2 y 坐标"><input type="number" step="any" data-rt-path="users.2.position_m.2" aria-label="ue2 z 坐标"><input type="number" step="any" data-rt-path="users.2.orientation_deg.0" aria-label="ue2 yaw"><input type="number" step="any" data-rt-path="users.2.orientation_deg.1" aria-label="ue2 pitch"><input type="number" step="any" data-rt-path="users.2.orientation_deg.2" aria-label="ue2 roll"><input type="number" step="any" data-rt-path="users.2.power_scale_db" aria-label="ue2 功率 dB"></div>
+                <div class="rt-user-row" data-user-index="3"><strong>ue3</strong><input type="number" step="any" data-rt-path="users.3.position_m.0" aria-label="ue3 x 坐标"><input type="number" step="any" data-rt-path="users.3.position_m.1" aria-label="ue3 y 坐标"><input type="number" step="any" data-rt-path="users.3.position_m.2" aria-label="ue3 z 坐标"><input type="number" step="any" data-rt-path="users.3.orientation_deg.0" aria-label="ue3 yaw"><input type="number" step="any" data-rt-path="users.3.orientation_deg.1" aria-label="ue3 pitch"><input type="number" step="any" data-rt-path="users.3.orientation_deg.2" aria-label="ue3 roll"><input type="number" step="any" data-rt-path="users.3.power_scale_db" aria-label="ue3 功率 dB"></div>
+              </div>
+            </div>
+            <div class="rt-field-section">
+              <h3>波束与后级噪声</h3>
+              <div class="rt-user-grid">
+                <div class="rt-user-heading rt-beam-heading"><span>波束</span><span>方位偏差 (°)</span><span>俯仰偏差 (°)</span></div>
+                <div class="rt-user-row rt-beam-row"><strong>beam0 / ue0</strong><input type="number" step="any" data-rt-path="beams.azimuth_offset_deg.0"><input type="number" step="any" data-rt-path="beams.elevation_offset_deg.0"></div>
+                <div class="rt-user-row rt-beam-row"><strong>beam1 / ue1</strong><input type="number" step="any" data-rt-path="beams.azimuth_offset_deg.1"><input type="number" step="any" data-rt-path="beams.elevation_offset_deg.1"></div>
+                <div class="rt-user-row rt-beam-row"><strong>beam2 / ue2</strong><input type="number" step="any" data-rt-path="beams.azimuth_offset_deg.2"><input type="number" step="any" data-rt-path="beams.elevation_offset_deg.2"></div>
+                <div class="rt-user-row rt-beam-row"><strong>beam3 / ue3</strong><input type="number" step="any" data-rt-path="beams.azimuth_offset_deg.3"><input type="number" step="any" data-rt-path="beams.elevation_offset_deg.3"></div>
+              </div>
+              <div class="rt-field-grid rt-small-grid">
+                <label>相位量化位数<input type="number" min="0" max="16" step="1" data-rt-path="beams.phase_bits"></label>
+                <label>后级噪声比<input type="number" min="0" max="0.01" step="any" data-rt-path="noise.post_combiner_ratio"></label>
+              </div>
+            </div>
+            <div class="rt-field-section">
+              <h3>场景来源与几何</h3>
+              <div class="rt-field-grid">
+                <label>来源
+                  <select id="rt-scene-source">
+                    <option value="builtin">内置场景</option>
+                    <option value="parameterized">参数化几何</option>
+                    <option value="imported">导入场景包</option>
+                  </select>
+                </label>
+                <label>场景
+                  <select id="rt-scene-kind">
+                    <option value="empty">LoS（空场景）</option>
+                    <option value="ground">地面</option>
+                    <option value="ground_wall">地面＋墙面</option>
+                    <option value="custom">导入 ZIP</option>
+                  </select>
+                </label>
+              </div>
+              <div id="rt-geometry-fields" class="rt-geometry-fields">
+                <h4>地面</h4>
+                <div class="rt-field-grid">
+                  <label>x min (m)<input type="number" step="any" data-rt-path="geometry.ground_bounds_m.0"></label>
+                  <label>x max (m)<input type="number" step="any" data-rt-path="geometry.ground_bounds_m.1"></label>
+                  <label>y min (m)<input type="number" step="any" data-rt-path="geometry.ground_bounds_m.2"></label>
+                  <label>y max (m)<input type="number" step="any" data-rt-path="geometry.ground_bounds_m.3"></label>
+                  <label>高度 (m)<input type="number" step="any" data-rt-path="geometry.ground_height_m"></label>
+                  <label>材料<select data-rt-path="geometry.ground_material"><option value="concrete">concrete</option><option value="brick">brick</option></select></label>
+                  <label>厚度 (m)<input type="number" min="0" max="10" step="any" data-rt-path="geometry.ground_thickness_m"></label>
+                </div>
+                <h4 id="rt-wall-heading">墙面（仅地面＋墙面场景）</h4>
+                <div id="rt-wall-fields" class="rt-field-grid">
+                  <label>起点 x (m)<input type="number" step="any" data-rt-path="geometry.wall_start_xy_m.0"></label>
+                  <label>起点 y (m)<input type="number" step="any" data-rt-path="geometry.wall_start_xy_m.1"></label>
+                  <label>终点 x (m)<input type="number" step="any" data-rt-path="geometry.wall_end_xy_m.0"></label>
+                  <label>终点 y (m)<input type="number" step="any" data-rt-path="geometry.wall_end_xy_m.1"></label>
+                  <label>底部高度 (m)<input type="number" step="any" data-rt-path="geometry.wall_base_height_m"></label>
+                  <label>墙高 (m)<input type="number" min="0" step="any" data-rt-path="geometry.wall_height_m"></label>
+                  <label>材料<select data-rt-path="geometry.wall_material"><option value="concrete">concrete</option><option value="brick">brick</option></select></label>
+                  <label>厚度 (m)<input type="number" min="0" max="10" step="any" data-rt-path="geometry.wall_thickness_m"></label>
+                </div>
+              </div>
+              <p class="rt-fixed-note">导入 ZIP 必须只含根 scene.xml 与 meshes/*.ply；上传后由服务端严格校验并生成场景 ID。</p>
+            </div>
+            <div class="rt-field-section">
+              <h3>追踪预算与配置文件</h3>
+              <div class="rt-field-grid">
+                <label>载频 (Hz)<input type="number" min="100000000" max="100000000000" step="any" data-rt-path="rt.carrier_frequency_hz"></label>
+                <label>随机种子<input type="number" min="0" step="1" data-rt-path="rt.seed"></label>
+                <label>反射深度<input type="number" min="0" max="3" step="1" data-rt-path="rt.max_depth"></label>
+                <label>每源采样数<input type="number" min="10000" max="200000" step="1" data-rt-path="rt.samples_per_src"></label>
+                <label>最大路径数<input type="number" min="1" max="10000" step="1" data-rt-path="rt.max_num_paths_per_src"></label>
+                <label>RT 配置文件<select id="rt-profile-select"></select></label>
+                <label>TX 配置文件<select id="rt-tx-profile-select"></select></label>
+                <label>仿真配置文件<select id="rt-simulation-profile-select"></select></label>
+                <label>PHY 设备<select id="rt-phy-device" aria-label="RT BLER PHY 设备"></select></label>
+              </div>
+              <p class="rt-device-status" id="rt-device-status"></p>
+            </div>
+            <div id="rt-config-error" class="rt-config-error hidden" role="alert"></div>
+            <details class="rt-expert">
+              <summary>专家编辑：RT TOML（编辑后点“应用 TOML”；失败时保留原输入）</summary>
+              <label class="visually-hidden" for="rt-expert-editor">RT TOML</label>
+              <textarea id="rt-expert-editor" spellcheck="false" aria-label="RT TOML 专家编辑器"></textarea>
+              <div class="rt-expert-actions"><span id="rt-expert-status" role="status">表单参数为当前有效配置。</span><button class="button button-dark" id="rt-apply-toml" type="button">应用 TOML</button></div>
+            </details>
+            <details class="rt-payload-config">
+              <summary>TX 与仿真 TOML：编辑后预检会使用当前文本；保存按钮才会写回所选 profile</summary>
+              <div class="rt-payload-grid">
+                <section>
+                  <label for="rt-tx-editor">发射机 TX TOML</label>
+                  <textarea id="rt-tx-editor" spellcheck="false" aria-label="RT 工作流 TX TOML 编辑器"></textarea>
+                  <button class="button button-dark" id="rt-save-tx-config" type="button">保存所选 TX profile</button>
+                </section>
+                <section>
+                  <label for="rt-simulation-editor">仿真 BLER TOML</label>
+                  <textarea id="rt-simulation-editor" spellcheck="false" aria-label="RT 工作流仿真 TOML 编辑器"></textarea>
+                  <button class="button button-dark" id="rt-save-simulation-config" type="button">保存所选仿真 profile</button>
+                </section>
+              </div>
+            </details>
+          </div>
+        </details>
+      </div>
     </section>
 
     <section class="panel run-panel">
@@ -97,18 +277,29 @@
         <div><span class="step">03</span><h2>仿真结果</h2></div>
         <div class="result-actions"><p id="result-subtitle">完成仿真后将在此显示结果</p><a class="download-link hidden" id="download-csv" href="#" download>下载 CSV</a><a class="download-link hidden" id="download-json" href="#" download>下载 JSON</a></div>
       </div>
+      <div id="rt-result-summary" class="rt-result-summary hidden">
+        <div class="rt-condition-label">固定 RT 快照条件 BLER；参考 SNR 以 UE0 / beam0 标定。</div>
+        <div id="rt-strict-warning" class="rt-strict-warning hidden" role="status"></div>
+        <div id="rt-validation-details" class="rt-validation-details"></div>
+        <div class="rt-result-downloads">
+          <a class="download-link hidden" id="download-validation" href="#">下载准入报告</a>
+          <a class="download-link hidden" id="download-snapshot" href="#">下载快照 NPZ</a>
+          <a class="download-link hidden" id="download-snapshot-json" href="#">下载快照 JSON</a>
+          <a class="download-link hidden" id="download-repro" href="#">下载回放配置包</a>
+        </div>
+      </div>
       <div class="results-empty" id="results-empty">
         <div class="empty-graphic" aria-hidden="true"><span></span><span></span><span></span><span></span><i></i></div>
         <h3>等待第一组数据</h3><p>启动任务后，曲线和指标表会随结果自动更新。</p>
       </div>
       <div class="results-content hidden" id="results-content">
         <div class="chart-card">
-          <div class="chart-title"><div><h3>SNR vs. BLER</h3><p>对数刻度；空心点表示零误块，绘于 1/TB 统计上限</p></div><div class="legend" id="chart-legend"></div></div>
+          <div class="chart-title"><div><h3>SNR vs. BLER</h3><p id="chart-description">对数刻度；零误块以统计上界标记，不绘制伪观测值。</p></div><div class="chart-tools"><label id="rt-user-filter-wrap" class="rt-user-filter hidden">用户<select id="rt-user-filter" aria-label="筛选 RT 结果用户"><option value="all">all</option><option value="ue0">ue0</option><option value="ue1">ue1</option><option value="ue2">ue2</option><option value="ue3">ue3</option></select></label><div class="legend" id="chart-legend"></div></div></div>
           <div class="canvas-wrap"><canvas id="bler-chart" role="img" aria-label="SNR 与 BLER 曲线图"></canvas></div>
         </div>
         <div class="table-card">
           <div class="table-title"><h3>测量明细</h3><span id="table-count"></span></div>
-          <div class="table-scroll"><table><thead><tr><th>信道估计器 / MIMO 检测器</th><th>SNR (dB)</th><th>BLER</th><th>BER</th><th>CRC 失败率</th><th>帧数</th><th>传输块</th><th>误块</th><th>耗时</th></tr></thead><tbody id="metrics-body"></tbody></table></div>
+          <div class="table-scroll"><table><thead><tr><th>用户</th><th>信道估计器 / MIMO 检测器</th><th>SNR (dB)</th><th>实际 SNR (dB)</th><th>参考 SNR (dB)</th><th>BLER</th><th>95% CI</th><th>BER</th><th>状态 / 原因</th><th>CRC 失败率</th><th>帧数</th><th>传输块</th><th>误块</th><th>耗时</th></tr></thead><tbody id="metrics-body"></tbody></table></div>
         </div>
       </div>
     </section>

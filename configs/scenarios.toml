@@ -207,3 +207,40 @@ description = "CP-OFDM、12 RB、4 用户各 1 层但占用 4 个发射端口，
 tx = "pusch_4ue_4tx_codebook_cp12.toml"
 channel = "cdl_38_901_4tx_8rx.toml"
 simulation = "bler_cp_smoke.toml"
+
+# ── Sionna RT · 固定快照条件 BLER（网页快速诊断）──
+[[scenarios]]
+id = "rt-los-quick"
+label = "Sionna RT · LoS"
+description = "4 用户 DFT-s-OFDM LoS 静态快照；9 个检测器/SNR 点，每点最多 2 帧，仅作快速诊断。"
+channel_backend = "rt"
+tx = "pusch_4ue.toml"
+rt = "rt_beam_los.toml"
+simulation = "bler_rt_beam_web_quick.toml"
+
+[[scenarios]]
+id = "rt-ground-quick"
+label = "Sionna RT · 地面反射"
+description = "LoS＋地面镜面反射固定快照；频域 BLER 使用页面显示的有界近似验收。"
+channel_backend = "rt"
+tx = "pusch_4ue.toml"
+rt = "rt_beam_ground.toml"
+simulation = "bler_rt_beam_web_quick.toml"
+
+[[scenarios]]
+id = "rt-ground-wall-quick"
+label = "Sionna RT · 地面＋墙面"
+description = "LoS＋地面/墙面镜面反射固定快照；频域 BLER 使用页面显示的有界近似验收，不代表严格时域等价。"
+channel_backend = "rt"
+tx = "pusch_4ue.toml"
+rt = "rt_beam_ground_wall.toml"
+simulation = "bler_rt_beam_web_quick.toml"
+
+[[scenarios]]
+id = "rt-cp-los-quick"
+label = "Sionna RT · CP-OFDM LoS"
+description = "4 用户 CP-OFDM LoS 固定快照；9 个检测器/SNR 点，每点最多 2 帧，仅作快速诊断。"
+channel_backend = "rt"
+tx = "pusch_rt_4ue_cp.toml"
+rt = "rt_beam_los.toml"
+simulation = "bler_rt_beam_web_quick.toml"

@@ -125,7 +125,7 @@ class TxSettings:
     def effective_sionna_mcs(self) -> tuple[int, int]:
         """Return a non-transform Sionna MCS with equivalent Qm and code rate.
 
-        Sionna 2.0.1 does not expose transform-precoding through PUSCHConfig.
+        Sionna 2.2.0 does not expose transform-precoding through PUSCHConfig.
         Its TB encoder still accepts the same modulation order and target rate,
         so map the configured transform-precoding MCS to an equivalent native
         MCS for encoding. For table 1/index 20 this resolves to table 1/index 21.

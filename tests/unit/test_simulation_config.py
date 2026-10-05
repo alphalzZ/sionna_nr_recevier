@@ -181,6 +181,18 @@ class BlerSettingsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             settings.validate()
 
+    def test_rejects_scalar_detector_parameter_for_rt_detector_arms(self):
+        base = BlerSettings.from_toml(ROOT / "configs" / "bler_4ue_cdl.toml")
+        for detector in ("zf", "beam-independent"):
+            settings = dataclasses.replace(
+                base,
+                detector_parameter=16,
+                detectors=("lmmse", detector),
+            )
+            with self.subTest(detector=detector):
+                with self.assertRaisesRegex(ValueError, "detector_parameter"):
+                    settings.validate()
+
     def test_rejects_unknown_detector(self):
         settings = BlerSettings(
             snr_db=(10.0,), batch_size=1, max_frames_per_snr=1,

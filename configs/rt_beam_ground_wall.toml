@@ -1,0 +1,53 @@
+[rt]
+scene = "ground_wall"
+carrier_frequency_hz = 3500000000.0
+synthetic_array = true
+seed = 13
+max_depth = 2
+samples_per_src = 100000
+max_num_paths_per_src = 10000
+
+[receiver]
+name = "bs"
+position_m = [0.0, 0.0, 25.0]
+orientation_deg = [0.0, 0.0, 0.0]
+num_rows = 8
+num_cols = 8
+vertical_spacing_wavelengths = 0.5
+horizontal_spacing_wavelengths = 0.5
+pattern = "iso"
+polarization = "V"
+l_min = -6
+max_delay_spread_s = 3e-6
+
+[[users]]
+name = "ue0"
+position_m = [153.2088886, -128.5575220, 1.5]
+orientation_deg = [0.0, 0.0, 0.0]
+power_scale_db = 0.0
+
+[[users]]
+name = "ue1"
+position_m = [193.1851652, -51.7638090, 1.5]
+orientation_deg = [0.0, 0.0, 0.0]
+power_scale_db = 0.0
+
+[[users]]
+name = "ue2"
+position_m = [193.1851652, 51.7638090, 1.5]
+orientation_deg = [0.0, 0.0, 0.0]
+power_scale_db = 0.0
+
+[[users]]
+name = "ue3"
+position_m = [153.2088886, 128.5575220, 1.5]
+orientation_deg = [0.0, 0.0, 0.0]
+power_scale_db = 0.0
+
+[beams]
+azimuth_offset_deg = [0.0, 0.0, 0.0, 0.0]
+elevation_offset_deg = [0.0, 0.0, 0.0, 0.0]
+phase_bits = 0
+
+[noise]
+post_combiner_ratio = 0.001

@@ -1,6 +1,6 @@
 # Transmitter interface and MIMO coverage
 
-`TxSettings` builds one native Sionna 2.0.1 `PUSCHConfig` per UE. Users share
+`TxSettings` builds one native Sionna 2.2.0 `PUSCHConfig` per UE. Users share
 PUSCH resource/MCS/layer settings and carry separate transport blocks and
 non-overlapping DMRS port sets. Each UE supports 1–4 layers, with at most eight
 concurrent layers across all UEs. Native antenna-port counts are 1, 2, or 4;
@@ -30,6 +30,6 @@ OCC-first order (ports 0/1 on the even comb). RX capture profiles explicitly
 set `dft_s_dmrs_port_order = "native"`; other profiles default to `"comb-first"`.
 Single-symbol DMRS permits type-1 ports 0–3; eight streams require length 2,
 ports 0–7, and `dmrs_additional_position` 0 or 1. This adapter supports no
-group/sequence hopping. Sionna's composite lacks transform-precoding MCS
-tables, so the adapter selects an equivalent native MCS with the same
-modulation order and target rate, retaining the configured MCS in metadata.
+group/sequence hopping. Sionna 2.2.0's `PUSCHConfig` does not expose
+transform-precoding MCS tables, so the adapter selects an equivalent native MCS
+with the same modulation order and target rate, retaining the configured MCS in metadata.

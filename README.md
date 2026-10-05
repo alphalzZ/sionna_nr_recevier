@@ -4,7 +4,7 @@
 
 ## 当前发送端
 
-当前实现以 Sionna 2.0.1 的 `PUSCHTransmitter` 生成 PUSCH 数据资源网格，并支持 CP-OFDM 和 DFT-s-OFDM 波形输出。DFT-s-OFDM 对数据符号应用酉 DFT，并按 type-1 低 PAPR 序列生成 DMRS 后进行 OFDM 调制；`[pusch].dmrs_additional_position` 支持 0、1、2，由 Sionna 资源图决定各 DMRS occasion。由于 Sionna 2.0.1 的组合 PUSCH 发射器不支持 transform precoding，配置中的 DFT 预编码 MCS 会映射到同调制阶数和码率的原生 Sionna MCS，以复用其 TB 编码器。当前活动配置为 DFT-s-OFDM MCS table 1/index 20，目标码率 0.6015625，TB 大小 28,168 bit。
+当前实现使用 Sionna 2.2.0 的 `PUSCHTransmitter` 生成 PUSCH 数据资源网格，并支持 CP-OFDM 和 DFT-s-OFDM 波形输出。DFT-s-OFDM 对数据符号应用酉 DFT，并按 type-1 低 PAPR 序列生成 DMRS 后进行 OFDM 调制；`[pusch].dmrs_additional_position` 支持 0、1、2，由 Sionna 资源图决定各 DMRS occasion。Sionna 2.2.0 的 `PUSCHConfig` 不暴露 transform precoding，因此配置中的 DFT 预编码 MCS 映射到同调制阶数和码率的原生 Sionna MCS。当前活动配置为 DFT-s-OFDM MCS table 1/index 20，目标码率 0.6015625，TB 大小 28,168 bit。
 
 CP-OFDM 沿用 Sionna 原生 PUSCH 资源网格与 DMRS 映射。`dmrs_beta` 必须
 匹配当前 DMRS 组数和长度对应的 Sionna 原生值；配置加载时校验，不会静默
@@ -77,20 +77,79 @@ nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /tmp/pusch_rx_grid.npz --
 
 频域信道 NPZ 提供 `grid`、`per_user_grid` 和 `channel_frequency_response`，可直接输入接收机，不进行 OFDM 调制、时域信道卷积或接收端 OFDM 解调。
 
+## Sionna RT 四波束固定快照链路
+
+RT 实验使用独立于 CDL 的链路：`nr-pusch-rt-channel` 生成静态阵元/波束快照，`nr-pusch-beam-bler` 在固定传播快照上运行编码 PUSCH。RT 不调用 CDL 信道或 CDL tap-power prior；结果是指定几何和固定信道条件下的 BLER，不代表动态无线信道或真实城区 benchmark。模型只含静态单频载波 LoS/镜面多径，不含移动、多普勒/ICI 或 RF 链互串。
+
+```bash
+nr-pusch-rt-channel --tx-config configs/pusch_4ue.toml \
+  --rt-config configs/rt_beam_los.toml \
+  --output /tmp/nr-rt-validation/dft/channel.npz
+nr-pusch-beam-bler --tx-config configs/pusch_4ue.toml \
+  --channel-snapshot /tmp/nr-rt-validation/dft/channel.npz \
+  --simulation-config configs/bler_rt_beam_smoke.toml \
+  --output /tmp/nr-rt-validation/dft/results.csv --device cpu
+```
+
+快照 NPZ 保存阵元路径、阵元域与波束域频响/时域 taps；同名 JSON 记录 RT 版本、场景资源 hash、频率轴、TA、CP 与配置摘要。加载时会校验当前 TX 资源网格/DMRS 几何、UE 顺序、文件摘要和运行时版本；缺文件或不匹配时失败关闭，不回退 CDL。结果写 CSV 与 JSON sidecar，可选 `--progress-jsonl`；每个估计器/检测器/SNR 点有逐 UE 行和 `all` 聚合行。新检测器 `beam-independent` 将其它 UE 泄漏作为高斯等效干扰，`zf` 做逐 RE 零迫；二者与既有六种联合检测器共享 NR TB 解码。联合接收用阵元噪声诱发的完整波束协方差白化，独立接收只作逐波束噪声归一化。RT 只支持 `perfect`/`dmrs`，不接受依赖 CDL 先验的 `dmrs-lmmse`。
+
+`[noise].post_combiner_ratio` 表示后级合路噪声方差/阵元噪声方差，缺省为 `0.001`，`--post-combiner-ratio` 可覆盖并写入结果清单。以下可在相同快照、payload 与标准复高斯噪声 draw 上扫描 `0`、`0.001`、`0.01`；该 smoke 是连通性诊断，不是统计 BLER 结论：
+
+```bash
+for ratio in 0 0.001 0.01; do
+  nr-pusch-beam-bler --tx-config configs/pusch_4ue.toml \
+    --channel-snapshot /tmp/nr-rt-validation/dft/channel.npz \
+    --simulation-config configs/bler_rt_beam_smoke.toml \
+    --post-combiner-ratio "$ratio" \
+    --output "/tmp/nr-rt-validation/dft/ratio-${ratio}.csv" --device cpu
+done
+```
+
+### RT 专用配置
+
+| 配置 | 用途 |
+|---|---|
+| `configs/rt_beam_los.toml` | 3.5 GHz、空场景、8×8 V 极化 iso 阵列、四 UE、深度 0；LoS 传播基线。 |
+| `configs/rt_beam_ground.toml` | 相同几何，ground 场景、追踪深度 1。 |
+| `configs/rt_beam_ground_wall.toml` | 相同几何，ground+wall 场景、追踪深度 2。 |
+| `configs/pusch_rt_4ue_cp.toml` | CP-OFDM 接口/正确性对照；四 UE 单层、50 RB、MCS table 1/index 20、30-kHz SCS。统计主 profile 仍是 `configs/pusch_4ue.toml`。 |
+| `configs/bler_rt_beam_smoke.toml` | CPU、60/80 dB、最多 2 帧/点，覆盖 `perfect`/`dmrs` 和两种新检测器加既有六种 detector；仅连通性检查。 |
+| `configs/bler_rt_beam.toml` | CUDA:0、15–50 dB 每 5 dB、batch 20、最多 2,000 帧/SNR、target 200 errors、perfect/DMRS × 三个 detector、`stop_at_zero_bler=true`；最多 48 个 arm×SNR 点，Web gate 通过后才运行。这是配置预算，不是已测统计结果。 |
+| `configs/bler_rt_beam_web_quick.toml` | 当前 CPU profile：10/15/17/20 dB、batch 16、最多 2,000 帧/SNR、target 100 errors、DMRS × 三个 detector、`stop_at_zero_bler=false`；12 个 arm×SNR 点。文件名虽含 quick，该当前工作量并非两帧 smoke，也不是统计基准。 |
+
+### RT 物理与编码验收
+
+`nr-pusch-beam-validate` 将传播、波束、噪声、无编码、编码 PUSCH、多径、时域和单因素扫描写入 JSON gate 报告；任一必需检查失败时返回非零。`--simulation-config` 仅用于 `pusch`、`sweeps`、`all` 阶段。`all` 固定按 LoS、beam、noise、uncoded、PUSCH、reflection/path convergence、time、sweeps 顺序执行，要求 ground-wall 场景及两帧 smoke 预算：
+
+```bash
+nr-pusch-beam-validate --tx-config configs/pusch_4ue.toml \
+  --rt-config configs/rt_beam_ground_wall.toml \
+  --simulation-config configs/bler_rt_beam_smoke.toml \
+  --stage all --output /tmp/nr-rt-validation/all/report.json --device cpu
+```
+
+`time` 阶段用同一静态 tap 对照 native OFDM 解调与有限 tap 频响；严格 FD/TD 等价仍要求原 `1e-5` RMS 门槛。`multipath` 使用 100k/200k samples-per-source 配对检查镜面反射和 CFR 收敛。`sweeps` 扫描用户间隔、UE3 功率、公共波束偏移、相位量化、场景、CSI 估计器和检测器；每点仅两帧，是连通性诊断，不是统计 BLER。按本仓库研究协议，CLI 统计应先通过 `all` 严格 gate；通用 `nr-pusch-beam-bler` 不默认自动门禁，只有提供 `--web-validation` 时才验证 Web 报告，而 Web worker 始终要求 `web-frequency-v1` 通过。该 Web gate 不改写严格报告。
+
+2026-10-04 ground-wall DFT smoke：`all` 的前六个 gate（包括 160/160 coded rows 与 path-convergence）通过，但 time gate 的 FD/TD RMS 为 `3.3515e-4`（门槛 `1e-5`），因此停止在 sweeps 前；单独的 `sweeps` stage 已通过 20/20 个两帧诊断点。另一个 CP-OFDM LoS 正确性 smoke 的 time gate 通过（FD/TD RMS `1.4443e-6`），32 个两帧 coded rows 均 complete、0/8 TB errors；完整 unittest 147 tests 通过（302.921s）。这些都不是统计 BLER。未运行 CUDA 统计 BLER。实测细节与完整 tap 保留说明见 `docs/dmrs_tap_power_prior.md` §9。
+
+`configs/scenarios.toml` 保留原 25 个 CDL bundle，并新增 4 个 `channel_backend="rt"` 快速预设；Web 默认仍为 CDL。RT Web 一键运行会在同一 FIFO job 内先追踪/验收，再执行 BLER；advanced 支持参数化 ground/ground-wall 几何及受限的 XML＋PLY ZIP 导入。
+
 ## 多用户接收和 BLER
 
 `NrPuschRx` 以 Sionna PUSCH TB 解码器合并每 UE 多层码字。时域 IQ 经 OFDM 解调，频域网格直接检测；DFT-s-OFDM 数据先均衡、按层逆 DFT。`perfect` 接收物理 TX 天线 CSI，codebook 时应用原生预编码矩阵；`dmrs` 从每层导频的 comb/OCC 联合估计有效层信道，`dmrs-lmmse` 加入 CDL tap-power prior。保留原 4 UE 单层捕获的 MATLAB 对照估计路径。信道估计输出 `[batch,1,rx_antenna,user,layer,symbol,subcarrier]`，最终 TB/CRC 按 UE。
 
 CP-OFDM 使用原生逐 RE 信道估计和检测路径，不做 DFT 解扩/IDFT；支持
-`lmmse`、`lmmse-sic`、`k-best`、`ep`、`mmse-pic` 和 `soft-mmse-pic`。
-EP 使用 double precision；K-best 要求接收天线数不少于总流数。Type-2
+`lmmse`、`lmmse-sic`、`k-best`、`ep`、`mmse-pic`、`soft-mmse-pic`、
+`zf` 和 `beam-independent`。`beam-independent` 要求每用户单层且观测端口数等于总流数，
+将其它用户功率作为高斯等效干扰；RT runner 在 ZF 前检查逐 RE 数值秩，失败点标为
+`infeasible_rank`。EP 使用 double precision；K-best 要求接收天线数不少于总流数。Type-2
 DMRS 与数据共用 OFDM 符号时，估计只使用原生 pilot mask 中的 RE。
 
 DMRS 拟合使用配置的 `max_delay_spread_s` 限制候选 tap 范围，窗口长度随几何变化：4 用户 DFT-s-OFDM 基线（18 MHz 采样率）为 `-6..60`、共 67 taps；CP-OFDM 2 用户 2 层基线（4.32 MHz）为 `-6..19`、共 26 taps。这是时延范围先验，不读取本帧真实信道系数。多个 DMRS occasion 各自拟合 CSI，再按 OFDM 符号位置对相邻估计做复数线性插值；首个/末个 occasion 之外保持最近估计。`err_var` 按插值权重平方传播，假设各 occasion 的估计噪声独立，不包含信道时变造成的插值模型误差；高 Doppler 场景仍需独立验证。
 
 ### CDL tap-power LMMSE 验证
 
-`dmrs-lmmse` 是显式 opt-in；现有 `dmrs` 默认和活动 TX/CDL profile 不变。LMMSE 算法验证固定单符号 DMRS；另行比较 `dmrs_additional_position=0/1/2` 的可靠性与 TBS 资源代价，结果见 `docs/receiver_optimization.md`，不能视为等吞吐比较。tap-power prior 的物理含义、需要训练几份先验、以及跨天线配置复用的理论依据与当前限制见 `docs/dmrs_tap_power_prior.md`；本文档只给出生成、验收和发布步骤。
+`dmrs-lmmse` 是显式 opt-in；现有 `dmrs` 默认和活动 TX/CDL profile 不变。LMMSE 算法验证固定单符号 DMRS；另行比较 `dmrs_additional_position=0/1/2` 的可靠性与 TBS 资源代价，结果见 `docs/receiver_optimization.md`，不能视为等吞吐比较。tap-power prior 的物理含义、所需份数及 CDL prior 的验收/发布规则见 `docs/dmrs_tap_power_prior.md`；RT `web-frequency-v1` 是独立传播/FD 近似门槛，不训练、读取或发布该 CDL prior，也不能改变 §7 的 prior 发布条件。
 
 短时连通性验证（`--frames-per-snr` 只覆盖 development/holdout，60 dB 安全检查仍使用配置中的 64 帧）：
 
@@ -185,9 +244,15 @@ nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38
 /home/le-lei/workspace/test/.venv/bin/nr-pusch-web --host 127.0.0.1 --port 8765
 ```
 
-浏览器打开 `http://127.0.0.1:8765/`。页面可选择并编辑发送、CDL 信道和 BLER TOML profile；“保存配置”会校验并覆盖所选 `configs/*.toml`，而直接“启动仿真”使用当前编辑器文本创建独立快照，无需先保存。建议先用 `bler_smoke.toml` 熟悉操作，再选择完整扫描配置。运行任务按提交顺序串行执行，避免多个任务同时争用 GPU；页面显示每个检测器和 SNR 点的进度、BLER 曲线、统计表和日志，结果可下载为 CSV/JSON。任务及配置快照保存在被 Git 忽略的 `runs/web/<任务 ID>/`，服务重启后仍可查看已有结果；正在运行的进程因服务中断而结束时，任务会标记为失败。网页只绑定本机回环地址；需要从其他机器访问时请使用 SSH 端口转发。
+浏览器打开 `http://127.0.0.1:8765/`。CDL 页沿用原三个配置编辑器、保存/预检和串行任务；接收分析页仍使用原 RX 流程。运行任务按提交顺序串行执行，进度、图表、历史、日志与结果下载仍归属各自持久 job。该服务按 local-only 工具设计；绑定非 loopback 地址前必须在外部提供认证和访问控制，不能直接作为公网服务。
 
-页面顶部“选择实验方案”提供 `configs/scenarios.toml` 里的 25 个预设组合，选中后自动填入三个 profile 的文本并做兼容性预检；预设的 TX/信道/仿真配置不可再单独拆分修改，需要改参数时用下面的高级编辑。分组覆盖：4 用户 DFT-s-OFDM 的 CDL-A…E、`cdl_38_901_4x4_speed.toml`（3 m/s Doppler）、DMRS-LMMSE 与三估计器矩阵、CPU/GPU 两种检测器扫描；1 用户单层与 1 用户 4 层；4 用户 4 端口码本；8 流的 CDL-A/B/C 与 MMSE-PIC；2 用户 CP-OFDM 4 流的 CDL-A…E、type-2 DMRS（`dmrs_additional_position=1`）、DMRS-LMMSE；以及 4 用户 CP-OFDM 12 RB 4 端口码本。标 `[需已发布先验]` 的三个场景要先按 §"CDL tap-power LMMSE 验证" 生成本机先验，否则预检直接报“未找到与当前 TX/CDL/抽头窗口匹配的已通过验证的 DMRS prior”。
+CDL 仍有 25 个原预设；Sionna RT 页有 `rt-los-quick`、`rt-ground-quick`、`rt-ground-wall-quick`、`rt-cp-los-quick` 四个预设。选择场景、DFT/CP 波形和预算后一次运行会自动完成 tracing、Web gate 和 BLER；CP 通过 TX profile 派生为自定义组合。当前 quick profile 见上表，包含最多 2,000 帧/SNR；其名称不代表低工作量。Long profile 是 CUDA:0、8 SNR、batch 20、最多 2,000 帧/SNR、target 200、perfect/DMRS × 三个 detector，并可在首个零错误点后按每个 estimator/detector arm 跳过更高 SNR；跳过行标记为 skipped、BLER/CI 为空、计入进度但不算作 BLER=0。Web RT 限制由 `/api/rt/options` 返回；输入超限会显示具体字段/数值/上限的弹窗并保持运行禁用，不自动缩小或改设备。
+
+高级配置可编辑 BS/UE、阵列、功率、波束、噪声、参数化地面/墙面、追踪预算及 RT/TX/BLER TOML。导入仅接受根 `scene.xml` 与受限 ASCII 三角网格 `meshes/*.ply`；PLY 顶点采用世界 XYZ、单位米，需在导入前完成定位，不支持 Mitsuba transform 或单位转换；预览只显示 XY 包围盒，不显示传播路径。JSON 请求体限 12 MiB、ZIP 限 8 MiB、解压内容总量限 32 MiB。该接口不是任意 Mitsuba 工程或 3D 拖放建模器。`GET /api/rt/options` 查询设备/限制，`GET /api/rt/scene-template.zip` 下载模板，`POST /api/rt/scenes` 导入包，`POST /api/rt/config` 解析 RT 参数。每个 job 复制场景和配置，可下载 validation report、NPZ/JSON snapshot 与无主机绝对路径的 `reproducibility.zip`。配置超限时弹窗列出所有超限字段、当前值与允许范围；profile 不会被自动改写。
+
+RT 网页 gate `web-frequency-v1` 要求 native FD/TD 相对 RMS ≤ 0.001、tap-window/CP 外有效能量与直接 CFR 截断误差各 ≤ 1%，mesh 场景还需同 seed 的双采样路径收敛。原严格 FD/TD `1e-5` 结果保留为独立质量标记，不影响此有界 Web gate：2026-10-04 ground-wall 实测 RMS `0.0003351521`、CFR 截断误差 `0.00922528199`、CP 52 samples；Web gate 通过、strict gate 仍失败。页面持续标注固定场景/静态快照条件 BLER 和 strict warning；这项放宽不表示 strict 时域等价，也不构成城市信道或统计 benchmark。
+实际 ground-wall 浏览器 job `7a69bd0a2ea4` 使用当时的 quick profile、seed 13、噪声比 0.001、CPU PHY，9/9 点 complete；20 dB beam-independent 为 8/8 aggregate TB errors，ZF/LMMSE 观察到 0/8 errors（Bonferroni 95% 上界 0.920943）。它是旧 profile 的条件诊断，不是当前 quick profile 的结果，也不是统计 BLER 或零错误保证。
+2026-10-05 full regression：`PYTHONPATH=src /home/le-lei/workspace/test/.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v` 通过 177 tests；unittest 报告运行时间 488.684 s（shell wall time 493.19 s）。这是代码回归证据，不是 BLER/统计性能证据。
 
 ### 历史 GPU batch 扫描与频域/时域对照
 

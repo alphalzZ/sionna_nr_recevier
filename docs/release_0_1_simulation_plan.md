@@ -10,7 +10,7 @@ Three kinds of evidence remain distinct:
 2. **Diagnostic estimator validation:** reduced paired DFT/CP jobs train separate priors and preserve frame-level results. They do not satisfy full statistical acceptance.
 3. **Measured performance:** only the two fixed frequency-domain CDL-A workloads and three fixed seeds below. BLER at 8 or 16 frames is descriptive; the run is not maximum-throughput tuning.
 
-Current package metadata is `nr-pusch-lab` 0.1.0, Python `>=3.11`, Sionna 2.0.1 (`pyproject.toml`). Previously observed environment: Python 3.14.4, PyTorch 2.13.0+cu130, NumPy 2.5.2, h5py 3.16.0, RTX 3060 Laptop GPU (6,064,832,512-byte VRAM), driver CUDA 13.2, Ryzen 5 5600H (6C/12T), 16 GiB RAM. These are prior observations, not this run's environment; recapture before freezing. The prior GPU snapshot showed 26% utilization and 870 MiB allocated, so it did not satisfy the idle requirement. Never terminate unrelated GPU processes.
+Current package metadata is `nr-pusch-lab` 0.1.0, Python `>=3.11`, Sionna 2.2.0 and Sionna RT 2.2.0 (`pyproject.toml`). Pre-migration inventory: Python 3.14.4, Sionna/Sionna RT 2.0.1, PyTorch 2.13.0+cu130, NumPy 2.5.2, h5py 3.16.0, Mitsuba 3.8.0, Dr.Jit 1.3.1, RTX 3060 Laptop GPU (6,064,832,512-byte VRAM), driver CUDA 13.2, Ryzen 5 5600H (6C/12T), 16 GiB RAM. The 2.2.0 migration resolved Mitsuba 3.9.1 and Dr.Jit 1.5.0 without replacing PyTorch; recapture exact environment before freezing. These changes do not rewrite historical CDL measurements. The prior GPU snapshot showed 26% utilization and 870 MiB allocated, so it did not satisfy the idle requirement. Never terminate unrelated GPU processes.
 
 `bler.runtime_s` measures each SNR point's simulation work including TX/channel/noise/RX/counters, but excludes model setup and export (`src/nr_pusch/bler.py:149-189,195-270,322-371`). Report frames/s and TB/s from this point runtime and `/usr/bin/time -v` wall time separately. One-second `nvidia-smi` memory is total device usage, not PyTorch allocator peak.
 
@@ -82,6 +82,8 @@ nr-pusch-web --host 127.0.0.1 --port 8765 \
 ```
 
 Use a real Chromium browser session on the dashboard (not API-only evidence): load dashboard; list/read/save a temporary copied profile; submit a one-frame GPU BLER run; poll to completion; download and validate its CSV and JSON; decode the H5 fixture through the RX endpoint with `device="cuda:0"`; download and inspect decoded NPZ and JSON. Capture browser-visible proof, server logs and download artifacts under `functional/web/`. Stop only the server launched for this test after capturing logs.
+
+RT 的 Web 验收是另一条功能/正确性 smoke，不替代以上 CDL/RX 浏览器回归：在隔离的 loopback 服务和临时 runs 目录中，实测 LoS、ground+wall 与 CP-LoS quick presets、参数化/受限 ZIP 场景、取消、history 和结果下载；保存 Web validation report、场景包和固定快照 replay。Quick 每点最多2帧，只作诊断，不运行500帧统计配置。Web job 仅在 `web-frequency-v1` 通过后启动 BLER；ground+wall 可在 Web RMS≤0.001 下运行，但必须持续显示 strict FD/TD `1e-5` 未通过的 warning。非 loopback 部署仍需外部认证和访问控制。
 
 ### 6. Reduced paired estimator validation and exact priors
 
@@ -172,6 +174,10 @@ Retain frames, TBs, CRC failures, TB block errors, bit errors, bit count, BLER, 
 Write `manifest.json` and `README.md` with exact source revision and optional patch hash, all input-config SHA-256s, Python/package/GPU/driver versions, all commands and resolved parameters, chosen frame cap, seed list, per-run exit/completion status, wall times, telemetry summary, artifact paths and known coverage/statistical limitations. State explicitly that low-count BLER and shortened estimator validation are diagnostic only and that no release-adoption or statistical claim follows.
 
 Finish `checksums.sha256` only after output artifacts have settled. Hash source/config snapshots, environment inventory, logs, reports, CSV/JSON, telemetry and all other retained files; include patch digest if nonempty. Preserve generated NPZ locally under the output tree even though globally ignored. Never modify or delete the user-owned `.omp/` tree.
+
+## Separate RT experimental lane
+
+Sionna RT 2.2.0 four-beam remains a separate correctness lane, not a Release 0.1 CDL throughput workload. Preserve historical strict CLI gate reports and their exact pass/fail meaning. CLI research statistics require their documented strict `all` acceptance; the Web worker has a separate fixed-snapshot `web-frequency-v1` admission gate (FD/TD RMS≤0.001, CP/window/CFR bounds≤1%, mesh convergence) and retains strict `1e-5` as a visible independent quality field. Passing the Web gate authorizes only conditional BLER for that static snapshot; it does not rewrite a strict failure, establish dynamic-city equivalence, or create a statistical benchmark. Do not claim the 500-frame Web budget was measured unless that run actually completed.
 
 ## Acceptance gates
 

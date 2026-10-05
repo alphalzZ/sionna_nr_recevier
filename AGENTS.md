@@ -3,6 +3,7 @@
 ## Project Structure & Module Organization
 
 This is a small Python package for configurable NR PUSCH waveform generation and captured-IQ analysis. Production code is under `src/nr_pusch/`: `config.py` parses TOML and builds Sionna settings, `transmitter.py` creates the multi-user waveform, `iq/` reads references, `artifacts.py` writes NPZ/JSON outputs, and `cli/` contains commands. Put run profiles in `configs/`, design notes in `docs/`, and tests in `tests/unit/` or `tests/integration/`. MATLAB reference files belong under `tests/fixtures/matlab_h5/`; do not edit or regenerate supplied fixtures as part of ordinary development.
+`rt_config.py` and `rt_scene_assets.py` validate RT profiles and scene packages; `web.py` owns the local FIFO API and job lifecycle.
 
 ## Build, Test, and Development Commands
 
@@ -14,6 +15,9 @@ Use the repository virtual environment at `/home/le-lei/workspace/test/.venv`.
 - `nr-pusch-channel --config configs/cdl_38_901_4x4.toml --input /tmp/pusch.npz --sample-rate-hz 18000000 --output /tmp/pusch_rx.npz` applies the configured CDL channel.
 - `nr-pusch-bler --tx-config configs/pusch_4ue.toml --channel-config configs/cdl_38_901_4x4.toml --simulation-config configs/bler_4ue_cdl.toml --output /tmp/pusch_bler.csv --device cpu` runs an SNR versus BLER sweep.
 - `nr-pusch-rx --tx-config configs/pusch_4ue.toml --input /tmp/pusch_rx.npz --noise-variance 0.001 --output /tmp/pusch_decode.npz` decodes receive IQ and reports TB CRC status.
+- `nr-pusch-web --host 127.0.0.1 --port 8765 --config-dir configs --runs-dir /tmp/nr-rt-web-validation/runs` starts the local CDL/RT dashboard; it is not authenticated for non-loopback exposure.
+- `nr-pusch-rt-channel --tx-config configs/pusch_4ue.toml --rt-config configs/rt_beam_los.toml --output /tmp/rt-channel.npz` prepares a format-2 snapshot; custom/parameterized snapshot replay uses the matching `--scene-root`.
+`nr-pusch-beam-bler --tx-config configs/pusch_4ue.toml --channel-snapshot /tmp/rt-channel.npz --simulation-config configs/bler_rt_beam_web_quick.toml --output /tmp/rt-bler.csv --device cpu` runs the fixed-snapshot profile as configured (the checked-in quick-named profile currently allows up to 2,000 frames/SNR); inspect the profile before launching, and do not treat its name as a statistical benchmark.
 
 ## Coding Style & Naming Conventions
 

@@ -1,0 +1,17 @@
+[bler]
+snr_db = [10.0,15, 17.0, 20.0]
+batch_size = 16
+max_frames_per_snr = 2000
+target_block_errors = 100
+seed = 13
+num_decoder_iterations = 20
+channel_estimator = "dmrs"
+channel_estimators = ["dmrs"]
+detector = "lmmse"
+detectors = ["beam-independent", "zf", "lmmse"]
+detector_damping = 0.25
+device = "cpu"
+channel_domain = "frequency"
+l_min = -6
+max_delay_spread_s = 3e-6
+stop_at_zero_bler = false

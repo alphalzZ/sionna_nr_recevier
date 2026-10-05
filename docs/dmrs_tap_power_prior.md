@@ -18,7 +18,7 @@ $$
 p[\ell]=\mathbb{E}\big\{\,|h[\ell]|^2\,\big\}.
 $$
 
-即 $p$ 是在当前信道集合下**抽头功率的期望**，也就是功率时延谱（PDP）在离散 tap 栅格上的取值。实现上它是**一个**长度为 $l_{\max}-l_{\min}+1$ 的实向量缓冲（`receiver.py:1233` 的 `register_buffer("_tap_power_prior", …)`）。估计按 OCC 对联合作出：设计矩阵把该对里两个用户的抽头基拼接在一起，未知量维数是 `2 * num_taps`（两个用户 × 抽头数），因此 `torch.cat((prior, prior))` 是给两个用户各配一份**同样**的权重（`receiver.py:1272-1276`、`receiver.py:1309`），用于 $\mathbf A\mathbf R_t$；后验按每根接收天线分别求解，但用的都是同一份 $p$。所以它是一个**标量 PDP**，不随用户、天线或 tap 位置变化。
+即 $p$ 是在当前信道集合下**抽头功率的期望**，也就是功率时延谱（PDP）在离散 tap 栅格上的取值。实现上它是**一个**长度为 $l_{\max}-l_{\min}+1$ 的实向量缓冲（`receiver.py:1298` 的 `register_buffer("_tap_power_prior", …)`）。估计按 OCC 对联合作出：设计矩阵把该对里两个用户的抽头基拼接在一起，未知量维数是 `2 * num_taps`（两个用户 × 抽头数），因此先验向量被复制给两个用户、按同一权重构造协方差加权设计矩阵（`receiver.py:1337-1349,1374-1379`），用于联合拟合；后验按每根接收天线分别求解，但用的都是同一份 $p$。所以它是一个**标量 PDP**，不随用户、天线或 tap 位置变化。
 
 逐 tap 的作用是"该多大程度相信观测"。把 tap 先验写成零均值、方差为 $p[\ell]$ 的对角高斯，标量情形下的 LMMSE 收缩系数（仅用于说明方向，接收机用的是多天线联合的完整估计器）是
 
@@ -134,6 +134,8 @@ $$
 - 由于 `accepted_gate_sha256` 覆盖整个 `acceptance_gate` 字典（其中包含 `thresholds`），同一几何下用不同门槛版本发布的先验标记不同，可据此区分结论来源。
 - 禁止为了让某个波形通过而改阈值、换 seed 或换 SNR 点；确需变更时应新增一份版本化验证配置并在摘要 JSON 记录，原门槛的失败结论保持不变。
 
+RT 固定快照验收与 Web `web-frequency-v1` gate 都是独立的物理/接收准入，不训练、读取或发布此 CDL tap-power prior。RT 报告不能满足 §7 的 prior 发布门槛，也不能替换 §9 中按既有配置记录的 CDL prior 测量；Web 的有界 FD/TD 阈值不修改本节的 DMRS 先验门槛。
+
 ## 8. 当前实现与理论的差距（已知限制）
 
 共享目录的键是**完整兼容性字典**（TX 载波、PUSCH 设置、CDL + 天线、抽头窗、FFT、采样率，排除 MCS）的 SHA-256，其中包含 `AntennaSettings`。因此当前实现要求**逐几何各一份**：按 §4 的条件，4T4R 训练出的向量对 1T1R 是同一集合均值（无偏，但方差不同），系统仍会因键不同而报"未找到"。
@@ -176,6 +178,13 @@ $$
 发布文件：`configs/tap_power_prior/dft_s_ofdm/8232bdc01e20cd9ba8437cc27f02f41108c292e551043bdba164e3cfed260b87.npz`（67 taps）与 `configs/tap_power_prior/cp_ofdm/d0efae4dad9e11aa39c757814ccada531bcbb2b626381e813bbe99253f4b65a4.npz`（26 taps），两份都带 acceptance 标记。CP-OFDM 的标记记录的是版本 2 门槛（`0.09` / 上界非严格）；**这一轮的抽样同时满足版本 1 的严格判据**（≥10%、上界严格小于 0），所以 CP 的版本 1 失败结论属于当时的抽样，不代表 LMMSE 在该几何上无效。版本 1 的诊断候选仍留在 `outputs/tap-power-prior/cp_2ue_2layer/validation.prior.npz`，失败记录保留在 `outputs/tap-power-prior/cp_2ue_2layer/validation.json`，不因版本 2 的发布而改写。版本 2 改变了 `batch_size`，因此其信道实现与 AWGN 抽样与版本 1 不同，两组数字不可互相替代。
 
 端到端复核：CP-OFDM 网页任务 `fcaf738186c5`（高级配置组合 CP TX/CDL + `bler_cp_2ue_2layer_dmrs_lmmse_smoke.toml`，15 个点）中 `dmrs-lmmse` 在 20/25/30/35/40 dB 的 BLER 为 0.95 / 0.275 / 0.007 / 0.001 / 0，逐点低于同轮 `dmrs` 的 0.975 / 0.3219 / 0.010 / 0.002 / 0（每点 ≤500 帧，作为趋势参考）。
+
+### 独立 Sionna RT 固定快照 gate（2026-10-04）
+
+`nr-pusch-beam-validate --tx-config configs/pusch_4ue.toml --rt-config configs/rt_beam_ground_wall.toml --simulation-config configs/bler_rt_beam_smoke.toml --stage all --output /tmp/nr-rt-validation/all/report.json --device cpu` 的 LoS、beam、noise、uncoded、两帧编码 PUSCH（160/160 行 complete）和 ground/wall reflection/path-convergence 阶段通过；`all` 在 time gate 停止，未运行后续 sweeps。另以相同 TX/RT/smoke profile 独立执行 `--stage sweeps`，20/20 个两帧诊断点通过；该结果不构成统计 BLER。tap 窗外能量为 0，direct-RT CFR 截断相对误差 `0.0092253`（门槛 `0.01`），99%-能量区间满足 CP 判定（52 samples），但 native OFDM 的 FD/TD 相对 RMS 为 `0.00033515`，超过 `1e-5` 门槛。tap 窗为 `l_min=-6..l_max=60`（67 taps），CP 为 52 samples；仅在临时诊断中移除 lag `>46` 的尾 tap（能量 `3.68×10⁻⁶`）后，FD/TD RMS 降到 `1.44×10⁻⁶`。产品快照保留完整 taps；该 ground-wall 快照未通过 FD/TD gate，因此不运行 gated CUDA 统计 BLER。单独 CP-OFDM LoS profile 的 time gate 通过（direct-CFR error `5.01×10⁻¹⁶`、FD/TD RMS `1.44×10⁻⁶`）；32 个两帧 coded smoke rows 均 complete 且为 0/8 TB errors，仅作连通性验证。完整 unittest discovery 147 tests passed in 302.921s。以上诊断不改变任何 CDL prior 发布状态或 §9 既有 CDL 测量。
+
+Web `web-frequency-v1` 对同一 ground-wall 固定快照单独准入：Web RMS `0.0003351521445438266`≤`0.001`、direct-CFR 截断 `0.009225281990267654`≤`0.01`、CP `52` samples；mesh 100k→200k 收敛通过。Web gate passed，但严格 FD/TD `1e-5` 仍失败，因此这里只能报告标有近似条件的静态快照 BLER；它不是严格 gate 通过、CDL prior 结果或城市信道统计基准。原 CLI `stage=all` 的失败记录与既有门槛保持不变。
+同日实际浏览器 job `7a69bd0a2ea4` 使用 `pusch_4ue.toml`、`rt_beam_ground_wall.toml`、`bler_rt_beam_web_quick.toml`，SNR 20/40/60 dB、每点最多 2 帧、seed 13、post-combiner ratio 0.001、CPU PHY；9/9 unique points 和 45 行均 complete。20 dB aggregate 中 beam-independent 为 8/8 TB errors；ZF 与 LMMSE 为 0/8 observed errors，但各只有 8 个 aggregate TB，Bonferroni 95% 上界为 0.920943，不能将 0 errors 解释为真实 BLER=0。该实际结果绑定上述 snapshot/hash，仍是 Web gate 通过、strict FD/TD 失败的固定场景条件诊断。
 
 ## 10. 新增 profile 时的检查清单
 

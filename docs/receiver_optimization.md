@@ -281,3 +281,26 @@ DMRS 估计使用原生 pilot mask，而不是把整个 DMRS 符号都当成导�
 
 回归覆盖 `configs/pusch_cp_2ue_2layer.toml` 的 2 UE × 2 层频域/时域信道路径、perfect/DMRS CSI、六种检测器与 DMRS tap-prior LMMSE；另有 8 流 perfect/DMRS 解码及 type-2 pilot/data 同符号用例。`configs/bler_cp_smoke.toml` 只作两 TB 单帧连通性检查，不代表统计 BLER。端到端 CLI 示例见 `README.md` 的 CP-OFDM smoke。
 
+## 7. 固定快照 RT 四波束检测基准
+
+Sionna RT 四波束链路使用同一阵元域传播矩阵构造 `H_beam = Wᴴ H_ant`，每个 UE 的一个调制流同时进入四个波束；不为各 beam 独立重采样或把其它用户干扰从观测中删除。共享阵元噪声 `n ~ CN(0, sigma_a² I)` 与独立后级噪声 `v ~ CN(0, sigma_v² I)` 合并后的协方差是 `R_eta = sigma_a² WᴴW + sigma_v² I`（`src/nr_pusch/noise.py:71-149`）。
+
+`beam-independent` 是独立物理 beam 的基准：`x̂_i = y_i/h_ii`，`no_eff_i = (Σ_{j≠i}|h_ij|² + Re(s_ii))/|h_ii|²`。它把未取消的其他 UE QAM 泄漏近似为高斯干扰；desired 增益严格为零时输出擦除和无限有效噪声，不用 epsilon 造出期望信号。ZF 与既有联合检测器使用完整噪声协方差白化；独立接收只除以各 beam 的 `sqrt(R_ii)`，不抽取全白化后的单端口。具体 equalizer 与 DFT 解扩后噪声方差处理位于 `src/nr_pusch/receiver.py:159-201,210-318`，CP-OFDM 复用原生逐 RE detector 路径（`src/nr_pusch/receiver.py:930-1690`）。RT BLER 在逐 RE 检查 ZF 数值秩；秩失败记为 `infeasible_rank`，不对伪逆结果计分。Sionna 的 all-one `StreamManagement` 把其它 UE 当作 desired stream，所以独立模式必须显式把 off-diagonal 功率加到 `no_eff`。
+
+这两个新增模式沿用现有 `NrPuschRx` 的 DMRS、DFT 解扩、软解映射和 TB/CRC 解码；RT 支持 perfect/DMRS，但拒绝使用由 CDL prior 拟合的 `dmrs-lmmse`。快照 BLER 仅描述给定固定几何/路径实现，seed 变化只改变 payload/noise，不重采样传播；每个点保留 2-frame smoke 为连通性证据，不当作统计曲线。`beam-independent` 与 ZF/联合 detector 的 coded runner、噪声基变换和按 UE 区间实现见 `src/nr_pusch/beam_simulation.py:57-297`。
+
+CPU 两帧 smoke 自动保存 `physical_beam`、`diagonal_noise_scaled` 与 `whitened` 的 NPZ/JSON capture；三种坐标系使用相同 payload、噪声 draw、R 和对应的 perfect-CSI matrix（`src/nr_pusch/beam_simulation.py:408-533`）。回放时必须匹配 capture 的 grid 和 CSI：
+
+```bash
+nr-pusch-rx --rx-config configs/pusch_4ue.toml \
+  --input /tmp/nr-rt-validation/dft/results_captures/whitened.npz \
+  --output /tmp/nr-rt-validation/dft/whitened-decoded.npz \
+  --input-domain frequency --channel-estimator perfect \
+  --detector lmmse --noise-variance 1 --device cpu
+nr-pusch-rx --rx-config configs/pusch_4ue.toml \
+  --input /tmp/nr-rt-validation/dft/results_captures/diagonal_noise_scaled.npz \
+  --output /tmp/nr-rt-validation/dft/independent-decoded.npz \
+  --input-domain frequency --channel-estimator perfect \
+  --detector beam-independent --noise-variance 1 --device cpu
+```
+

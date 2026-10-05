@@ -1,0 +1,22 @@
+<scene version="2.1.0">
+    <bsdf type="itu-radio-material" id="ground-concrete">
+        <string name="type" value="concrete"/>
+        <float name="thickness" value="0.1"/>
+        <float name="scattering_coefficient" value="0.0"/>
+    </bsdf>
+    <bsdf type="itu-radio-material" id="wall-brick">
+        <string name="type" value="brick"/>
+        <float name="thickness" value="0.1"/>
+        <float name="scattering_coefficient" value="0.0"/>
+    </bsdf>
+    <shape type="ply" id="ground">
+        <string name="filename" value="meshes/ground.ply"/>
+        <boolean name="face_normals" value="true"/>
+        <ref id="ground-concrete" name="bsdf"/>
+    </shape>
+    <shape type="ply" id="wall">
+        <string name="filename" value="meshes/wall.ply"/>
+        <boolean name="face_normals" value="true"/>
+        <ref id="wall-brick" name="bsdf"/>
+    </shape>
+</scene>
