@@ -6,6 +6,7 @@ import unittest
 
 from nr_pusch.config import TxSettings
 from nr_pusch.rt_config import RtBeamSettings
+from nr_pusch.rt_scene_assets import SIONNA_RT_SCENE_IDS
 
 
 ROOT = Path(__file__).parents[2]
@@ -81,6 +82,17 @@ class RtBeamSettingsTest(unittest.TestCase):
         self.assertEqual(reparsed, settings)
         self.assertEqual(settings.geometry.ground_bounds_m, (-20.0, 40.0, -30.0, 50.0))
         self.assertEqual(settings.geometry.wall_material, "concrete")
+
+    def test_accepts_every_sionna_scene_and_rejects_parameterized_geometry(self):
+        source = RtBeamSettings.from_toml(ROOT / "configs" / "rt_beam_los.toml")
+        for scene_id in sorted(SIONNA_RT_SCENE_IDS):
+            with self.subTest(scene=scene_id):
+                raw = source.to_dict()
+                raw["rt"]["scene"] = scene_id
+                settings = RtBeamSettings.from_dict(raw)
+                self.assertEqual(settings.rt.scene, scene_id)
+                with self.assertRaisesRegex(ValueError, "仅适用于 ground 或 ground_wall"):
+                    RtBeamSettings.from_dict(raw | {"geometry": {}})
 
     def test_scene_file_and_geometry_scope_are_enforced(self):
         source = RtBeamSettings.from_toml(ROOT / "configs" / "rt_beam_los.toml")

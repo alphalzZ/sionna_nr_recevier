@@ -7,7 +7,11 @@ import hashlib
 import importlib.metadata
 import json
 import math
+import os
 from pathlib import Path
+import shutil
+import tempfile
+import zipfile
 from typing import Any
 
 import mitsuba as mi
@@ -26,6 +30,8 @@ from nr_pusch.rt_scene_assets import RtSceneAssets, resolve_builtin_scene_assets
 from nr_pusch.transmitter import NrPuschTx
 
 _FORMAT_VERSION = 2
+
+_SNAPSHOT_CACHE_FORMAT_VERSION = 1
 
 _ARRAY_KEYS = (
     "path_a",
@@ -482,6 +488,220 @@ def load_rt_beam_snapshot(
     snapshot = RtBeamSnapshot(**arrays, metadata=metadata)
     _validate_snapshot(snapshot, tx_settings, tx_geometry, resource_grid=resource_grid)
     return snapshot
+
+
+def project_outputs_dir() -> Path:
+    """Return the repository-local ignored directory for persistent RT artifacts."""
+    return Path(__file__).resolve().parents[2] / "outputs"
+
+
+def _snapshot_cache_root(cache_dir: str | Path | None, *, create: bool) -> Path:
+    default = cache_dir is None
+    project_root = Path(__file__).resolve().parents[2]
+    outputs = project_outputs_dir()
+    if default:
+        if outputs.is_symlink():
+            raise ValueError("项目 outputs 目录不得是符号链接")
+        if create:
+            outputs.mkdir(parents=True, exist_ok=True)
+        if outputs.exists():
+            resolved_outputs = outputs.resolve(strict=True)
+            if not resolved_outputs.is_dir() or resolved_outputs.parent != project_root:
+                raise ValueError("项目 outputs 目录必须位于仓库根目录下")
+        elif not create:
+            return outputs / "rt_snapshots"
+        root = outputs / "rt_snapshots"
+    else:
+        root = Path(cache_dir)
+    if root.is_symlink():
+        raise ValueError("RT 快照缓存目录不得是符号链接")
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+    if not root.exists():
+        return root.absolute()
+    if not root.is_dir():
+        raise ValueError("RT 快照缓存路径必须是目录")
+    resolved_root = root.resolve(strict=True)
+    if default and resolved_root.parent != outputs.resolve(strict=True):
+        raise ValueError("RT 快照缓存必须直接位于项目 outputs 目录下")
+    return resolved_root
+
+
+def _snapshot_implementation_sha256() -> str:
+    return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+
+
+def _snapshot_cache_identity_key(
+    config_sha256: str,
+    versions: dict[str, str],
+    rt_variant: str,
+) -> str:
+    return _json_sha256(
+        {
+            "cache_format_version": _SNAPSHOT_CACHE_FORMAT_VERSION,
+            "snapshot_format_version": _FORMAT_VERSION,
+            "config_sha256": config_sha256,
+            "versions": versions,
+            "rt_variant": rt_variant,
+            "implementation_sha256": _snapshot_implementation_sha256(),
+        }
+    )
+
+
+def rt_snapshot_cache_key(
+    tx_settings: TxSettings,
+    rt_settings: RtBeamSettings,
+    *,
+    scene_assets: RtSceneAssets | None = None,
+) -> tuple[str, RtSceneAssets]:
+    """Fingerprint exactly the settings, scene assets, runtime and code used by a snapshot."""
+    tx_settings.validate()
+    rt_settings.validate_transmitter(tx_settings)
+    assets = _resolve_scene_assets(rt_settings, scene_assets)
+    tx_geometry, _ = _read_tx_resource_geometry(tx_settings)
+    config_sha256 = _json_sha256(
+        {
+            "rt_config": rt_settings.to_dict(),
+            "tx_resource_geometry": tx_geometry,
+            "scene_bundle_sha256": assets.bundle_sha256,
+        }
+    )
+    return (
+        _snapshot_cache_identity_key(config_sha256, _runtime_versions(), mi.variant()),
+        assets,
+    )
+
+
+def load_cached_rt_beam_snapshot(
+    tx_settings: TxSettings,
+    rt_settings: RtBeamSettings,
+    *,
+    scene_assets: RtSceneAssets | None = None,
+    cache_dir: str | Path | None = None,
+) -> tuple[RtBeamSnapshot | None, str]:
+    """Load a content-addressed snapshot only after revalidating its current inputs."""
+    cache_key, assets = rt_snapshot_cache_key(
+        tx_settings, rt_settings, scene_assets=scene_assets
+    )
+    root = _snapshot_cache_root(cache_dir, create=False)
+    entry = root / cache_key
+    if entry.is_symlink():
+        raise ValueError("RT snapshot cache entry may not be a symlink")
+    if not entry.exists():
+        return None, cache_key
+    if not entry.is_dir():
+        raise ValueError("RT snapshot cache entry must be a directory")
+    cache_manifest_path = entry / "cache.json"
+    snapshot_path = entry / "channel_snapshot.npz"
+    snapshot_manifest_path = snapshot_path.with_suffix(".json")
+    paths = (cache_manifest_path, snapshot_path, snapshot_manifest_path)
+    if any(path.is_symlink() or not path.is_file() for path in paths):
+        return None, cache_key
+    try:
+        cache_manifest = json.loads(cache_manifest_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(cache_manifest, dict)
+            or cache_manifest.get("format_version") != _SNAPSHOT_CACHE_FORMAT_VERSION
+            or cache_manifest.get("cache_key") != cache_key
+        ):
+            return None, cache_key
+        snapshot = load_rt_beam_snapshot(
+            snapshot_path,
+            tx_settings,
+            scene_root=assets.root,
+        )
+        if (
+            cache_manifest.get("config_sha256") != snapshot.metadata.get("config_sha256")
+            or cache_manifest.get("scene_bundle_sha256")
+            != snapshot.metadata.get("scene_bundle_sha256")
+            or cache_manifest.get("array_sha256") != snapshot.metadata.get("array_sha256")
+            or _snapshot_cache_identity_key(
+                snapshot.metadata["config_sha256"],
+                snapshot.metadata["versions"],
+                snapshot.metadata["rt_variant"],
+            )
+            != cache_key
+        ):
+            return None, cache_key
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, EOFError, zipfile.BadZipFile):
+        return None, cache_key
+    return snapshot, cache_key
+
+
+def store_rt_beam_snapshot_cache(
+    snapshot: RtBeamSnapshot,
+    tx_settings: TxSettings,
+    rt_settings: RtBeamSettings,
+    *,
+    scene_assets: RtSceneAssets | None = None,
+    cache_dir: str | Path | None = None,
+) -> str:
+    """Atomically publish a verified snapshot under its deterministic input fingerprint."""
+    cache_key, assets = rt_snapshot_cache_key(
+        tx_settings, rt_settings, scene_assets=scene_assets
+    )
+    if (
+        snapshot.metadata.get("scene_bundle_sha256") != assets.bundle_sha256
+        or snapshot.metadata.get("scene_asset_sha256") != assets.file_sha256
+        or snapshot.metadata.get("config_sha256") is None
+        or _snapshot_cache_identity_key(
+            snapshot.metadata.get("config_sha256"),
+            snapshot.metadata.get("versions"),
+            snapshot.metadata.get("rt_variant"),
+        )
+        != cache_key
+    ):
+        raise ValueError("RT snapshot does not match the current cache inputs")
+    root = _snapshot_cache_root(cache_dir, create=True)
+    entry = root / cache_key
+    if entry.is_symlink():
+        raise ValueError("RT snapshot cache entry may not be a symlink")
+    if entry.exists():
+        cached, _ = load_cached_rt_beam_snapshot(
+            tx_settings,
+            rt_settings,
+            scene_assets=assets,
+            cache_dir=root,
+        )
+        if cached is not None:
+            return cache_key
+        shutil.rmtree(entry)
+
+    temporary = Path(tempfile.mkdtemp(prefix=".rt-snapshot-cache-", dir=root))
+    try:
+        snapshot_path, snapshot_manifest_path = save_rt_beam_snapshot(
+            snapshot,
+            temporary / "channel_snapshot.npz",
+        )
+        snapshot_manifest = json.loads(snapshot_manifest_path.read_text(encoding="utf-8"))
+        cache_manifest = {
+            "format_version": _SNAPSHOT_CACHE_FORMAT_VERSION,
+            "cache_key": cache_key,
+            "config_sha256": snapshot_manifest["config_sha256"],
+            "scene_bundle_sha256": snapshot_manifest["scene_bundle_sha256"],
+            "array_sha256": snapshot_manifest["array_sha256"],
+        }
+        (temporary / "cache.json").write_text(
+            json.dumps(cache_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            os.rename(temporary, entry)
+        except OSError:
+            if entry.exists() and not entry.is_symlink():
+                cached, _ = load_cached_rt_beam_snapshot(
+                    tx_settings,
+                    rt_settings,
+                    scene_assets=assets,
+                    cache_dir=root,
+                )
+                if cached is not None:
+                    return cache_key
+            raise
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+    return cache_key
 
 
 class NrPuschRtBeamChannel:

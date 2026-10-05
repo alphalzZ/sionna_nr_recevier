@@ -12,9 +12,12 @@ from nr_pusch.config import TxSettings
 from nr_pusch.rt_channel import (
     NrPuschRtBeamChannel,
     _cp_energy_diagnostics,
+    load_cached_rt_beam_snapshot,
     load_rt_beam_snapshot,
     prepare_rt_beam_snapshot,
+    rt_snapshot_cache_key,
     save_rt_beam_snapshot,
+    store_rt_beam_snapshot_cache,
 )
 from nr_pusch.rt_config import RtBeamSettings
 from nr_pusch.rt_scene_assets import (
@@ -230,6 +233,55 @@ class RtBeamChannelTest(unittest.TestCase):
             path.with_suffix(".json").write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "重新 prepare"):
                 load_rt_beam_snapshot(path, self.tx_settings)
+
+    def test_snapshot_cache_reuses_verified_arrays_and_invalidates_rt_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory) / "rt_snapshots"
+            scene_assets = resolve_builtin_scene_assets("empty")
+            key = store_rt_beam_snapshot_cache(
+                self.snapshot,
+                self.tx_settings,
+                self.rt_settings,
+                scene_assets=scene_assets,
+                cache_dir=cache_dir,
+            )
+            cached, cached_key = load_cached_rt_beam_snapshot(
+                self.tx_settings,
+                self.rt_settings,
+                scene_assets=scene_assets,
+                cache_dir=cache_dir,
+            )
+            self.assertIsNotNone(cached)
+            self.assertEqual(key, cached_key)
+            np.testing.assert_array_equal(cached.h_ant, self.snapshot.h_ant)
+            self.assertTrue((cache_dir / key / "cache.json").is_file())
+            cached_npz = cache_dir / key / "channel_snapshot.npz"
+            cached_npz.write_bytes(b"not-a-zip")
+            corrupted, _ = load_cached_rt_beam_snapshot(
+                self.tx_settings,
+                self.rt_settings,
+                scene_assets=scene_assets,
+                cache_dir=cache_dir,
+            )
+            self.assertIsNone(corrupted)
+
+            changed = replace(
+                self.rt_settings,
+                rt=replace(self.rt_settings.rt, seed=self.rt_settings.rt.seed + 1),
+            )
+            changed_key, _ = rt_snapshot_cache_key(
+                self.tx_settings,
+                changed,
+                scene_assets=scene_assets,
+            )
+            stale, _ = load_cached_rt_beam_snapshot(
+                self.tx_settings,
+                changed,
+                scene_assets=scene_assets,
+                cache_dir=cache_dir,
+            )
+            self.assertNotEqual(key, changed_key)
+            self.assertIsNone(stale)
 
     def test_custom_scene_assets_prepare_save_and_replay_without_fallback(self):
         with tempfile.TemporaryDirectory() as directory:

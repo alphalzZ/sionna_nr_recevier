@@ -6,7 +6,12 @@ import argparse
 from pathlib import Path
 
 from nr_pusch.config import TxSettings
-from nr_pusch.rt_channel import prepare_rt_beam_snapshot, save_rt_beam_snapshot
+from nr_pusch.rt_channel import (
+    load_cached_rt_beam_snapshot,
+    prepare_rt_beam_snapshot,
+    save_rt_beam_snapshot,
+    store_rt_beam_snapshot_cache,
+)
 from nr_pusch.rt_config import RtBeamSettings
 from nr_pusch.rt_scene_assets import (
     generate_parameterized_scene_assets,
@@ -19,6 +24,7 @@ def main() -> None:
     parser.add_argument("--tx-config", required=True, help="Four-user NR PUSCH TX TOML")
     parser.add_argument("--rt-config", required=True, help="Four-beam Sionna RT TOML")
     parser.add_argument("--scene-root", help="Explicit validated scene asset directory")
+    parser.add_argument("--cache-dir", help="RT 快照缓存目录；默认为项目 outputs/rt_snapshots")
     parser.add_argument("--output", required=True, help="Output NPZ snapshot path")
     args = parser.parse_args()
 
@@ -41,10 +47,28 @@ def main() -> None:
         scene_assets = resolve_scene_assets(
             args.scene_root, f"{rt_settings.rt.scene}.xml", source="builtin"
         )
-    snapshot = prepare_rt_beam_snapshot(
-        tx_settings, rt_settings, scene_assets=scene_assets
+    snapshot, cache_key = load_cached_rt_beam_snapshot(
+        tx_settings,
+        rt_settings,
+        scene_assets=scene_assets,
+        cache_dir=args.cache_dir,
     )
+    cache_hit = snapshot is not None
+    if snapshot is None:
+        snapshot = prepare_rt_beam_snapshot(
+            tx_settings, rt_settings, scene_assets=scene_assets
+        )
     npz_path, json_path = save_rt_beam_snapshot(snapshot, output)
+    if not cache_hit:
+        cache_key = store_rt_beam_snapshot_cache(
+            snapshot,
+            tx_settings,
+            rt_settings,
+            scene_assets=scene_assets,
+            cache_dir=args.cache_dir,
+        )
+    print(f"RT snapshot cache: {'hit' if cache_hit else 'miss'} ({cache_key})")
+    print(f"Cache root: {args.cache_dir or 'outputs/rt_snapshots'}")
     print(f"RT channel snapshot: {npz_path}")
     print(f"Manifest: {json_path}")
     print(f"Scene bundle SHA-256: {snapshot.metadata['scene_bundle_sha256']}")

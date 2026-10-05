@@ -10,6 +10,7 @@ import tomllib
 from typing import Any, TYPE_CHECKING
 
 from nr_pusch.config import TxSettings
+from nr_pusch.rt_scene_assets import BUILTIN_SCENE_IDS
 
 if TYPE_CHECKING:
     from .simulation_config import BlerSettings
@@ -232,14 +233,14 @@ class RtBeamSettings:
         return settings
 
     def validate(self) -> None:
-        if self.rt.scene not in {"empty", "ground", "ground_wall", "custom"}:
-            raise ValueError("rt.scene 必须是 empty、ground、ground_wall 或 custom")
+        if self.rt.scene != "custom" and self.rt.scene not in BUILTIN_SCENE_IDS:
+            raise ValueError("rt.scene 必须是内置 Sionna RT 场景或 custom")
         if self.rt.scene == "custom":
             if self.rt.scene_file != "scene.xml":
                 raise ValueError("rt.scene_file 对 custom 场景必须为 scene.xml")
         elif self.rt.scene_file is not None:
             raise ValueError("rt.scene_file 仅适用于 custom 场景")
-        if self.rt.scene in {"empty", "custom"} and self.geometry is not None:
+        if self.geometry is not None and self.rt.scene not in {"ground", "ground_wall"}:
             raise ValueError("geometry 仅适用于 ground 或 ground_wall 场景")
         if self.geometry is not None:
             _validate_geometry(self.geometry)

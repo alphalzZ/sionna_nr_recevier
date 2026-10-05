@@ -67,6 +67,8 @@ class WebRtBlerTest(unittest.TestCase):
         shutil.copyfile(CONFIGS / "scenarios.toml", self.config_dir / "scenarios.toml")
         self.runs_dir = self.root / "runs"
         self.app = SimulationWebApp(self.config_dir, self.runs_dir)
+        self.outputs_dir = self.root / "outputs"
+        self.app.outputs_dir = self.outputs_dir
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.app))
         self.server.daemon_threads = True
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -101,6 +103,16 @@ class WebRtBlerTest(unittest.TestCase):
         self.assertEqual(options["web_limits"]["batch_size"], [1, 20])
         self.assertEqual(options["web_limits"]["max_frames_per_snr"], [1, 2_000])
         self.assertEqual(options["web_limits"]["stop_at_zero_bler"], [False, True])
+        self.assertEqual(
+            {item["id"] for item in options["scene_presets"]},
+            {
+                "empty", "ground", "ground_wall", "box", "box_knife",
+                "box_one_screen", "box_two_screens", "double_reflector",
+                "etoile", "floor_wall", "florence", "munich", "san_francisco",
+                "simple_reflector", "simple_street_canyon",
+                "simple_street_canyon_with_cars", "simple_wedge", "triple_reflector",
+            },
+        )
 
     def _scene_payload(self, scenario_id: str) -> dict[str, str]:
         listed = next(
@@ -200,6 +212,18 @@ class WebRtBlerTest(unittest.TestCase):
             job = self._submit_and_wait(scenario_id)
             completed[scenario_id] = job
             names = SCENARIOS[scenario_id]
+            self.assertIs(job["snapshot_cache_hit"], False)
+            self.assertRegex(job["snapshot_cache_key"], r"^[0-9a-f]{64}$")
+            output_archive = self.outputs_dir / "rt_runs" / job["id"]
+            self.assertEqual(job["output_archive"], f"outputs/rt_runs/{job['id']}")
+            self.assertTrue((output_archive / "results.csv").is_file())
+            self.assertTrue((output_archive / "channel_snapshot.npz").is_file())
+            archived_job = json.loads((output_archive / "job.json").read_text(encoding="utf-8"))
+            self.assertEqual(archived_job["status"], "completed")
+            cache_info = json.loads(
+                (output_archive / "snapshot_cache.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(cache_info["hit"])
             self.assertEqual(job["config_names"]["tx"], names[0])
             self.assertEqual(job["config_names"]["rt"], names[1])
             aggregate = [row for row in job["points"] if row["user"] == "all"]
@@ -253,6 +277,12 @@ class WebRtBlerTest(unittest.TestCase):
             ]
             self.assertEqual([event["stage"] for event in stage_events], ["tracing", "validating"])
             self.assertTrue(all(event["type"] == "stage" and "at" in event for event in stage_events))
+
+        first_los = completed["rt-los-quick"]
+        cached_repeat = self._submit_and_wait("rt-los-quick")
+        self.assertIs(cached_repeat["snapshot_cache_hit"], True)
+        self.assertEqual(cached_repeat["snapshot_cache_key"], first_los["snapshot_cache_key"])
+        self.assertNotEqual(cached_repeat["output_archive"], first_los["output_archive"])
 
         history = self._json("/api/runs")["runs"]
         for scenario_id, job in completed.items():
@@ -546,6 +576,11 @@ class WebRtBlerTest(unittest.TestCase):
             "scene_bundle_sha256": bundle,
             "checks": [],
             "warnings": [],
+        }))
+        (directory / "snapshot_cache.json").write_text(json.dumps({
+            "format_version": 1,
+            "cache_key": "b" * 64,
+            "hit": False,
         }))
         calls = []
 

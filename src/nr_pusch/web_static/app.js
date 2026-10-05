@@ -650,7 +650,13 @@ function renderJob(job) {
     if (url) link.href = url;
   }
   const logs = Array.isArray(job.logs) ? job.logs : [];
-  $("log-view").textContent = logs.length ? logs.join("\n") : active ? "任务已提交，等待日志…" : (job.error || "暂无运行日志。");
+  const outputNotes = [];
+  if (isRt && typeof job.snapshot_cache_hit === "boolean") {
+    outputNotes.push(`静态信道快照缓存：${job.snapshot_cache_hit ? "命中" : "未命中"}`);
+  }
+  if (isRt && job.output_archive) outputNotes.push(`结果归档：${job.output_archive}`);
+  outputNotes.push(logs.length ? logs.join("\n") : active ? "任务已提交，等待日志…" : (job.error || "暂无运行日志。"));
+  $("log-view").textContent = outputNotes.join("\n");
   $("log-view").scrollTop = $("log-view").scrollHeight;
   if (job.error) showAlert(job.error);
   renderRtValidationInfo(job);
@@ -966,8 +972,34 @@ async function initRtCatalog() {
     state.rtOptions = { devices: ["cpu"] };
     state.rtOptionsError = parseRtError(error);
   }
+  populateRtSceneKindSelect();
   populateRtPresetSelect();
   updateRtBudgetAvailability();
+}
+
+function rtBuiltinSceneIds() {
+  const presets = state.rtOptions?.scene_presets;
+  return new Set(
+    Array.isArray(presets)
+      ? presets.map((preset) => preset?.id).filter((id) => typeof id === "string")
+      : ["empty", "ground", "ground_wall"],
+  );
+}
+
+function populateRtSceneKindSelect() {
+  const select = $("rt-scene-kind");
+  if (!select) return;
+  const presets = state.rtOptions?.scene_presets;
+  if (!Array.isArray(presets) || !presets.length) return;
+  const selected = select.value;
+  select.replaceChildren();
+  presets.forEach((preset) => {
+    configOption(select, preset.id, preset.label || preset.id);
+    select.options[select.options.length - 1].title = preset.description || "";
+  });
+  configOption(select, "custom", "导入 ZIP");
+  const validIds = rtBuiltinSceneIds();
+  select.value = selected === "custom" || validIds.has(selected) ? selected : "empty";
 }
 
 function populateRtPresetSelect() {
@@ -1195,8 +1227,11 @@ function updateRtSceneStatus() {
   } else if (settings?.rt?.scene === "custom") {
     $("rt-scene-status").textContent = "导入场景包：尚未上传 ZIP；请先选择并上传合法场景包。";
   } else {
-    const labels = { empty: "LoS 空场景", ground: "内置地面", ground_wall: "内置地面＋墙面" };
-    $("rt-scene-status").textContent = `内置场景：${labels[settings?.rt?.scene] || settings?.rt?.scene || "LoS"}`;
+    const scene = settings?.rt?.scene;
+    const preset = state.rtOptions?.scene_presets?.find((item) => item.id === scene);
+    $("rt-scene-status").textContent = preset
+      ? `内置场景：${preset.label}。${preset.description}`
+      : `内置场景：${scene || "LoS"}`;
   }
   const entries = state.rtMeshSummary && typeof state.rtMeshSummary === "object" ? Object.entries(state.rtMeshSummary) : [];
   $("rt-mesh-summary").textContent = entries.length
@@ -1458,8 +1493,8 @@ function onRtSceneSourceChange() {
   const source = $("rt-scene-source").value;
   let scene = settings.rt?.scene;
   if (source === "builtin") {
-    if (scene === "custom") scene = "empty";
-    if (!["empty", "ground", "ground_wall"].includes(scene)) scene = "empty";
+    const available = rtBuiltinSceneIds();
+    if (!available.has(scene)) scene = available.has("empty") ? "empty" : available.values().next().value;
     settings.rt.scene = scene;
     delete settings.rt.scene_file;
     delete settings.geometry;

@@ -12,6 +12,7 @@ from typing import Any
 from nr_pusch.beam_validation import validate_rt_web_snapshot
 from nr_pusch.config import TxSettings
 from nr_pusch.rt_channel import (
+    load_cached_rt_beam_snapshot,
     load_rt_beam_snapshot,
     prepare_rt_beam_snapshot,
     save_rt_beam_snapshot,
@@ -64,6 +65,7 @@ def main() -> int:
     parser.add_argument("--rt-config", required=True)
     parser.add_argument("--simulation-config", required=True)
     parser.add_argument("--scene-root")
+    parser.add_argument("--cache-dir", required=True, help="Persistent RT snapshot cache directory")
     parser.add_argument("--output", required=True, help="Lower-budget RT snapshot NPZ")
     parser.add_argument("--validation-output", required=True, help="Web validation JSON report")
     parser.add_argument("--stage-jsonl", required=True, help="Append-only preparation stage events")
@@ -80,18 +82,25 @@ def main() -> int:
         validate_rt_web_limits(rt_settings, simulation_settings)
         rt_settings.validate_transmitter(tx_settings)
         assets = _scene_assets(rt_settings, args.scene_root)
+        snapshot, cache_key = load_cached_rt_beam_snapshot(
+            tx_settings,
+            rt_settings,
+            scene_assets=assets,
+            cache_dir=args.cache_dir,
+        )
+        cache_hit = snapshot is not None
 
         _emit_stage(stage_path, "tracing")
-        snapshot = prepare_rt_beam_snapshot(
-            tx_settings, rt_settings, scene_assets=assets
-        )
+        if snapshot is None:
+            snapshot = prepare_rt_beam_snapshot(
+                tx_settings, rt_settings, scene_assets=assets
+            )
         save_rt_beam_snapshot(snapshot, snapshot_path)
         verified_snapshot = load_rt_beam_snapshot(
             snapshot_path,
             tx_settings,
             scene_root=assets.root if assets is not None else None,
         )
-
         _emit_stage(stage_path, "validating")
         asset_hashes = verified_snapshot.metadata.get("scene_asset_sha256", {})
         has_mesh = isinstance(asset_hashes, dict) and any(
@@ -122,6 +131,15 @@ def main() -> int:
         if not report["passed"]:
             print("RT Web frequency-domain acceptance gate failed", file=sys.stderr)
             return 1
+        _write_report(
+            snapshot_path.with_name("snapshot_cache.json"),
+            {
+                "format_version": 1,
+                "cache_key": cache_key,
+                "hit": cache_hit,
+            },
+        )
+        print(f"RT snapshot cache: {'hit' if cache_hit else 'miss'} ({cache_key})")
         print(
             "RT Web frequency-domain acceptance gate passed; "
             f"strict_fd_td_passed={report['strict_fd_td_passed']}"

@@ -7,6 +7,7 @@ scene files are data, never general-purpose Mitsuba projects.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, distribution
 import hashlib
 import io
 import json
@@ -22,7 +23,6 @@ import zipfile
 import zlib
 import xml.etree.ElementTree as ET
 
-
 MAX_ZIP_BYTES = 8 * 1024 * 1024
 MAX_EXPANDED_BYTES = 32 * 1024 * 1024
 MAX_SCENE_XML_BYTES = 256 * 1024
@@ -35,9 +35,44 @@ MAX_FACES = 200_000
 MAX_COORDINATE_M = 10_000.0
 MAX_COMPRESSION_RATIO = 200
 
+MAX_BUILTIN_SCENE_BYTES = 32 * 1024 * 1024
+MAX_BUILTIN_SCENE_XML_BYTES = 4 * 1024 * 1024
+MAX_BUILTIN_SCENE_FILES = 8_192
+
+BUILTIN_SCENE_PRESETS = (
+    ("empty", "LoS（空场景）", "无几何遮挡的 LoS 基线。"),
+    ("ground", "地面", "内置地面平面。"),
+    ("ground_wall", "地面＋墙面", "内置地面与墙面。"),
+    ("box", "Sionna RT · 箱体", "内置箱体反射场景；位置沿用当前 RT 配置。"),
+    ("box_knife", "Sionna RT · 箱体＋刀形体", "内置箱体与刀形体；位置沿用当前 RT 配置。"),
+    ("box_one_screen", "Sionna RT · 单屏障", "内置箱体与单屏障；位置沿用当前 RT 配置。"),
+    ("box_two_screens", "Sionna RT · 双屏障", "内置箱体与双屏障；位置沿用当前 RT 配置。"),
+    ("double_reflector", "Sionna RT · 双反射板", "内置双反射板；位置沿用当前 RT 配置。"),
+    ("etoile", "Sionna RT · Étoile", "内置城市场景（约 2.5 MiB）；追踪开销较高，位置沿用当前 RT 配置。"),
+    ("floor_wall", "Sionna RT · 地面＋墙体", "内置地面与墙体；不同于可参数化地面＋墙面。"),
+    ("florence", "Sionna RT · Florence 城区", "大型内置场景（约 12 MiB）；追踪和内存开销较高。"),
+    ("munich", "Sionna RT · Munich 城区", "大型内置场景（约 11 MiB）；追踪和内存开销较高。"),
+    ("san_francisco", "Sionna RT · San Francisco 城区", "大型内置场景（约 25 MiB）；追踪和内存开销较高。"),
+    ("simple_reflector", "Sionna RT · 单反射板", "内置单反射板；位置沿用当前 RT 配置。"),
+    ("simple_street_canyon", "Sionna RT · 简单街谷", "内置街谷；位置沿用当前 RT 配置。"),
+    ("simple_street_canyon_with_cars", "Sionna RT · 含车辆街谷", "内置街谷与车辆；位置沿用当前 RT 配置。"),
+    ("simple_wedge", "Sionna RT · 楔形场景", "内置楔形几何；当前传播模型不启用衍射。"),
+    ("triple_reflector", "Sionna RT · 三反射板", "内置三反射板；位置沿用当前 RT 配置。"),
+)
+BUILTIN_SCENE_IDS = frozenset(scene for scene, _, _ in BUILTIN_SCENE_PRESETS)
+SIONNA_RT_SCENE_IDS = frozenset(scene for scene, _, _ in BUILTIN_SCENE_PRESETS[3:])
+
+
+def builtin_scene_catalog() -> list[dict[str, str]]:
+    return [
+        {"id": scene, "label": label, "description": description}
+        for scene, label, description in BUILTIN_SCENE_PRESETS
+    ]
+
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z", re.ASCII)
 _SCENE_FILE_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\.xml\Z", re.ASCII)
 _PLY_PATH_RE = re.compile(r"meshes/([A-Za-z0-9_-]{1,64})\.ply\Z", re.ASCII)
+_BUILTIN_PLY_PATH_RE = re.compile(r"meshes/[\w-]{1,128}\.ply\Z")
 _XML_DECLARATION_RE = re.compile(br"^(?:\xef\xbb\xbf)?\s*<\?xml\s+([^?]*)\?>", re.IGNORECASE)
 _ENCODING_RE = re.compile(br"\bencoding\s*=\s*(['\"])([^'\"]+)\1", re.IGNORECASE)
 
@@ -581,6 +616,123 @@ def _read_limited_regular_file(path: Path, limit: int, context: str) -> bytes:
     return content
 
 
+def _builtin_shape_files(raw: bytes, scene_file: str) -> list[str]:
+    if len(raw) > MAX_BUILTIN_SCENE_XML_BYTES:
+        raise ValueError(f"{scene_file} exceeds the trusted built-in XML limit")
+    try:
+        raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{scene_file} must be UTF-8 XML") from exc
+    if re.search(br"<!\s*(?:DOCTYPE|ENTITY)\b", raw, re.IGNORECASE):
+        raise ValueError("DOCTYPE and ENTITY declarations are not allowed in built-in scene XML")
+    declaration = _XML_DECLARATION_RE.match(raw)
+    if declaration:
+        encoding = _ENCODING_RE.search(declaration.group(1))
+        if encoding and encoding.group(2).decode("ascii", errors="ignore").lower() != "utf-8":
+            raise ValueError("built-in scene XML declaration must use UTF-8")
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        raise ValueError(f"invalid built-in scene XML: {exc}") from exc
+    if root.tag != "scene" or root.attrib != {"version": "2.1.0"}:
+        raise ValueError('built-in scene XML root must be <scene version="2.1.0">')
+    if root.text and root.text.strip():
+        raise ValueError("built-in scene XML may contain only top-level bsdf and shape elements")
+
+    shapes = []
+    for element in root:
+        if element.tag not in {"bsdf", "shape"}:
+            raise ValueError(f"unsupported built-in scene element: <{element.tag}>")
+        if element.tag == "shape":
+            if element.attrib.get("type") != "ply":
+                raise ValueError("built-in scene shapes must use PLY meshes")
+            shapes.append(element)
+    if not shapes or len(shapes) + 1 > MAX_BUILTIN_SCENE_FILES:
+        raise ValueError("built-in scene has no PLY meshes or too many shapes")
+
+    paths: set[str] = set()
+    filename_nodes: set[int] = set()
+    for shape in shapes:
+        filename_elements = [
+            child
+            for child in shape.iter()
+            if child.tag == "string" and child.attrib.get("name") == "filename"
+        ]
+        if len(filename_elements) != 1:
+            raise ValueError("each built-in PLY shape must reference exactly one mesh file")
+        filename_element = filename_elements[0]
+        if filename_element.attrib.keys() != {"name", "value"} or len(filename_element):
+            raise ValueError("built-in mesh references must contain only name and value")
+        filename = filename_element.attrib["value"]
+        if not _safe_relative_path(filename) or not _BUILTIN_PLY_PATH_RE.fullmatch(filename):
+            raise ValueError(f"built-in mesh path must be meshes/<safe-id>.ply: {filename}")
+        paths.add(filename)
+        filename_nodes.add(id(filename_element))
+
+    for element in root.iter():
+        if element.tag.lower() == "include":
+            raise ValueError("built-in scene XML may not include external XML")
+        if "filename" in element.attrib:
+            raise ValueError("built-in scene XML may not use filename attributes")
+        if (
+            element.tag == "string"
+            and element.attrib.get("name") == "filename"
+            and id(element) not in filename_nodes
+        ):
+            raise ValueError("built-in scene XML has an external filename reference")
+    return sorted(paths)
+
+
+def _check_builtin_root_assets(
+    root: Path,
+    scene_file: str,
+) -> tuple[dict[str, bytes], dict[str, dict[str, Any]]]:
+    if not _SCENE_FILE_RE.fullmatch(scene_file):
+        raise ValueError("scene_file must be a safe root-level XML filename")
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"scene root does not exist: {root}") from exc
+    if not resolved_root.is_dir():
+        raise ValueError("scene root must be a directory")
+    scene_path = resolved_root / scene_file
+    if scene_path.is_symlink() or not scene_path.is_file():
+        raise ValueError(f"scene root is missing regular file {scene_file}")
+    scene_bytes = _read_limited_regular_file(
+        scene_path, MAX_BUILTIN_SCENE_XML_BYTES, scene_file
+    )
+    mesh_files = _builtin_shape_files(scene_bytes, scene_file)
+    if len(mesh_files) + 1 > MAX_BUILTIN_SCENE_FILES:
+        raise ValueError("built-in scene contains too many unique mesh files")
+    files: dict[str, bytes] = {scene_file: scene_bytes}
+    total_bytes = len(scene_bytes)
+    mesh_parent = resolved_root / "meshes"
+    if mesh_parent.is_symlink() or not mesh_parent.is_dir():
+        raise ValueError("built-in scene is missing its meshes directory")
+    try:
+        resolved_mesh_parent = mesh_parent.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"cannot resolve built-in meshes directory: {exc}") from exc
+    for relative in mesh_files:
+        mesh_path = resolved_root.joinpath(*PurePosixPath(relative).parts)
+        if mesh_path.is_symlink() or not mesh_path.is_file():
+            raise ValueError(f"built-in scene is missing regular file {relative}")
+        try:
+            resolved_mesh = mesh_path.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"cannot resolve built-in scene asset {relative}: {exc}") from exc
+        if resolved_mesh.parent != resolved_mesh_parent:
+            raise ValueError(f"built-in scene asset escapes its root: {relative}")
+        mesh_content = _read_limited_regular_file(
+            mesh_path,
+            MAX_BUILTIN_SCENE_BYTES - total_bytes,
+            relative,
+        )
+        total_bytes += len(mesh_content)
+        if total_bytes > MAX_BUILTIN_SCENE_BYTES:
+            raise ValueError("built-in scene exceeds its 32-MiB asset limit")
+        files[relative] = mesh_content
+    return files, {}
 def _check_root_assets(root: Path, scene_file: str, *, allow_unreferenced: bool) -> tuple[dict[str, bytes], dict[str, dict[str, Any]]]:
     if not _SCENE_FILE_RE.fullmatch(scene_file):
         raise ValueError("scene_file must be a safe root-level XML filename")
@@ -642,35 +794,80 @@ def _check_root_assets(root: Path, scene_file: str, *, allow_unreferenced: bool)
     return validated, summaries
 
 
+_LOCAL_BUILTIN_SCENES = frozenset({"empty", "ground", "ground_wall"})
+
+
+def _check_builtin_scene_assets(
+    root: Path,
+    scene_file: str,
+) -> tuple[dict[str, bytes], dict[str, dict[str, Any]]]:
+    if Path(scene_file).stem in _LOCAL_BUILTIN_SCENES:
+        return _check_root_assets(root, scene_file, allow_unreferenced=True)
+    return _check_builtin_root_assets(root, scene_file)
+
+
 def resolve_scene_assets(
     root: str | Path,
     scene_file: str = "scene.xml",
     *,
     source: str = "imported",
 ) -> RtSceneAssets:
-    """Validate and hash one explicit scene root; all assets must be in that root."""
+    """Validate and hash an explicit scene root under its source-specific policy."""
     source = _source_name(source)
     try:
         resolved_root = Path(root).resolve(strict=True)
     except OSError as exc:
         raise ValueError(f"scene root does not exist: {root}") from exc
-    files, _ = _check_root_assets(resolved_root, scene_file, allow_unreferenced=False)
+    if source == "builtin":
+        files, _ = _check_builtin_scene_assets(resolved_root, scene_file)
+    else:
+        files, _ = _check_root_assets(resolved_root, scene_file, allow_unreferenced=False)
     hashes, bundle_hash = _bundle_identity(files)
+    if source == "builtin":
+        expected = resolve_builtin_scene_assets(Path(scene_file).stem)
+        if hashes != expected.file_sha256 or bundle_hash != expected.bundle_sha256:
+            raise ValueError("built-in scene root does not match the installed scene package")
     return RtSceneAssets(resolved_root, scene_file, hashes, bundle_hash, source)
 
 
 def resolve_builtin_scene_assets(scene: str) -> RtSceneAssets:
-    """Resolve and hash a packaged ``empty``, ``ground``, or ``ground_wall`` scene."""
-    scene_files = {"empty": "empty.xml", "ground": "ground.xml", "ground_wall": "ground_wall.xml"}
-    try:
-        scene_file = scene_files[scene]
-    except KeyError as exc:
-        raise ValueError("built-in scene must be empty, ground, or ground_wall") from exc
-    root = Path(__file__).resolve().parent / "rt_scenes"
+    """Resolve and hash a local or pinned Sionna-RT packaged scene."""
+    local_scenes = _LOCAL_BUILTIN_SCENES
+    if scene in local_scenes:
+        root = Path(__file__).resolve().parent / "rt_scenes"
+        scene_file = f"{scene}.xml"
+    elif scene in SIONNA_RT_SCENE_IDS:
+        try:
+            package_root = Path(
+                distribution("sionna-rt").locate_file("sionna/rt/scenes")
+            ).resolve(strict=True)
+        except PackageNotFoundError as exc:
+            raise ValueError("Sionna RT packaged scenes are unavailable") from exc
+        except OSError as exc:
+            raise ValueError(f"cannot resolve Sionna RT scene package: {exc}") from exc
+        root = package_root / scene
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError(f"Sionna RT package is missing scene {scene}")
+        try:
+            resolved_scene_root = root.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"cannot resolve Sionna RT scene {scene}: {exc}") from exc
+        if resolved_scene_root.parent != package_root:
+            raise ValueError(f"Sionna RT scene escapes its package root: {scene}")
+        root = resolved_scene_root
+        scene_file = f"{scene}.xml"
+    else:
+        raise ValueError(f"unknown built-in RT scene: {scene}")
+
     resolved_root = root.resolve(strict=True)
-    files, _ = _check_root_assets(resolved_root, scene_file, allow_unreferenced=True)
+    if scene in local_scenes:
+        files, _ = _check_root_assets(resolved_root, scene_file, allow_unreferenced=True)
+    else:
+        files, _ = _check_builtin_root_assets(resolved_root, scene_file)
     hashes, bundle_hash = _bundle_identity(files)
     return RtSceneAssets(resolved_root, scene_file, hashes, bundle_hash, "builtin")
+
+
 
 
 def persist_scene_bundle(
@@ -711,11 +908,14 @@ def persist_scene_bundle(
 def copy_scene_assets(assets: RtSceneAssets, root: str | Path) -> RtSceneAssets:
     """Copy one resolved scene to a job-owned root without changing asset identity."""
     resolved_source = Path(assets.root).resolve(strict=True)
-    files, _ = _check_root_assets(
-        resolved_source,
-        assets.scene_file,
-        allow_unreferenced=assets.source == "builtin",
-    )
+    if assets.source == "builtin":
+        files, _ = _check_builtin_scene_assets(resolved_source, assets.scene_file)
+    else:
+        files, _ = _check_root_assets(
+            resolved_source,
+            assets.scene_file,
+            allow_unreferenced=False,
+        )
     hashes, bundle_hash = _bundle_identity(files)
     if hashes != assets.file_sha256 or bundle_hash != assets.bundle_sha256:
         raise ValueError("scene assets changed after resolution")

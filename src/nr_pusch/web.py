@@ -43,6 +43,7 @@ from .rt_scene_assets import (
     persist_scene_bundle,
     resolve_builtin_scene_assets,
     resolve_scene_assets,
+    builtin_scene_catalog,
 )
 from .simulation_config import BlerSettings
 from .transmitter import NrPuschTx
@@ -81,6 +82,7 @@ class SimulationWebApp:
     def __init__(self, config_dir: Path, runs_dir: Path, python: str = sys.executable):
         self.config_dir = config_dir.resolve()
         self.runs_dir = runs_dir.resolve()
+        self.outputs_dir = Path(__file__).resolve().parents[2] / "outputs"
         if not self.config_dir.is_dir():
             raise FileNotFoundError(f"配置目录不存在: {self.config_dir}")
         self.runs_dir.mkdir(parents=True, exist_ok=True)
@@ -439,6 +441,7 @@ class SimulationWebApp:
         except Exception as exc:
             warning = f"无法查询 PyTorch CUDA 能力：{exc}"
         return {
+            "scene_presets": builtin_scene_catalog(),
             "devices": devices,
             "web_limits": {
                 "carrier_frequency_hz": [1e8, 1e11],
@@ -619,6 +622,9 @@ class SimulationWebApp:
                     [user.name for user in settings["rt"].users] if backend == "rt" else []
                 ),
                 "validation_summary": None,
+                "snapshot_cache_key": None,
+                "snapshot_cache_hit": None,
+                "output_archive": None,
                 "config_names": names,
                 "total_points": (
                     len(simulation_settings.channel_estimators_for_sweep)
@@ -825,7 +831,12 @@ class SimulationWebApp:
 
     def _verify_prepared_rt(self, job_id: str) -> dict[str, Any]:
         directory = self._job_dir(job_id)
-        for name in ("channel_snapshot.npz", "channel_snapshot.json", "validation.json"):
+        for name in (
+            "channel_snapshot.npz",
+            "channel_snapshot.json",
+            "validation.json",
+            "snapshot_cache.json",
+        ):
             if not (directory / name).is_file():
                 raise ValueError(f"RT 场景准备缺少 {name}")
         report = self._store_validation_report(job_id)
@@ -836,11 +847,25 @@ class SimulationWebApp:
         )
         if not isinstance(snapshot_metadata, dict):
             raise ValueError("RT channel_snapshot.json 必须是 JSON 对象")
+        cache_info = json.loads(
+            (directory / "snapshot_cache.json").read_text(encoding="utf-8")
+        )
+        if (
+            not isinstance(cache_info, dict)
+            or cache_info.get("format_version") != 1
+            or not isinstance(cache_info.get("cache_key"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", cache_info["cache_key"])
+            or not isinstance(cache_info.get("hit"), bool)
+        ):
+            raise ValueError("RT snapshot cache 状态文件无效")
         with self._lock:
             job = self._jobs[job_id]
             expected_bundle = job.get("scene_bundle_sha256")
             expected_file = job.get("scene_file")
             expected_source = job.get("scene_source")
+            job["snapshot_cache_key"] = cache_info["cache_key"]
+            job["snapshot_cache_hit"] = cache_info["hit"]
+            self._write_job(job)
         snapshot_hash = snapshot_metadata.get("array_sha256")
         if (
             report.get("format_version") != 1
@@ -858,6 +883,100 @@ class SimulationWebApp:
                 "RT 场景准入报告失败，或 snapshot/scene bundle hash 与任务资源不匹配"
             )
         return report
+
+    def _persist_completed_rt_snapshot(self, job_id: str) -> None:
+        from .rt_channel import load_rt_beam_snapshot, store_rt_beam_snapshot_cache
+
+        directory = self._job_dir(job_id)
+        if directory.is_symlink() or directory.resolve(strict=True).parent != self.runs_dir:
+            raise ValueError("RT job directory escaped the configured runs directory")
+        with self._lock:
+            job = dict(self._jobs[job_id])
+        tx_settings = TxSettings.from_toml(directory / "tx.toml")
+        rt_settings = RtBeamSettings.from_toml(directory / "rt.toml")
+        assets = resolve_scene_assets(
+            directory / "scene",
+            job["scene_file"],
+            source=job["scene_source"],
+        )
+        snapshot = load_rt_beam_snapshot(
+            directory / "channel_snapshot.npz",
+            tx_settings,
+            scene_root=assets.root,
+        )
+        cache_key = store_rt_beam_snapshot_cache(
+            snapshot,
+            tx_settings,
+            rt_settings,
+            scene_assets=assets,
+            cache_dir=self.outputs_dir / "rt_snapshots",
+        )
+        if cache_key != job.get("snapshot_cache_key"):
+            raise ValueError("RT snapshot cache key 与预检结果不一致")
+        archive = self._archive_completed_rt_job(job_id)
+        with self._lock:
+            current = self._jobs[job_id]
+            current["output_archive"] = str(Path("outputs") / "rt_runs" / job_id)
+            self._write_job(current)
+
+    def _archive_completed_rt_job(self, job_id: str) -> Path:
+        source = self._job_dir(job_id)
+        outputs = self.outputs_dir
+        if outputs.is_symlink():
+            raise ValueError("项目 outputs 目录不得是符号链接")
+        outputs.mkdir(parents=True, exist_ok=True)
+        if not outputs.is_dir():
+            raise ValueError("项目 outputs 路径必须是目录")
+        archive_root = outputs / "rt_runs"
+        if archive_root.is_symlink():
+            raise ValueError("RT 结果目录不得是符号链接")
+        archive_root.mkdir(mode=0o700, exist_ok=True)
+        if archive_root.resolve(strict=True).parent != outputs.resolve(strict=True):
+            raise ValueError("RT 结果目录必须直接位于 outputs 下")
+        os.chmod(archive_root, 0o700)
+        destination = archive_root / job_id
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(f"RT 结果归档已存在: {destination}")
+        temporary = Path(tempfile.mkdtemp(prefix=f".{job_id}-", dir=archive_root))
+        try:
+            for current, directories, filenames in os.walk(source, followlinks=False):
+                source_directory = Path(current)
+                relative_directory = source_directory.relative_to(source)
+                target_directory = temporary / relative_directory
+                target_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                for name in directories:
+                    child = source_directory / name
+                    if child.is_symlink() or not child.is_dir():
+                        raise ValueError(f"RT 结果包含非目录资源: {child}")
+                    (target_directory / name).mkdir(mode=0o700)
+                for name in filenames:
+                    child = source_directory / name
+                    if child.is_symlink():
+                        raise ValueError(f"RT 结果包含符号链接: {child}")
+                    if relative_directory == Path(".") and name == "job.json":
+                        continue
+                    if not child.is_file():
+                        raise ValueError(f"RT 结果包含非普通文件: {child}")
+                    shutil.copyfile(child, target_directory / name)
+            with self._lock:
+                archived_job = dict(self._jobs[job_id])
+            archived_job.update(
+                status="completed",
+                stage="done",
+                finished_at=_now(),
+                error=None,
+                cancel_requested=False,
+                output_archive=str(Path("outputs") / "rt_runs" / job_id),
+            )
+            (temporary / "job.json").write_text(
+                json.dumps(archived_job, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+            os.rename(temporary, destination)
+        except BaseException:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        return destination
 
     def _execute(self, job_id: str) -> None:
         with self._lock:
@@ -885,6 +1004,7 @@ class SimulationWebApp:
                     "--output", str(directory / "channel_snapshot.npz"),
                     "--validation-output", str(directory / "validation.json"),
                     "--stage-jsonl", str(stage_jsonl),
+                    "--cache-dir", str(self.outputs_dir / "rt_snapshots"),
                 ]
                 prepared = self._run_child(
                     job_id, prepare_command, timeout_s=600, stage_jsonl=stage_jsonl
@@ -974,6 +1094,11 @@ class SimulationWebApp:
                     job_id, "failed", f"仿真输出缺少 {', '.join(missing)}；未标记为完成。"
                 )
                 return
+            if backend == "rt":
+                if self._cancel_requested(job_id):
+                    self._finish_job(job_id, "cancelled")
+                    return
+                self._persist_completed_rt_snapshot(job_id)
             self._finish_job(job_id, "completed")
         except Exception as exc:
             traceback.print_exc()
