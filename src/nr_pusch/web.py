@@ -32,7 +32,12 @@ import numpy as np
 from .channel_config import ChannelSettings
 from .config import TxSettings
 from .dmrs_prior import dmrs_prior_compatibility, resolve_dmrs_tap_power_prior
-from .rt_config import RtBeamSettings, validate_rt_web_limits
+from .rt_config import (
+    RT_WEB_MAX_RECEIVER_ARRAY_DIMENSION,
+    RT_WEB_MAX_RECEIVER_ARRAY_ELEMENTS,
+    RtBeamSettings,
+    validate_rt_web_limits,
+)
 from .rt_scene_assets import (
     RtSceneAssets,
     ValidatedRtSceneBundle,
@@ -449,7 +454,9 @@ class SimulationWebApp:
                 "max_depth": [0, 3],
                 "samples_per_src": [10_000, 200_000],
                 "max_num_paths_per_src": [1, 10_000],
-                "array_elements": [4, 64],
+                "array_rows": [1, RT_WEB_MAX_RECEIVER_ARRAY_DIMENSION],
+                "array_cols": [1, RT_WEB_MAX_RECEIVER_ARRAY_DIMENSION],
+                "array_elements": [4, RT_WEB_MAX_RECEIVER_ARRAY_ELEMENTS],
                 "batch_size": [1, 20],
                 "max_frames_per_snr": [1, 2_000],
                 "stop_at_zero_bler": [False, True],

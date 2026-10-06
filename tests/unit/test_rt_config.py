@@ -141,9 +141,38 @@ class RtBeamSettingsTest(unittest.TestCase):
         ):
             validate_rt_web_limits(settings, invalid)
 
-        oversized = replace(settings, receiver=replace(settings.receiver, num_rows=16))
-        with self.assertRaisesRegex(ValueError, r"receiver array elements=128"):
-            validate_rt_web_limits(oversized, quick)
+        full_array = replace(
+            settings,
+            receiver=replace(settings.receiver, num_rows=16, num_cols=16),
+        )
+        validate_rt_web_limits(full_array, quick)
+
+        oversized_rows = replace(
+            settings,
+            receiver=replace(settings.receiver, num_rows=17, num_cols=8),
+        )
+        with self.assertRaisesRegex(
+            ValueError, r"receiver\.num_rows=17 outside \[1,16\]"
+        ):
+            validate_rt_web_limits(oversized_rows, quick)
+
+        oversized_cols = replace(
+            settings,
+            receiver=replace(settings.receiver, num_rows=8, num_cols=17),
+        )
+        with self.assertRaisesRegex(
+            ValueError, r"receiver\.num_cols=17 outside \[1,16\]"
+        ):
+            validate_rt_web_limits(oversized_cols, quick)
+
+        oversized_elements = replace(
+            settings,
+            receiver=replace(settings.receiver, num_rows=17, num_cols=16),
+        )
+        with self.assertRaisesRegex(
+            ValueError, r"receiver array elements=272 outside \[4,256\]"
+        ):
+            validate_rt_web_limits(oversized_elements, quick)
 
     def test_cp_rt_profile_preserves_four_user_single_layer_grid(self):
         tx = TxSettings.from_toml(ROOT / "configs" / "pusch_rt_4ue_cp.toml")

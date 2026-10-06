@@ -107,6 +107,9 @@ class WebRtBlerTest(unittest.TestCase):
         self.assertEqual(options["web_limits"]["batch_size"], [1, 20])
         self.assertEqual(options["web_limits"]["max_frames_per_snr"], [1, 2_000])
         self.assertEqual(options["web_limits"]["stop_at_zero_bler"], [False, True])
+        self.assertEqual(options["web_limits"]["array_rows"], [1, 16])
+        self.assertEqual(options["web_limits"]["array_cols"], [1, 16])
+        self.assertEqual(options["web_limits"]["array_elements"], [4, 256])
         self.assertEqual(
             {item["id"] for item in options["scene_presets"]},
             {
@@ -117,6 +120,23 @@ class WebRtBlerTest(unittest.TestCase):
                 "simple_street_canyon_with_cars", "simple_wedge", "triple_reflector",
             },
         )
+
+    def test_web_preflight_accepts_maximum_16_by_16_receiver_array(self):
+        settings = RtBeamSettings.from_toml(CONFIGS / "rt_beam_los.toml").to_dict()
+        settings["receiver"]["num_rows"] = 16
+        settings["receiver"]["num_cols"] = 16
+        accepted = self._json("/api/rt/config", {"rt_settings": settings}, method="POST")
+        self.assertEqual(
+            accepted["summary"]["receiver_array"],
+            {"rows": 16, "cols": 16, "elements": 256},
+        )
+
+        oversized = RtBeamSettings.from_toml(CONFIGS / "rt_beam_los.toml").to_dict()
+        oversized["receiver"]["num_rows"] = 17
+        with self.assertRaises(HTTPError) as rejected:
+            self._request("/api/rt/config", {"rt_settings": oversized}, method="POST")
+        self.assertEqual(rejected.exception.code, 400)
+        rejected.exception.close()
 
     def test_scene_preview_renders_builtin_geometry_and_devices_as_png(self):
         settings = RtBeamSettings.from_toml(CONFIGS / "rt_beam_los.toml").to_dict()
