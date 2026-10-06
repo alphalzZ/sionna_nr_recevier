@@ -23,6 +23,7 @@ outputs/
 .env
 .env.*
 !.env.example
+.omp/mcp.json
 # Local Codex routing usage history
 .codex/
 .codex/model-routing-history.jsonl
