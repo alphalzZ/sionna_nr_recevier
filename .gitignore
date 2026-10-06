@@ -23,6 +23,6 @@ outputs/
 .env
 .env.*
 !.env.example
-
 # Local Codex routing usage history
+.codex/
 .codex/model-routing-history.jsonl

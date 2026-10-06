@@ -3,7 +3,8 @@
   "mcpServers": {
     "blender": {
       "type": "http",
-      "url": "http://127.0.0.1:9765/mcp"
+      "url": "http://127.0.0.1:9765/mcp",
+      "enabled": false
     }
   }
 }

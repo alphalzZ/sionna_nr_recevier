@@ -289,6 +289,17 @@ Sionna RT 四波束链路使用同一阵元域传播矩阵构造 `H_beam = Wᴴ 
 
 这两个新增模式沿用现有 `NrPuschRx` 的 DMRS、DFT 解扩、软解映射和 TB/CRC 解码；RT 支持 perfect/DMRS，但拒绝使用由 CDL prior 拟合的 `dmrs-lmmse`。快照 BLER 仅描述给定固定几何/路径实现，seed 变化只改变 payload/noise，不重采样传播；每个点保留 2-frame smoke 为连通性证据，不当作统计曲线。`beam-independent` 与 ZF/联合 detector 的 coded runner、噪声基变换和按 UE 区间实现见 `src/nr_pusch/beam_simulation.py:57-297`。
 
+### 7.1 阵列规模对 DMRS/beam-independent BLER 的影响（2026-10-06）
+
+在同一 `ground_wall` RT 快照上只将基站阵列从 8×8 改为 16×16；DMRS、`beam-independent`、UE/场景/载频/种子不变，每点 500 帧。
+
+| 阵列 | 20/25/30 dB 每 UE TB 错误数 | 每 UE BLER（95% Clopper–Pearson CI） |
+| --- | --- | --- |
+| 8×8 | 各点均 500/500 | 1.0 `[0.99265, 1]` |
+| 16×16 | 各点均 0/500 | 0 `[0, 0.00735]` |
+
+16×16 的 UE0 参考数据 RE 信道功率为 8×8 的 3.96 倍（+5.98 dB），最差非目标 ISR 从 −11.80 dB 降到 −27.32 dB。另在相同阵元噪声方差下比较 8×8@20 dB 与 16×16@25.978613 dB，16×16 仍为 0/500 错误/UE。结果支持该固定场景下扩展阵列孔径能改善该接收链；它是单一静态快照的条件 BLER，不是跨场景/移动信道统计保证，0/500 也不表示真 BLER 为零。完整设置、CI、噪声归一化说明和重现命令见 `docs/rt_array_bler_experiment.md`。
+
 CPU 两帧 smoke 自动保存 `physical_beam`、`diagonal_noise_scaled` 与 `whitened` 的 NPZ/JSON capture；三种坐标系使用相同 payload、噪声 draw、R 和对应的 perfect-CSI matrix（`src/nr_pusch/beam_simulation.py:408-533`）。回放时必须匹配 capture 的 grid 和 CSI：
 
 ```bash

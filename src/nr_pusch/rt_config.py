@@ -15,6 +15,8 @@ from nr_pusch.rt_scene_assets import BUILTIN_SCENE_IDS
 if TYPE_CHECKING:
     from .simulation_config import BlerSettings
 
+RT_WEB_MAX_RECEIVER_ARRAY_DIMENSION: int = 16
+RT_WEB_MAX_RECEIVER_ARRAY_ELEMENTS: int = RT_WEB_MAX_RECEIVER_ARRAY_DIMENSION**2
 
 @dataclass(frozen=True)
 class RtGeometrySettings:
@@ -333,13 +335,22 @@ def validate_rt_web_limits(
         violations.append(
             f"rt.max_num_paths_per_src={scene.max_num_paths_per_src} outside [1,10000]"
         )
-    if not 1 <= receiver.num_rows <= 64:
-        violations.append(f"receiver.num_rows={receiver.num_rows} outside [1,64]")
-    if not 1 <= receiver.num_cols <= 64:
-        violations.append(f"receiver.num_cols={receiver.num_cols} outside [1,64]")
+    if not 1 <= receiver.num_rows <= RT_WEB_MAX_RECEIVER_ARRAY_DIMENSION:
+        violations.append(
+            f"receiver.num_rows={receiver.num_rows} outside "
+            f"[1,{RT_WEB_MAX_RECEIVER_ARRAY_DIMENSION}]"
+        )
+    if not 1 <= receiver.num_cols <= RT_WEB_MAX_RECEIVER_ARRAY_DIMENSION:
+        violations.append(
+            f"receiver.num_cols={receiver.num_cols} outside "
+            f"[1,{RT_WEB_MAX_RECEIVER_ARRAY_DIMENSION}]"
+        )
     antenna_count = receiver.num_rows * receiver.num_cols
-    if not 4 <= antenna_count <= 64:
-        violations.append(f"receiver array elements={antenna_count} outside [4,64]")
+    if not 4 <= antenna_count <= RT_WEB_MAX_RECEIVER_ARRAY_ELEMENTS:
+        violations.append(
+            f"receiver array elements={antenna_count} outside [4,"
+            f"{RT_WEB_MAX_RECEIVER_ARRAY_ELEMENTS}]"
+        )
     if not 0.0 < receiver.vertical_spacing_wavelengths <= 2.0:
         violations.append(
             f"receiver.vertical_spacing_wavelengths={receiver.vertical_spacing_wavelengths:g} outside (0,2]"
